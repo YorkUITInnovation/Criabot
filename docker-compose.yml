@@ -1,0 +1,86 @@
+version: '3.8'
+services:
+  redis:
+    image: 'docker.io/redis:latest'
+    environment:
+      REDIS_ARGS: "--requirepass root"
+    ports:
+      - '127.0.0.1:6379:6379'
+    volumes:
+      - ./redis_data/redis.conf:/usr/local/etc/redis/redis.conf
+  mysql:
+    image: 'docker.io/mysql:latest'
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: cria
+    healthcheck:
+      test: mysqladmin ping -h 127.0.0.1 -uroot --password=$$MYSQL_ROOT_PASSWORD
+      start_period: 1s
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    ports:
+      - '127.0.0.1:3306:3306'
+    volumes:
+      - './mysql_data:/var/lib/mysql:cached'
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - ./qdrant_data/storage:/qdrant/storage
+      - ./qdrant_data/config:/qdrant/config/custom_config.yaml
+  criadex:
+    image: uitadmin/criadex:latest
+    ports:
+      - "25574:25574"
+    environment:
+      ENV_PATH: "./env/docker.env"
+    volumes:
+      - ./criadex_data:/home/cria/env
+    depends_on:
+      mysql:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://127.0.0.1:25574/health_check" ]
+      start_period: 1s
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  criabot:
+    image: uitadmin/criabot:latest
+    ports:
+      - "25575:25575"
+    environment:
+      ENV_PATH: "./env/docker.env"
+    volumes:
+      - ./criabot_data:/home/cria/env
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      criadex:
+        condition: service_healthy
+  criaparse:
+    image: uitadmin/criaparse:latest
+    ports:
+      - "25576:25576"
+    environment:
+      ENV_PATH: "./env/docker.env"
+    volumes:
+      - ./criaparse_data:/home/cria/env
+    depends_on:
+      criadex:
+        condition: service_healthy
+  unstructured:
+    image: 'downloads.unstructured.io/unstructured-io/unstructured-api:latest'
+    ports:
+      - '8000:8000'
+    environment:
+      UNSTRUCTURED_MEMORY_FREE_MINIMUM_MB: 256
+      UNSTRUCTURED_API_KEY: "3.14159CriaUnstructuredAPIPassword"
+

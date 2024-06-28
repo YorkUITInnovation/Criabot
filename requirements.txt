@@ -1,0 +1,18 @@
+python-multipart>=0.0.6
+fastapi>=0.104.1
+aiomysql==0.2.0
+uvicorn==0.24.0.post1
+python-dotenv==1.0.0
+cryptography==41.0.5
+tiktoken==0.5.1
+slowapi==0.1.8
+aioredis==2.0.1
+pydantic==2.6.2
+sqlalchemy==2.0.27
+fastapi-restful
+typing-inspect
+
+# Don't freak out, the token is read-only on CriadexSDK
+# Due for renewal: November 20th, 2024
+# v1.2.0
+criadexsdk @ git+https://criayu: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@github.com/criayu/criadexsdk
