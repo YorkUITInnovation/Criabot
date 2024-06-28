@@ -26,7 +26,7 @@ RUN         pip install -r requirements.txt
 
 RUN         rm ./requirements.txt
 
-FROM        with_packages as final
+FROM        with_packages AS final
 
 #           PROJECT SOURCE CODE
 

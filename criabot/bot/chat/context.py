@@ -16,25 +16,8 @@ from pydantic import BaseModel
 
 from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import History
+from criabot.bot.chat.schemas import RelatedPrompt, Context, QuestionContext, TextContext
 from criabot.database.bots.tables.bot_params import BotParametersModel
-
-ContextType: Type = Literal["QUESTION", "TEXT"]
-
-
-class QuestionContext(BaseModel):
-    context_type: ContextType = "QUESTION"
-    file_name: str
-    group_name: str
-    node: TextNodeWithScore
-
-
-class TextContext(BaseModel):
-    context_type: ContextType = "TEXT"
-    text: str
-    nodes: List[TextNodeWithScore]
-
-
-Context: Type = Union[QuestionContext, TextContext]
 
 GroupSearchResponses: Type = Dict[str, GroupSearchResponse]
 
@@ -253,19 +236,40 @@ class ContextRetriever:
                 top_node = node
                 break
 
+        related_prompts: List[RelatedPrompt] = []
+
         # Case 1) Top node is a question & direct response is requested
-        if cls.is_question_node(top_node) and not cls.is_llm_reply(top_node):
-            return QuestionContext(
-                file_name=top_node.node.metadata.get(cls.FILE_NAME_METADATA_KEY),
-                group_name=top_node.node.metadata.get(cls.GROUP_NAME_METADATA_KEY),
-                node=top_node
+        if cls.is_question_node(top_node):
+
+            related_prompts = top_node.node.metadata.get(cls.RELATED_PROMPTS_METADATA_KEY) or []
+
+            # LLM Reply NOT Enabled
+            if not cls.is_llm_reply(top_node):
+
+                return QuestionContext(
+                    file_name=top_node.node.metadata.get(cls.FILE_NAME_METADATA_KEY),
+                    group_name=top_node.node.metadata.get(cls.GROUP_NAME_METADATA_KEY),
+                    node=top_node,
+                    related_prompts=related_prompts
+                )
+
+            # LLM Reply Enabled
+            # Note: This change will reduce accuracy by cutting out relevant nodes if the top node is a question
+            # Was asked to make this change. The problem with this approach will be that if people ask 2-part questions, or generally if the answer would benefit
+            # from multiple nodes, it will only return the Q answer. Or if there is an issue with re-ranking, it will only return the incorrect Q answer.
+            # It's a cost-benefit of whether the potential for hallucination is worth the potential for better overall answers.
+            return TextContext(
+                text=build_context([top_node]),
+                nodes=ranked_nodes,
+                related_prompts=related_prompts
             )
 
         # Case 2) Top node is not a question or direct response is not requested
         # This is the main case, text context gets built here
         return TextContext(
             text=build_context(ranked_nodes),
-            nodes=ranked_nodes
+            nodes=ranked_nodes,
+            related_prompts=related_prompts
         )
 
     @classmethod

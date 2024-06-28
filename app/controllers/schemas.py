@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from starlette import status
 from starlette.exceptions import HTTPException
 
-from criabot.bot.chat.chat import RelatedPrompt
+from criabot.bot.chat.schemas import RelatedPrompt
 
 SUCCESS_CODE: str = "SUCCESS"
 RATE_LIMIT_CODE: str = "RATE_LIMIT"

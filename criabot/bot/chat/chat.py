@@ -3,32 +3,14 @@ from typing import List, Optional, Dict, Tuple
 from CriadexSDK import CriadexSDK
 from CriadexSDK.routers.agents.azure.chat import ChatMessage, AgentChatRoute, ChatAgentConfig, ChatResponse
 from CriadexSDK.routers.content.search import CompletionUsage, Filter, TextNodeWithScore, GroupSearchResponse
-from pydantic import BaseModel, Field
 
 from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import ChatBuffer, History
-from criabot.bot.chat.context import build_context_prompt, ContextRetriever, QuestionContext, TextContext, Context, \
-    build_no_context_guess_prompt, build_no_context_llm_prompt, ContextRetrieverResponse
+from criabot.bot.chat.context import build_context_prompt, ContextRetriever, QuestionContext, TextContext, build_no_context_guess_prompt, build_no_context_llm_prompt, ContextRetrieverResponse
+from criabot.bot.chat.schemas import ChatReply
 from criabot.cache.api import BotCacheAPI
 from criabot.cache.objects.chats import ChatModel
 from criabot.database.bots.tables.bot_params import BotParametersModel
-
-
-class RelatedPrompt(BaseModel):
-    label: str
-    prompt: str
-
-
-class ChatReply(BaseModel):
-    prompt: str
-    token_usage: List[CompletionUsage]
-    total_usage: CompletionUsage
-    search_units: int
-    content: ChatMessage
-    history: List[ChatMessage]
-    related_prompts: List[RelatedPrompt] = Field(default_factory=list)
-    context: Optional[Context]
-    group_responses: Dict[str, GroupSearchResponse]
 
 
 class Chat:
@@ -167,7 +149,7 @@ class Chat:
             history=reply_history,  # Reply history, which INCLUDES the ephemeral for logging
             group_responses=response.group_responses,
             context=response.context,
-            related_prompts=response.context.node.node.metadata.get(ContextRetriever.RELATED_PROMPTS_METADATA_KEY) or [],
+            related_prompts=response.context.related_prompts,
             token_usage=token_usage,
             search_units=response.search_units,
             total_usage=CompletionUsage(
