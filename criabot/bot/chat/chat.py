@@ -149,7 +149,7 @@ class Chat:
             history=reply_history,  # Reply history, which INCLUDES the ephemeral for logging
             group_responses=response.group_responses,
             context=response.context,
-            related_prompts=response.context.related_prompts,
+            related_prompts=response.context.related_prompts if response.context else [],
             token_usage=token_usage,
             search_units=response.search_units,
             total_usage=CompletionUsage(
