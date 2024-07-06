@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import re
 import textwrap
 from typing import List, Optional, Dict, Awaitable, Union, Type, Literal
 
@@ -245,7 +246,6 @@ class ContextRetriever:
 
             # LLM Reply NOT Enabled
             if not cls.is_llm_reply(top_node):
-
                 return QuestionContext(
                     file_name=top_node.node.metadata.get(cls.FILE_NAME_METADATA_KEY),
                     group_name=top_node.node.metadata.get(cls.GROUP_NAME_METADATA_KEY),
@@ -301,7 +301,7 @@ def build_context(nodes: List[TextNodeWithScore]) -> str:
     context: List[str] = []
 
     for idx, node in enumerate(nodes):
-        context.append(f"Info #{idx + 1}:\n" + node.node.text)
+        context.append(f"[DOCUMENT #{idx + 1}]\n" + node.node.text)
 
     return "\n\n".join(context)
 
@@ -325,6 +325,13 @@ def filter_nodes(nodes: List[TextNodeWithScore], min_relevance: float) -> List[T
     return relevant_nodes
 
 
+_RE_COMBINE_MULTISPACE = re.compile(r" +")
+
+
+def clean_text(text: str) -> str:
+    return _RE_COMBINE_MULTISPACE.sub(" ", textwrap.dedent(text)).strip()
+
+
 def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
     """
     Build a context-enabled prompt given the components
@@ -342,9 +349,11 @@ def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
          even if you do have a guess."""
     )
 
-    return textwrap.dedent(
+    return clean_text(
         f"""
-        All, some, or none of the following information may be useful to answering the user question.
+        [INSTRUCTIONS]
+        The documents below are the top results returned from a search engine.
+        They may be relevant or completely irrelevant to the question.
         {extra_text}
 
         [INFORMATION]
