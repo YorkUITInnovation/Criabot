@@ -112,19 +112,6 @@ class ContextRetriever:
 
         return response.verify().agent_response
 
-    def filter_response(
-            self,
-            index_responses: Dict[str, GroupSearchResponse]
-    ) -> Dict[str, GroupSearchResponse]:
-
-        for group_name, search_response in index_responses.items():
-            index_responses[group_name].nodes = filter_nodes(
-                nodes=search_response.nodes,
-                min_relevance=self._bot_params.min_k
-            )
-
-        return index_responses
-
     def build_search_group_config(
             self,
             prompt: str,
@@ -138,7 +125,6 @@ class ContextRetriever:
             min_k=self._bot_params.min_k,
             top_n=self._bot_params.top_n,  # Ignored (rerank_enabled=False)
             min_n=self._bot_params.min_n,  # Ignored (rerank_enabled=False)
-            rerank_enabled=False,  # Rerank since we're doing a hybrid
             search_filter=metadata_filter,
             extra_groups=extra_groups
         )
@@ -304,25 +290,6 @@ def build_context(nodes: List[TextNodeWithScore]) -> str:
         context.append(f"[DOCUMENT #{idx + 1}]\n" + node.node.text)
 
     return "\n\n".join(context)
-
-
-def filter_nodes(nodes: List[TextNodeWithScore], min_relevance: float) -> List[TextNodeWithScore]:
-    """
-    Filter nodes based on an LLM-ranked relevancy threshold
-
-    :param nodes: The nodes
-    :param min_relevance: The minimum relevance to be included
-    :return: The ones that survived
-
-    """
-
-    relevant_nodes: List[TextNodeWithScore] = []
-
-    for node in nodes:
-        if node.score >= min_relevance:
-            relevant_nodes.append(node)
-
-    return relevant_nodes
 
 
 _RE_COMBINE_MULTISPACE = re.compile(r" +")
