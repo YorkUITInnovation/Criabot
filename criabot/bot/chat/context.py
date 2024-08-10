@@ -2,7 +2,7 @@ import asyncio
 import itertools
 import re
 import textwrap
-from typing import List, Optional, Dict, Awaitable, Union, Type, Literal
+from typing import List, Optional, Dict, Awaitable, Union, Type
 
 from CriadexSDK import CriadexSDK
 from CriadexSDK.routers.agents import AgentRerankRoute
@@ -100,13 +100,15 @@ class ContextRetriever:
             nodes: List[TextNodeWithScore],
     ) -> RerankAgentResponse:
 
+        print("Massive Debug", len(nodes), self._bot_params.top_n, self._bot_params.min_n)
+
         response: AgentRerankRoute.Response = await self._criadex.agents.cohere.rerank(
             model_id=self._rerank_model_id,
             agent_config=RerankAgentConfig(
                 prompt=prompt,
                 nodes=nodes,
                 top_n=self._bot_params.top_n,
-                min_k=self._bot_params.min_k
+                min_n=self._bot_params.min_n
             )
         )
 
@@ -211,17 +213,12 @@ class ContextRetriever:
 
         top_node_score: float = ranked_nodes[0].score
         top_node: TextNodeWithScore = ranked_nodes[0]
-
         # If there are multiple nodes with the top score
         # Make sure that a QUESTION
         for node in ranked_nodes:
 
-            if node.score < top_node_score:
-                break
-
-            if cls.is_question_node(node):
+            if node.score > top_node_score:
                 top_node = node
-                break
 
         related_prompts: List[RelatedPrompt] = []
 
@@ -244,6 +241,7 @@ class ContextRetriever:
             # Was asked to make this change. The problem with this approach will be that if people ask 2-part questions, or generally if the answer would benefit
             # from multiple nodes, it will only return the Q answer. Or if there is an issue with re-ranking, it will only return the incorrect Q answer.
             # It's a cost-benefit of whether the potential for hallucination is worth the potential for better overall answers.
+            top_node.node.metadata.get(cls.ANSWER_METADATA_KEY)
             return TextContext(
                 text=build_context([top_node]),
                 nodes=ranked_nodes,

@@ -14,5 +14,5 @@ typing-inspect
 
 # Don't freak out, the token is read-only on CriadexSDK
 # Due for renewal: November 20th, 2024
-# v1.2.2
-criadexsdk @ git+https://criayu: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@github.com/criayu/criadexsdk
+# v1.2.idk2
+criadexsdk @ git+https://github.com/YorkUITInnovation/CriadexSDK

@@ -1,7 +1,10 @@
+import logging
+import traceback
 from typing import List, Optional, Dict, Tuple
 
 from CriadexSDK import CriadexSDK
 from CriadexSDK.routers.agents.azure.chat import ChatMessage, AgentChatRoute, ChatAgentConfig, ChatResponse
+from CriadexSDK.routers.agents.azure.related_prompts import RelatedPromptsAgentConfig, RelatedPromptsAgentResponse
 from CriadexSDK.routers.content.search import CompletionUsage, Filter, TextNodeWithScore, GroupSearchResponse
 
 from criabot.bot.bot import Bot
@@ -142,14 +145,34 @@ class Chat:
             chat_model=self._chat_model
         )
 
+        response_text: ChatMessage = reply_history[-1]
+
+        related_prompts = response.context.related_prompts if response.context else []
+        if self._bot_parameters.llm_generate_related_prompts and not related_prompts:
+            try:
+                related_prompts_response: RelatedPromptsAgentResponse = await self._criadex.agents.azure.related_prompts(
+                    model_id=self._llm_model_id,
+                    agent_config=RelatedPromptsAgentConfig(
+                        llm_prompt=prompt,
+                        llm_reply=response_text.content,
+                        max_reply_tokens=500,
+                        temperature=0.1
+                    )
+                )
+
+                related_prompts = related_prompts_response.related_prompts
+            except:
+                # Don't want this to actually cause issues
+                logging.error("Failed to generate related prompts!" + traceback.format_exc())
+
         # Return reply
         return ChatReply(
             prompt=prompt,
-            content=reply_history[-1],  # Reply history unaffected by buffer
+            content=response_text,
             history=reply_history,  # Reply history, which INCLUDES the ephemeral for logging
             group_responses=response.group_responses,
             context=response.context,
-            related_prompts=response.context.related_prompts if response.context else [],
+            related_prompts=related_prompts,
             token_usage=token_usage,
             search_units=response.search_units,
             total_usage=CompletionUsage(

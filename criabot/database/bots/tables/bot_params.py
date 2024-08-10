@@ -25,6 +25,8 @@ class BotParametersTable(BaseTable):
     top_n: Mapped[int] = mapped_column(Integer, nullable=False)
     min_n: Mapped[float] = mapped_column(Numeric(2, 1), nullable=False)
 
+    llm_generate_related_prompts: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
     no_context_message: Mapped[str] = mapped_column(Text, nullable=False)
     no_context_use_message: Mapped[bool] = mapped_column(Boolean, nullable=False)
     no_context_llm_guess: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -48,6 +50,8 @@ class BotParametersBaseConfig(BaseModel):
     min_n: float = 0.7
 
     # Context Params
+    llm_generate_related_prompts: bool = True
+
     no_context_message: str = "Sorry, I'm not sure about that."  # No context reply message
     no_context_use_message: bool = False
     no_context_llm_guess: bool = False
