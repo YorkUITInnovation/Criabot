@@ -18,7 +18,7 @@ class ChatModel(BaseModel):
 
     def add_user_message(self, prompt: str, bot_name: str, **kwargs) -> None:
         self.history.append(
-            ChatMessage(
+            ChatMessage.from_content(
                 role="user",
                 content=prompt,
                 metadata={**kwargs.pop("metadata", dict()), "bot_asked": bot_name},

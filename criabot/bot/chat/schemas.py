@@ -1,15 +1,11 @@
 from typing import List, Optional, Dict, Literal, Type, Union
 
 from CriadexSDK.routers.agents.azure.chat import ChatMessage
+from CriadexSDK.routers.agents.azure.related_prompts import RelatedPrompt
 from CriadexSDK.routers.content.search import CompletionUsage, GroupSearchResponse, TextNodeWithScore
 from pydantic import BaseModel, Field
 
 ContextType: Type = Literal["QUESTION", "TEXT"]
-
-
-class RelatedPrompt(BaseModel):
-    label: str
-    prompt: str
 
 
 class QuestionContext(BaseModel):
@@ -40,3 +36,4 @@ class ChatReply(BaseModel):
     related_prompts: List[RelatedPrompt] = Field(default_factory=list)
     context: Optional[Context]
     group_responses: Dict[str, GroupSearchResponse]
+    verified_response: bool

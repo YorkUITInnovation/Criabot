@@ -100,8 +100,6 @@ class ContextRetriever:
             nodes: List[TextNodeWithScore],
     ) -> RerankAgentResponse:
 
-        print("Massive Debug", len(nodes), self._bot_params.top_n, self._bot_params.min_n)
-
         response: AgentRerankRoute.Response = await self._criadex.agents.cohere.rerank(
             model_id=self._rerank_model_id,
             agent_config=RerankAgentConfig(
@@ -128,7 +126,7 @@ class ContextRetriever:
             top_n=self._bot_params.top_n,  # Ignored (rerank_enabled=False)
             min_n=self._bot_params.min_n,  # Ignored (rerank_enabled=False)
             search_filter=metadata_filter,
-            extra_groups=extra_groups
+            extra_groups=extra_groups,
         )
 
     async def transform_prompt(self, prompt: str, history: History) -> TransformAgentResponse:
@@ -319,6 +317,9 @@ def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
         [INSTRUCTIONS]
         The documents below are the top results returned from a search engine.
         They may be relevant or completely irrelevant to the question.
+        If you use any information from an image description, insert the image into the answer wherever it is relevant, using the format !IMG=<image_id>=IMG!. 
+        The ID of an image is found in the description start and end tags, [IMAGE <image_id> DESCRIPTION START].
+        
         {extra_text}
 
         [INFORMATION]

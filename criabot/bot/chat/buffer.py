@@ -2,7 +2,7 @@ from pprint import pprint
 from typing import List, Optional, Type
 
 import tiktoken
-from CriadexSDK.routers.agents.azure.chat import ChatMessage
+from CriadexSDK.routers.agents.azure.chat import ChatMessage, TextBlock
 
 
 def string_tokens(string: str, encoding_name: str = "cl100k_base") -> int:
@@ -57,7 +57,10 @@ class ChatBuffer:
 
     @classmethod
     def create_chat_token_metadata(cls, message: ChatMessage) -> int:
-        token_count: int = string_tokens(message.content)
+        token_count: int = sum([
+            string_tokens(block.text)
+            for block in message.blocks
+        ])
         message.metadata[cls.TOKEN_COUNT_META_NAME] = token_count
         return token_count
 
@@ -185,7 +188,9 @@ class ChatBuffer:
                     "| Current Prompt: ", f"\"{message.content}\""
                 )
 
-            message.content = message.content[:-remove_n_chars]
+            message.blocks = TextBlock(
+                text=message.content[:-remove_n_chars]
+            )
 
         # Update at the end
         message.metadata[cls.TOKEN_COUNT_META_NAME] = cls.get_token_metadata(message)

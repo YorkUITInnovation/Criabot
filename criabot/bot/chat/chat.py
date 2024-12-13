@@ -3,8 +3,8 @@ import traceback
 from typing import List, Optional, Dict, Tuple
 
 from CriadexSDK import CriadexSDK
-from CriadexSDK.routers.agents.azure.chat import ChatMessage, AgentChatRoute, ChatAgentConfig, ChatResponse
-from CriadexSDK.routers.agents.azure.related_prompts import RelatedPromptsAgentConfig, RelatedPromptsAgentResponse
+from CriadexSDK.routers.agents.azure.chat import ChatMessage, AgentChatRoute, ChatAgentConfig, ChatResponse, TextBlock
+from CriadexSDK.routers.agents.azure.related_prompts import RelatedPromptsAgentConfig, AgentRelatedPromptsRoute
 from CriadexSDK.routers.content.search import CompletionUsage, Filter, TextNodeWithScore, GroupSearchResponse
 
 from criabot.bot.bot import Bot
@@ -57,7 +57,7 @@ class Chat:
         self._buffer: ChatBuffer = ChatBuffer(
             max_tokens=self._bot_parameters.max_input_tokens,
             history=chat_model.update_system_message(
-                system_message=ChatMessage(
+                system_message=ChatMessage.from_content(
                     role="system",
                     content=bot_parameters.system_message,
                     metadata=self.chat_reply_metadata
@@ -116,7 +116,7 @@ class Chat:
 
         # Add the user's prompt to the buffer
         self._buffer.add_message(
-            message=ChatMessage(
+            message=ChatMessage.from_content(
                 role="user",
                 content=prompt,
                 metadata=self.chat_reply_metadata
@@ -150,20 +150,22 @@ class Chat:
         related_prompts = response.context.related_prompts if response.context else []
         if self._bot_parameters.llm_generate_related_prompts and not related_prompts:
             try:
-                related_prompts_response: RelatedPromptsAgentResponse = await self._criadex.agents.azure.related_prompts(
+                related_prompts_response: AgentRelatedPromptsRoute.Response = await self._criadex.agents.azure.related_prompts(
                     model_id=self._llm_model_id,
                     agent_config=RelatedPromptsAgentConfig(
                         llm_prompt=prompt,
-                        llm_reply=response_text.content,
+                        llm_reply=" ".join([block.text for block in response_text.blocks]),
                         max_reply_tokens=500,
                         temperature=0.1
                     )
                 )
+                related_prompts = related_prompts_response.agent_response.related_prompts
 
-                related_prompts = related_prompts_response.related_prompts
+                # Track token usage
+                token_usage.extend(related_prompts_response.agent_response.usage)
             except:
-                # Don't want this to actually cause issues
-                logging.error("Failed to generate related prompts!" + traceback.format_exc())
+                # Don't want this to actually cause issues if the agent fails because the LLM sucks
+                logging.error("Failed to generate related prompts! " + traceback.format_exc())
 
         # Return reply
         return ChatReply(
@@ -175,11 +177,13 @@ class Chat:
             related_prompts=related_prompts,
             token_usage=token_usage,
             search_units=response.search_units,
+            verified_response=response.context.context_type == "QUESTION" if response.context else False,
             total_usage=CompletionUsage(
                 completion_tokens=sum(usage.completion_tokens for usage in token_usage),
                 prompt_tokens=sum(usage.prompt_tokens for usage in token_usage),
-                total_tokens=sum(usage.total_tokens for usage in token_usage)
-            )
+                total_tokens=sum(usage.total_tokens for usage in token_usage),
+                usage_label="All"
+            ),
         )
 
     async def _query_llm(self, history: History) -> ChatResponse:
@@ -225,7 +229,7 @@ class Chat:
 
         # Add the ephemeral context
         buffered_history: History = self._buffer.buffer(
-            system_ephemeral=ChatMessage(
+            system_ephemeral=ChatMessage.from_content(
                 role="system",
                 content=build_context_prompt(context, best_guess=self._bot_parameters.no_context_llm_guess),
                 metadata=self.chat_reply_metadata
@@ -245,7 +249,7 @@ class Chat:
 
         # Add the ephemeral best guess prompt
         buffered_history: History = self._buffer.buffer(
-            system_ephemeral=ChatMessage(
+            system_ephemeral=ChatMessage.from_content(
                 role="system",
                 content=build_no_context_guess_prompt(
                     no_context_message=(
@@ -262,10 +266,12 @@ class Chat:
 
         # Prepend no context message
         if self._bot_parameters.no_context_use_message:
-            chat_response.message.content = (
-                    self._bot_parameters.no_context_message.strip()
-                    + "\n\n"
-                    + chat_response.message.content
+            chat_response.message.blocks = TextBlock(
+                text=(
+                        self._bot_parameters.no_context_message.strip()
+                        + "\n\n"
+                        + chat_response.message.content
+                )
             )
 
         # Update buffer & history with the assistant response
@@ -278,7 +284,7 @@ class Chat:
 
         # Add the ephemeral best guess prompt
         buffered_history: History = self._buffer.buffer(
-            system_ephemeral=ChatMessage(
+            system_ephemeral=ChatMessage.from_content(
                 role="system",
                 content=build_no_context_llm_prompt(),
                 metadata=self.chat_reply_metadata
@@ -297,7 +303,7 @@ class Chat:
     def _no_context_saved_message(self) -> Tuple[History, None]:
 
         self._buffer.add_message(
-            message=ChatMessage(
+            message=ChatMessage.from_content(
                 role="assistant",
                 content=self._bot_parameters.no_context_message,
                 metadata=self.chat_reply_metadata
@@ -328,7 +334,7 @@ class Chat:
 
         # Generate the fake "AI" response
         self._buffer.add_message(
-            message=ChatMessage(
+            message=ChatMessage.from_content(
                 role="assistant",
                 content=context.node.node.metadata.get(ContextRetriever.ANSWER_METADATA_KEY),
                 metadata={
