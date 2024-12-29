@@ -7,7 +7,7 @@ from fastapi_restful.cbv import cbv
 from pydantic import Field
 from starlette.requests import Request
 
-from app.controllers.content.documents.upload import BotContentUploadResponse
+from app.controllers.content.documents.upload import UploadDocumentResponse
 from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, APIResponseModel, QuestionConfig, exception_response, \
     catch_exceptions
@@ -16,7 +16,7 @@ from criabot.bot.bot import Bot
 from criabot.bot.schemas import GroupContentResponse
 from criabot.schemas import BotNotFoundError
 
-ResponseModel: Type[APIResponseModel] = BotContentUploadResponse
+ResponseModel: Type[APIResponseModel] = UploadDocumentResponse
 
 view = APIRouter()
 
@@ -28,7 +28,7 @@ class QuestionUploadConfig(ContentUploadConfig):
 
 @cbv(view)
 class UploadQuestionRoute(CriaRoute):
-    ResponseModel = BotContentUploadResponse
+    ResponseModel = UploadDocumentResponse
 
     @view.post(
         path="/bots/{bot_name}/questions/upload",

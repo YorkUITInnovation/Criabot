@@ -42,6 +42,7 @@ class ManageAboutRoute(CriaRoute):
             request: Request,
             bot_name: str
     ) -> ResponseModel:
+
         # Try to create the bot
         about_model: AboutBot = await request.app.criabot.about(
             name=bot_name

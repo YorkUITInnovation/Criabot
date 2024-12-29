@@ -1,5 +1,6 @@
 from typing import Optional, List
 
+from CriadexSDK.routers.content.search import Asset
 from CriadexSDK.routers.content.upload import ContentUploadConfig
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
@@ -16,22 +17,23 @@ from criabot.schemas import BotNotFoundError
 view = APIRouter()
 
 
-class BotContentUploadResponse(APIResponse):
+class UploadDocumentResponse(APIResponse):
     document_name: Optional[str] = None
     token_usage: Optional[int] = None
 
 
-class ContentDocumentFileContents(BaseModel):
+class DocumentConfig(BaseModel):
     nodes: List[dict]
+    assets: List[Asset]
 
 
 class DocumentUploadConfig(ContentUploadConfig):
-    file_contents: ContentDocumentFileContents
+    file_contents: DocumentConfig
 
 
 @cbv(view)
 class UploadDocumentRoute(CriaRoute):
-    ResponseModel = BotContentUploadResponse
+    ResponseModel = UploadDocumentResponse
 
     @view.post(
         path="/bots/{bot_name}/documents/upload",
@@ -74,4 +76,4 @@ class UploadDocumentRoute(CriaRoute):
         )
 
 
-__all__ = ["view", "BotContentUploadResponse"]
+__all__ = ["view", "UploadDocumentResponse"]

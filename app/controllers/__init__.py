@@ -1,5 +1,4 @@
 import logging
-from typing import Literal
 
 from fastapi import Security, APIRouter, Depends, Header
 from fastapi.openapi.docs import get_swagger_ui_html
@@ -13,7 +12,7 @@ from . import docs
 
 
 # noinspection PyPep8Naming
-def custom_headers(X_Api_Stacktrace: Literal["true", "false"] = Header(default=False)) -> str:
+def custom_headers(X_Api_Stacktrace: bool = Header(default=False)) -> bool:
     return X_Api_Stacktrace
 
 

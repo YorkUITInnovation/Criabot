@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
-from app.controllers.content.documents.update import BotContentUpdateResponse
+from app.controllers.content.documents.update import UpdateDocumentResponse
 from app.controllers.content.questions.upload import QuestionUploadConfig
 from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, exception_response, catch_exceptions
@@ -16,7 +16,7 @@ view = APIRouter()
 
 @cbv(view)
 class UpdateQuestionRoute(CriaRoute):
-    ResponseModel = BotContentUpdateResponse
+    ResponseModel = UpdateDocumentResponse
 
     @view.patch(
         path="/bots/{bot_name}/questions/update",

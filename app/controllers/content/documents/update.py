@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
-from app.controllers.content.documents.upload import BotContentUploadResponse, DocumentUploadConfig
+from app.controllers.content.documents.upload import UploadDocumentResponse, DocumentUploadConfig
 from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, exception_response, catch_exceptions
 from app.core.route import CriaRoute
@@ -13,13 +13,13 @@ from criabot.schemas import BotNotFoundError
 view = APIRouter()
 
 
-class BotContentUpdateResponse(BotContentUploadResponse):
+class UpdateDocumentResponse(UploadDocumentResponse):
     pass
 
 
 @cbv(view)
 class UpdateDocumentRoute(CriaRoute):
-    ResponseModel = BotContentUpdateResponse
+    ResponseModel = UpdateDocumentResponse
 
     @view.patch(
         path="/bots/{bot_name}/documents/update",
@@ -62,4 +62,4 @@ class UpdateDocumentRoute(CriaRoute):
         )
 
 
-__all__ = ["view", "BotContentUpdateResponse"]
+__all__ = ["view", "UpdateDocumentResponse"]
