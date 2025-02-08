@@ -3,4 +3,4 @@
 docker buildx build --push \
 --platform linux/amd64,linux/arm64 \
 --tag uitadmin/criabot:latest \
---tag uitadmin/criabot:v1.7.9 .
+--tag uitadmin/criabot:v1.8.1 .

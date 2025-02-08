@@ -7,6 +7,8 @@ from CriadexSDK.routers.agents.azure.related_prompts import RelatedPrompt
 from CriadexSDK.routers.content.search import CompletionUsage, GroupSearchResponse, TextNodeWithScore, Asset
 from pydantic import BaseModel, Field
 
+from criabot.bot.chat.utils import embed_assets_in_message
+
 
 class ContextType(str, enum.Enum):
     QUESTION = "QUESTION"
@@ -49,8 +51,10 @@ class ChatReplyContent(BaseModel):
             message: ChatMessage,
             assets: list[Asset]
     ) -> "ChatReplyContent":
-        # Combine blocks into a single string
-        content: str = message.content
+        # Combine blocks into a single string, embed assets into it
+        content: str = embed_assets_in_message(message.content, assets)
+
+        # Add the assets to the content
 
         return cls(
             role=message.role,

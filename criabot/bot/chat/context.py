@@ -322,8 +322,9 @@ def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
         [INSTRUCTIONS]
         The documents below are the top results returned from a search engine.
         They may be relevant or completely irrelevant to the question.
-        If you use ANY information from an IMAGE DESCRIPTION, embed the image as part of your answer using the format ![Image <image_id>](<image_id>),
-        where <image_id> is a placeholder for the uuid found in the image description start/end tags.
+       
+        IMPORTANT: If you use ANY information from an IMAGE DESCRIPTION, ALWAYS EMBED THE IMAGE as part of your answer using the format ![Asset](<image_id>),
+        where <image_id> is a placeholder for the uuid found in the image description start/end tags. ONLY include the raw UUID, NEVER a URL.
         The ID of an image is found in the tags at the start and end of its description in the context below.
         A description tag looks like this: [IMAGE <image_id> DESCRIPTION START].
                 

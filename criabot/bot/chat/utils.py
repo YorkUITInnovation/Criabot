@@ -1,4 +1,6 @@
+import datetime
 import re
+import urllib.parse
 import uuid
 from typing import Dict
 
@@ -64,3 +66,57 @@ def strip_asset_data_from_group_responses(group_responses: Dict[str, GroupSearch
         group_response.assets = asset_copies
 
     return group_responses
+
+
+"""
+class Asset(BaseModel):
+    id: int
+    uuid: str
+    document_id: int
+    group_id: int
+    mimetype: str
+    data: str
+    created: datetime
+    description: str
+"""
+
+
+def embed_assets_in_message(message_text: str, assets: list[Asset]) -> str:
+    """
+    Embed assets in the message text.
+
+    :param message_text: The message text
+    :param assets: The assets to embed
+
+    """
+
+    for asset in assets:
+        asset_uuid_hex = uuid.UUID(asset.uuid).hex
+        escaped_data = urllib.parse.quote(asset.data)
+        message_text = re.sub(
+            rf'!\[.*?]\({asset_uuid_hex}\)',
+            f'<img id="{asset.uuid}" class="reply-asset" style="width: 100%" src="data:image/png;base64,{escaped_data}" alt="{asset.description}" />',
+            message_text
+        )
+
+    return message_text
+
+
+if __name__ == '__main__':
+    _uuid = '95ee8d49-9591-42bd-b847-bfef8fa05596'
+    _uuid_hex = uuid.UUID(_uuid).hex
+    test_data = 'iV\nBORw0KGgoAAAANSUhEUgAAAAgAAAAIAQMAAAD+wSzIAAAABlBMVEX///+/v7+jQ3Y5AAAADklEQVQI12P4AIX8EAgALgAD/aNpbtEAAAAASUVORK5CYII'
+    _test_text = f"This is some sample text ![Image {_uuid_hex}]({_uuid_hex}) and some trailing text."
+
+    _asset = Asset(
+        id=1,
+        uuid=_uuid,
+        document_id=1,
+        group_id=1,
+        mimetype='image/png',
+        data=test_data,
+        created=datetime.datetime.now(),
+        description='description'
+    )
+
+    print(embed_assets_in_message(_test_text, [_asset]))
