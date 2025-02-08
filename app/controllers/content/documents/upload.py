@@ -4,7 +4,7 @@ from CriadexSDK.routers.content.search import Asset
 from CriadexSDK.routers.content.upload import ContentUploadConfig
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from app.controllers.schemas import NOT_FOUND_CODE, \
@@ -24,7 +24,7 @@ class UploadDocumentResponse(APIResponse):
 
 class DocumentConfig(BaseModel):
     nodes: List[dict]
-    assets: List[Asset]
+    assets: List[Asset] = Field(default_factory=list)
 
 
 class DocumentUploadConfig(ContentUploadConfig):

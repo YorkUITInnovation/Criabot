@@ -10,7 +10,8 @@ from CriadexSDK.routers.content.search import CompletionUsage, Filter, TextNodeW
 from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import ChatBuffer, History
 from criabot.bot.chat.context import build_context_prompt, ContextRetriever, QuestionContext, TextContext, build_no_context_guess_prompt, build_no_context_llm_prompt, ContextRetrieverResponse
-from criabot.bot.chat.schemas import ChatReply
+from criabot.bot.chat.schemas import ChatReply, ChatReplyContent
+from criabot.bot.chat.utils import extract_used_assets, strip_asset_data_from_group_responses
 from criabot.cache.api import BotCacheAPI
 from criabot.cache.objects.chats import ChatModel
 from criabot.database.bots.tables.bot_params import BotParametersModel
@@ -125,7 +126,7 @@ class Chat:
 
         # Generate the response history
         if isinstance(response.context, TextContext):
-            reply_history, reply_tokens = await self._text_context_reply(response.context)
+            reply_history, reply_tokens, message_text = await self._text_context_reply(response.context)
         elif isinstance(response.context, QuestionContext):
             reply_history, reply_tokens = self._question_context_reply(response.context)
         elif response.context is None:
@@ -145,7 +146,7 @@ class Chat:
             chat_model=self._chat_model
         )
 
-        response_text: ChatMessage = reply_history[-1]
+        response_message: ChatMessage = reply_history[-1]
 
         related_prompts = response.context.related_prompts if response.context else []
         if self._bot_parameters.llm_generate_related_prompts and not related_prompts:
@@ -154,7 +155,7 @@ class Chat:
                     model_id=self._llm_model_id,
                     agent_config=RelatedPromptsAgentConfig(
                         llm_prompt=prompt,
-                        llm_reply=" ".join([block.text for block in response_text.blocks]),
+                        llm_reply=response_message.content,
                         max_reply_tokens=500,
                         temperature=0.1
                     )
@@ -170,9 +171,12 @@ class Chat:
         # Return reply
         return ChatReply(
             prompt=prompt,
-            content=response_text,
+            content=ChatReplyContent.from_message(
+                message=response_message,
+                assets=extract_used_assets(assets=response.assets, text=response_message.content)
+            ),
             history=reply_history,  # Reply history, which INCLUDES the ephemeral for logging
-            group_responses=response.group_responses,
+            group_responses=strip_asset_data_from_group_responses(response.group_responses),  # strip to save bandwidth
             context=response.context,
             related_prompts=related_prompts,
             token_usage=token_usage,
@@ -225,7 +229,7 @@ class Chat:
         # Reverse it, if llm_reply=False, direct question is True
         return not top_response.node.metadata.get("llm_reply")
 
-    async def _text_context_reply(self, context: TextContext) -> Tuple[History, CompletionUsage]:
+    async def _text_context_reply(self, context: TextContext) -> Tuple[History, CompletionUsage, str]:
 
         # Add the ephemeral context
         buffered_history: History = self._buffer.buffer(
@@ -243,7 +247,7 @@ class Chat:
         self._buffer.add_message(message=chat_response.message)
         buffered_history.append(chat_response.message)
 
-        return buffered_history, chat_response.raw.usage
+        return buffered_history, chat_response.raw.usage, chat_response.message.content
 
     async def _no_context_llm_guess(self) -> Tuple[History, CompletionUsage]:
 

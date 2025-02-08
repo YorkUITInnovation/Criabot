@@ -11,7 +11,7 @@ from CriadexSDK.routers.agents.azure.transform import TransformAgentConfig, Tran
 from CriadexSDK.routers.agents.cohere.rerank import RerankAgentConfig, RerankAgentResponse
 from CriadexSDK.routers.content.search import TextNodeWithScore, Filter, GroupSearchResponse, \
     SearchGroupConfig, \
-    GroupContentSearchRoute, CompletionUsage
+    GroupContentSearchRoute, CompletionUsage, Asset
 from CriadexSDK.routers.groups.create import IndexTypes
 from pydantic import BaseModel
 
@@ -42,6 +42,12 @@ class ContextRetrieverResponse(BaseModel):
     def nodes(self) -> List[TextNodeWithScore]:
         return list(
             itertools.chain.from_iterable(r.nodes for r in self.group_responses.values())
+        )
+
+    @property
+    def assets(self) -> List[Asset]:
+        return list(
+            itertools.chain.from_iterable(r.assets for r in self.group_responses.values())
         )
 
 
@@ -200,7 +206,7 @@ class ContextRetriever:
         # Make sure we have something
         if len(rerank_response.ranked_nodes) > 0:
             retriever_response.context = self.build_context(
-                rerank_response.ranked_nodes
+                ranked_nodes=rerank_response.ranked_nodes,
             )
 
         # Give 'er
@@ -222,7 +228,6 @@ class ContextRetriever:
 
         # Case 1) Top node is a question & direct response is requested
         if cls.is_question_node(top_node):
-
             related_prompts = top_node.node.metadata.get(cls.RELATED_PROMPTS_METADATA_KEY) or []
 
             # LLM Reply NOT Enabled
@@ -241,15 +246,15 @@ class ContextRetriever:
             # It's a cost-benefit of whether the potential for hallucination is worth the potential for better overall answers.
             top_node.node.metadata.get(cls.ANSWER_METADATA_KEY)
             return TextContext(
-                text=build_context([top_node]),
+                text=build_text_context(nodes=[top_node]),
                 nodes=ranked_nodes,
-                related_prompts=related_prompts
+                related_prompts=related_prompts,
             )
 
         # Case 2) Top node is not a question or direct response is not requested
         # This is the main case, text context gets built here
         return TextContext(
-            text=build_context(ranked_nodes),
+            text=build_text_context(nodes=ranked_nodes),
             nodes=ranked_nodes,
             related_prompts=related_prompts
         )
@@ -271,7 +276,7 @@ class ContextRetriever:
         return node.node.metadata.get(cls.LLM_REPLY_METADATA_KEY)
 
 
-def build_context(nodes: List[TextNodeWithScore]) -> str:
+def build_text_context(nodes: List[TextNodeWithScore]) -> str:
     """
     Build context given a set of relevant nodes
 
@@ -317,9 +322,11 @@ def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
         [INSTRUCTIONS]
         The documents below are the top results returned from a search engine.
         They may be relevant or completely irrelevant to the question.
-        If you use any information from an image description, insert the image into the answer wherever it is relevant, using the format !IMG=<image_id>=IMG!. 
-        The ID of an image is found in the description start and end tags, [IMAGE <image_id> DESCRIPTION START].
-        
+        If you use ANY information from an IMAGE DESCRIPTION, embed the image as part of your answer using the format ![Image <image_id>](<image_id>),
+        where <image_id> is a placeholder for the uuid found in the image description start/end tags.
+        The ID of an image is found in the tags at the start and end of its description in the context below.
+        A description tag looks like this: [IMAGE <image_id> DESCRIPTION START].
+                
         {extra_text}
 
         [INFORMATION]
