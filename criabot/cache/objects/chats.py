@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from criabot.bot.chat.buffer import ChatBuffer
 from criabot.cache.core import CacheObject
+from app.core.config import CHAT_EXPIRE_TIME
 
 
 class ChatModel(BaseModel):
@@ -41,12 +42,10 @@ class ChatModel(BaseModel):
 
 
 class Chats(CacheObject):
-    CHAT_EXPIRE_TIME: int = 60 * 60  # 1 hour
-
     async def set(self, chat_id: str, chat_model: ChatModel, **kwargs) -> None:
         async with self.redis() as redis:
             await redis.set(
-                chat_id, chat_model.model_dump_json(), ex=kwargs.get('ex', self.CHAT_EXPIRE_TIME)
+                chat_id, chat_model.model_dump_json(), ex=kwargs.get('ex', CHAT_EXPIRE_TIME)
             )
 
     async def get(self, chat_id: str, **kwargs) -> Optional[ChatModel]:
