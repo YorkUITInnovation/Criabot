@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from criabot.bot.chat.buffer import ChatBuffer
 from criabot.cache.core import CacheObject
-from app.core.config import CHAT_EXPIRE_TIME
+from app.core.constants import CHAT_EXPIRE_TIME
 
 
 class ChatModel(BaseModel):
