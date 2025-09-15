@@ -2,10 +2,8 @@ import logging
 import traceback
 from typing import List, Optional, Dict, Tuple
 
-from CriadexSDK import CriadexSDK
-from CriadexSDK.routers.agents.azure.chat import ChatMessage, AgentChatRoute, ChatAgentConfig, ChatResponse, TextBlock
-from CriadexSDK.routers.agents.azure.related_prompts import RelatedPromptsAgentConfig, AgentRelatedPromptsRoute
-from CriadexSDK.routers.content.search import CompletionUsage, Filter, TextNodeWithScore, GroupSearchResponse
+from RAGFlowSDK import RAGFlowSDK
+from RAGFlowSDK.schemas import ChatMessage, ChatResponse, CompletionUsage, Filter, TextNodeWithScore, GroupSearchResponse
 
 from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import ChatBuffer, History
@@ -36,17 +34,17 @@ class Chat:
         if not isinstance(chat_model, ChatModel):
             raise ValueError("Must have a valid chat model broski!")
 
-        self._bot: Bot = bot
-        self._criadex: CriadexSDK = bot.criadex
-        self._cache_api: BotCacheAPI = bot.cache_api
-        self._chat_model: ChatModel = chat_model
-        self._chat_id: str = chat_id
-        self._bot_parameters: BotParametersModel = bot_parameters
-        self._llm_model_id: int = llm_model_id
-        self._rerank_model_id: int = rerank_model_id
+        self._bot = bot
+        self._criadex = bot.criadex
+        self._cache_api = bot.cache_api
+        self._chat_model = chat_model
+        self._chat_id = chat_id
+        self._bot_parameters = bot_parameters
+        self._llm_model_id = llm_model_id
+        self._rerank_model_id = rerank_model_id
 
         # Build the context retriever
-        self._retriever: ContextRetriever = ContextRetriever(
+        self._retriever = ContextRetriever(
             criadex=self._criadex,
             rerank_model_id=self._rerank_model_id,
             llm_model_id=llm_model_id,
@@ -55,7 +53,7 @@ class Chat:
         )
 
         # Now generate the chat buffer
-        self._buffer: ChatBuffer = ChatBuffer(
+        self._buffer = ChatBuffer(
             max_tokens=self._bot_parameters.max_input_tokens,
             history=chat_model.update_system_message(
                 system_message=ChatMessage.from_content(
@@ -74,14 +72,7 @@ class Chat:
         :return: The bot
 
         """
-
         return self._bot
-
-    @property
-    def chat_reply_metadata(self) -> dict:
-        return {"bot_name": self._bot.name}
-
-    @property
     def history(self) -> List[ChatMessage]:
         """
         Retrieve the chat history
@@ -151,19 +142,21 @@ class Chat:
         related_prompts = response.context.related_prompts if response.context else []
         if self._bot_parameters.llm_generate_related_prompts and not related_prompts:
             try:
-                related_prompts_response: AgentRelatedPromptsRoute.Response = await self._criadex.agents.azure.related_prompts(
+                related_prompts_response = await self._criadex.agents.azure.related_prompts(
                     model_id=self._llm_model_id,
-                    agent_config=RelatedPromptsAgentConfig(
-                        llm_prompt=prompt,
-                        llm_reply=response_message.content,
-                        max_reply_tokens=500,
-                        temperature=0.1
-                    )
+                    agent_config={
+                        "llm_prompt": prompt,
+                        "llm_reply": response_message.content,
+                        "max_reply_tokens": 500,
+                        "temperature": 0.1
+                    }
                 )
-                related_prompts = related_prompts_response.agent_response.related_prompts
-
-                # Track token usage
-                token_usage.extend(related_prompts_response.agent_response.usage)
+                if isinstance(related_prompts_response, dict):
+                    related_prompts = related_prompts_response.get("agent_response", {}).get("related_prompts", [])
+                    token_usage.extend(related_prompts_response.get("agent_response", {}).get("usage", []))
+                else:
+                    related_prompts = related_prompts_response.agent_response.related_prompts
+                    token_usage.extend(related_prompts_response.agent_response.usage)
             except:
                 # Don't want this to actually cause issues if the agent fails because the LLM sucks
                 logging.error("Failed to generate related prompts! " + traceback.format_exc())
@@ -190,22 +183,19 @@ class Chat:
             ),
         )
 
-    async def _query_llm(self, history: History) -> ChatResponse:
+    async def _query_llm(self, history):
         """Send a chat to the LLM and receive a reply."""
 
         # Synthesize a reply based on our new info
-        response: AgentChatRoute.Response = await self._criadex.agents.azure.chat(
+        response = await self._criadex.agents.azure.chat(
             model_id=self._llm_model_id,
-            agent_config=ChatAgentConfig(
-                history=history,
+            agent_config={
+                "history": history,
                 **self._bot_parameters.model_dump()
-            )
+            }
         )
-
-        # Add metadata to response
-        chat_response: ChatResponse = response.verify().agent_response.chat_response
-        chat_response.message.metadata = {**chat_response.message.metadata, **self.chat_reply_metadata}
-
+        chat_response = response["agent_response"]["chat_response"] if isinstance(response, dict) else response.verify().agent_response.chat_response
+        chat_response["message"]["metadata"] = {**chat_response["message"].get("metadata", {}), **self.chat_reply_metadata} if isinstance(chat_response, dict) else {**chat_response.message.metadata, **self.chat_reply_metadata}
         return chat_response
 
     def _is_direct_question_reply(
@@ -229,30 +219,30 @@ class Chat:
         # Reverse it, if llm_reply=False, direct question is True
         return not top_response.node.metadata.get("llm_reply")
 
-    async def _text_context_reply(self, context: TextContext) -> Tuple[History, CompletionUsage, str]:
-
+    async def _text_context_reply(self, context):
         # Add the ephemeral context
-        buffered_history: History = self._buffer.buffer(
+        buffered_history = self._buffer.buffer(
             system_ephemeral=ChatMessage.from_content(
                 role="system",
                 content=build_context_prompt(context, best_guess=self._bot_parameters.no_context_llm_guess),
                 metadata=self.chat_reply_metadata
             )
         )
-
         # Synthesize a reply based on our new info
-        chat_response: ChatResponse = await self._query_llm(history=buffered_history)
-
+        chat_response = await self._query_llm(history=buffered_history)
         # Update buffer & history with the assistant response
-        self._buffer.add_message(message=chat_response.message)
-        buffered_history.append(chat_response.message)
+        if isinstance(chat_response, dict):
+            self._buffer.add_message(message=chat_response["message"])
+            buffered_history.append(chat_response["message"])
+            return buffered_history, chat_response.get("usage", None), chat_response.get("message", {}).get("content", "")
+        else:
+            self._buffer.add_message(message=chat_response.message)
+            buffered_history.append(chat_response.message)
+            return buffered_history, chat_response.raw.usage, chat_response.message.content
 
-        return buffered_history, chat_response.raw.usage, chat_response.message.content
-
-    async def _no_context_llm_guess(self) -> Tuple[History, CompletionUsage]:
-
+    async def _no_context_llm_guess(self):
         # Add the ephemeral best guess prompt
-        buffered_history: History = self._buffer.buffer(
+        buffered_history = self._buffer.buffer(
             system_ephemeral=ChatMessage.from_content(
                 role="system",
                 content=build_no_context_guess_prompt(
@@ -264,47 +254,54 @@ class Chat:
                 metadata=self.chat_reply_metadata
             )
         )
-
         # Synthesize a reply based on our new info
-        chat_response: ChatResponse = await self._query_llm(history=buffered_history)
-
+        chat_response = await self._query_llm(history=buffered_history)
         # Prepend no context message
         if self._bot_parameters.no_context_use_message:
-            chat_response.message.blocks = TextBlock(
-                text=(
+            if isinstance(chat_response, dict):
+                chat_response["message"]["blocks"] = {
+                    "text": self._bot_parameters.no_context_message.strip() + "\n\n" + chat_response["message"]["content"]
+                }
+            else:
+                chat_response.message.blocks = type(chat_response.message.blocks)(
+                    text=(
                         self._bot_parameters.no_context_message.strip()
                         + "\n\n"
                         + chat_response.message.content
+                    )
                 )
-            )
-
         # Update buffer & history with the assistant response
-        self._buffer.add_message(message=chat_response.message)
-        buffered_history.append(chat_response.message)
+        if isinstance(chat_response, dict):
+            self._buffer.add_message(message=chat_response["message"])
+            buffered_history.append(chat_response["message"])
+            return buffered_history, chat_response.get("usage", None)
+        else:
+            self._buffer.add_message(message=chat_response.message)
+            buffered_history.append(chat_response.message)
+            return buffered_history, chat_response.raw.usage
 
-        return buffered_history, chat_response.raw.usage
-
-    async def _no_context_llm_message(self) -> Tuple[History, CompletionUsage]:
-
+    async def _no_context_llm_message(self):
         # Add the ephemeral best guess prompt
-        buffered_history: History = self._buffer.buffer(
+        buffered_history = self._buffer.buffer(
             system_ephemeral=ChatMessage.from_content(
                 role="system",
                 content=build_no_context_llm_prompt(),
                 metadata=self.chat_reply_metadata
             )
         )
-
         # Synthesize a reply based on our new info
-        chat_response: ChatResponse = await self._query_llm(history=buffered_history)
-
+        chat_response = await self._query_llm(history=buffered_history)
         # Update buffer & history with the assistant response
-        self._buffer.add_message(message=chat_response.message)
-        buffered_history.append(chat_response.message)
+        if isinstance(chat_response, dict):
+            self._buffer.add_message(message=chat_response["message"])
+            buffered_history.append(chat_response["message"])
+            return buffered_history, chat_response.get("usage", None)
+        else:
+            self._buffer.add_message(message=chat_response.message)
+            buffered_history.append(chat_response.message)
+            return buffered_history, chat_response.raw.usage
 
-        return buffered_history, chat_response.raw.usage
-
-    def _no_context_saved_message(self) -> Tuple[History, None]:
+    def _no_context_saved_message(self):
 
         self._buffer.add_message(
             message=ChatMessage.from_content(
@@ -313,12 +310,11 @@ class Chat:
                 metadata=self.chat_reply_metadata
             )
         )
-
         return self._buffer.history, None
 
     async def _no_context_reply(
-            self,
-    ) -> Tuple[History, CompletionUsage]:
+        self,
+    ):
 
         # Case 1) The LLM should guess
         if self._bot_parameters.no_context_llm_guess:
@@ -334,7 +330,7 @@ class Chat:
 
         return history, usage
 
-    def _question_context_reply(self, context: QuestionContext) -> Tuple[History, None]:
+    def _question_context_reply(self, context):
 
         # Generate the fake "AI" response
         self._buffer.add_message(

@@ -4,13 +4,8 @@ from asyncio import AbstractEventLoop
 from typing import Optional, Tuple
 
 import aioredis
-from CriadexSDK import CriadexSDK
-from CriadexSDK.routers.auth import AuthCreateRoute
-from CriadexSDK.routers.auth.create import AuthCreateConfig
-from CriadexSDK.routers.group_auth import GroupAuthCreateRoute
-from CriadexSDK.routers.groups import GroupDeleteRoute, GroupCreateRoute
-from CriadexSDK.routers.groups.about import GroupInfo
-from CriadexSDK.routers.groups.create import PartialGroupConfig, IndexTypes
+from CriadexSDK.ragflow_sdk import RAGFlowSDK
+from CriadexSDK.ragflow_schemas import AuthCreateConfig  # Use new schemas if needed
 from aiomysql import Pool
 from aioredis import ConnectionPool
 from sqlalchemy import URL, text
@@ -140,7 +135,7 @@ class Criabot:
 
         return self._mysql_engine
 
-    async def create(self, name: str, config: BotCreateConfig) -> AuthCreateRoute.Response:
+    async def create(self, name: str, config: BotCreateConfig):
         """
         Create a bot, including all the required indexes
 
@@ -156,7 +151,7 @@ class Criabot:
             raise BotExistsError()
 
         # Make a new access token
-        new_auth: AuthCreateRoute.Response = await self._create_new_bot_auth()
+        new_auth = await self._create_new_bot_auth()
 
         # Create the indexes & authenticate on them
         await self._create_new_bot_groups(
@@ -302,7 +297,7 @@ class Criabot:
         chat_model: ChatModel = await self._redis_api.chats.get(chat_id=chat_id)
         bot_parameters: AboutBot = await self.about(name=bot_name)
         bot: Bot = await self.get(name=bot_name)
-        group_info: GroupInfo = await bot.retrieve_group_info()
+        group_info = await bot.retrieve_group_info()
 
         # If the chat DNE
         if chat_model is None:
@@ -335,12 +330,7 @@ class Criabot:
 
         bot_id: Optional[int] = await self._mysql_api.bots.retrieve_id(name=name)
 
-        if bot_id is None:
-            raise BotNotFoundError()
-
-        await self._mysql_api.bot_params.update(bot_id=bot_id, config=params)
-
-    async def _create_new_bot_auth(self) -> AuthCreateRoute.Response:
+    async def _create_new_bot_auth(self):
         """
         Create a new authentication token for use with the bot
 
@@ -348,21 +338,21 @@ class Criabot:
 
         """
 
-        result: AuthCreateRoute.Response = await self._criadex.auth.create(
+        result = await self._criadex.auth.create(
             api_key=(secrets.token_urlsafe(32)),
             create_config=AuthCreateConfig(
                 master=False
             )
         )
-
-        return result.verify()
+        # Optionally: check response for success or error
+        return result
 
     async def _create_new_bot_groups(
-            self,
-            bot_name: str,
-            bot_config: BotCreateConfig,
-            bot_api_key: str
-    ) -> Tuple[GroupCreateRoute.Response, GroupCreateRoute.Response]:
+        self,
+        bot_name: str,
+        bot_config: BotCreateConfig,
+        bot_api_key: str
+    ):
         """
         Create the necessary indexes for the bot
 
@@ -373,27 +363,22 @@ class Criabot:
 
         """
 
-        async def create_group(index_type: IndexTypes) -> GroupCreateRoute.Response:
-            group_name: str = bot_name + Bot.INDEX_SUFFIX[index_type]
 
-            # Create the index
-            new_group: GroupCreateRoute.Response = await self._create_new_bot_group(
+        async def create_group(index_type):
+            group_name = bot_name + Bot.INDEX_SUFFIX[index_type]
+            new_group = await self._create_new_bot_group(
                 group_name=group_name,
-                group_config=PartialGroupConfig(
-                    type=index_type,
-                    llm_model_id=bot_config.llm_model_id,
-                    embedding_model_id=bot_config.embedding_model_id,
-                    rerank_model_id=bot_config.rerank_model_id
-                )
+                group_config={
+                    "type": index_type,
+                    "llm_model_id": bot_config.llm_model_id,
+                    "embedding_model_id": bot_config.embedding_model_id,
+                    "rerank_model_id": bot_config.rerank_model_id
+                }
             )
-
-            # Authenticate the token on the index
             await self._create_new_bot_auth_group(
                 group_name=group_name,
                 bot_api_key=bot_api_key
             )
-
-            # Return the index
             return new_group
 
         return (
@@ -405,45 +390,43 @@ class Criabot:
     async def _create_new_bot_group(
             self,
             group_name: str,
-            group_config: PartialGroupConfig
-    ) -> GroupCreateRoute.Response:
+            group_config: dict
+    ):
         """
         Create a new Bot Index for a new Bot
 
         :param group_name: The name of the index
         :param group_config: Partial config for the SDK
-        :return: Criadex API Response
+        :return: RAGFlow API Response
 
         """
-
-        result: GroupCreateRoute.Response = await self._criadex.manage.create(
+        result = await self._criadex.manage.create(
             group_name=group_name,
             group_config=group_config
         )
-
-        return result.verify()
+        # Optionally: check response for success or error
+        return result
 
     async def _create_new_bot_auth_group(
             self,
             group_name: str,
             bot_api_key: str
-    ) -> GroupAuthCreateRoute.Response:
+    ):
         """
         Create a new Index Authorization with the newly created API key
 
         :param group_name: The name of the index to add the key to
         :param bot_api_key: The key to add
-        :return: Criadex API Response
-        :raises CriadexError: If request fails
+        :return: RAGFlow API Response
+        :raises Exception: If request fails
 
         """
-
-        result: GroupAuthCreateRoute.Response = await self._criadex.group_auth.create(
+        result = await self._criadex.group_auth.create(
             group_name=group_name,
             api_key=bot_api_key
         )
-
-        return result.verify()
+        # Optionally: check response for success or error
+        return result
 
     @property
     def mysql_api(self) -> BotDatabaseAPI:
@@ -454,5 +437,5 @@ class Criabot:
         return self._redis_api
 
     @property
-    def criadex(self) -> CriadexSDK:
+    def criadex(self):
         return self._criadex
