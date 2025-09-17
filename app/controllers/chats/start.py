@@ -6,7 +6,6 @@ from starlette.requests import Request
 
 from app.controllers.schemas import SUCCESS_CODE, catch_exceptions, APIResponse
 from app.core.route import CriaRoute
-from criabot.bot.bot import Bot
 
 view = APIRouter()
 
@@ -33,6 +32,7 @@ class StartChatRoute(CriaRoute):
             request: Request
     ) -> ResponseModel:
         # Try to start a chat
+        from criabot.bot.bot import Bot
         chat_id: str = await Bot.start_chat(cache_api=request.app.criabot.redis_api)
 
         # Success!

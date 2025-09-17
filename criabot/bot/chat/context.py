@@ -4,8 +4,8 @@ import re
 import textwrap
 from typing import List, Optional, Dict, Awaitable, Union, Type
 
-from RAGFlowSDK import RAGFlowSDK
-from RAGFlowSDK.schemas import TextNodeWithScore, Filter, GroupSearchResponse, CompletionUsage, Asset
+from CriadexSDK.ragflow_sdk import RAGFlowSDK
+from CriadexSDK.ragflow_schemas import TextNodeWithScore, Filter, GroupSearchResponse, CompletionUsage, Asset
 from pydantic import BaseModel
 
 from criabot.bot.bot import Bot

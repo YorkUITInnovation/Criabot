@@ -7,7 +7,7 @@ from app.controllers.content.questions.upload import QuestionUploadConfig
 from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, exception_response, catch_exceptions
 from app.core.route import CriaRoute
-from criabot.bot.bot import Bot
+
 from criabot.bot.schemas import GroupContentResponse
 from criabot.schemas import BotNotFoundError
 
@@ -35,13 +35,15 @@ class UpdateQuestionRoute(CriaRoute):
             message="That bot could not be found!"
         )
     )
+
     async def execute(
-            self,
-            request: Request,
-            bot_name: str,
-            file: QuestionUploadConfig
+        self,
+        request: Request,
+        bot_name: str,
+        file: QuestionUploadConfig
     ) -> ResponseModel:
         # Try to retrieve the bot
+        from criabot.bot.bot import Bot
         bot: Bot = await request.app.criabot.get(name=bot_name)
 
         response: GroupContentResponse = await bot.update_group_content(

@@ -7,7 +7,7 @@ from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, exception_response, catch_exceptions
 from app.controllers.content.documents.list import BotContentListResponse
 from app.core.route import CriaRoute
-from criabot.bot.bot import Bot
+
 from criabot.schemas import BotNotFoundError
 
 view = APIRouter()
@@ -34,11 +34,13 @@ class ListQuestionsRoute(CriaRoute):
             message="That bot could not be found!"
         )
     )
+
     async def execute(
-            self,
-            request: Request,
-            bot_name: str
+        self,
+        request: Request,
+        bot_name: str
     ) -> ResponseModel:
+        from criabot.bot.bot import Bot
         bot: Bot = await request.app.criabot.get(name=bot_name)
         content: GroupContentListRoute.Response = await bot.list_group_files(index_type="QUESTION")
 

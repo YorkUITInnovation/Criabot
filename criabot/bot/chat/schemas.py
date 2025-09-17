@@ -47,15 +47,12 @@ class ChatReplyContent(BaseModel):
 
     @classmethod
     def from_message(
-            cls,
-            message: ChatMessage,
-            assets: list[Asset]
+        cls,
+        message: ChatMessage,
+        assets: list[Asset]
     ) -> "ChatReplyContent":
         # Combine blocks into a single string, embed assets into it
-        content: str = embed_assets_in_message(message.content, assets)
-
-        # Add the assets to the content
-
+        content: str = embed_assets_in_message(message.blocks[0].text, assets)
         return cls(
             role=message.role,
             content=content,

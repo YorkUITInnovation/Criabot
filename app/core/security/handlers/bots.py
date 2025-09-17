@@ -7,7 +7,6 @@ from starlette.requests import Request
 
 from app.controllers.schemas import APIResponse
 from app.core.security.get_api_key import GetApiKey, BadAPIKeyException
-from criabot.bot.bot import Bot
 
 BotNameFuncType: Type = Awaitable[str]
 
@@ -61,6 +60,7 @@ class GetApiKeyBots(GetApiKey):
                 detail="Bot name not included in params!"
             )
 
+        from criabot.bot.bot import Bot
         test_group_name: str = Bot.bot_group_name(bot_name, "DOCUMENT")
         group_response: GroupAuthCheckRoute.Response = await self.get_group_auth(test_group_name)
 

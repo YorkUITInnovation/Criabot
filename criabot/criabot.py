@@ -3,21 +3,24 @@ import secrets
 from asyncio import AbstractEventLoop
 from typing import Optional, Tuple
 
-import aioredis
+from redis import asyncio as aioredis
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
 from CriadexSDK.ragflow_schemas import AuthCreateConfig  # Use new schemas if needed
 from aiomysql import Pool
-from aioredis import ConnectionPool
+from redis.asyncio import ConnectionPool
 from sqlalchemy import URL, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 
-from criabot.bot.chat.chat import Chat
-from criabot.schemas import MySQLCredentials, RedisCredentials, CriadexCredentials, BotExistsError, \
-    BotCreateConfig, BotNotFoundError, AboutBot
-from .bot.bot import Bot
+from criabot.schemas import (
+    MySQLCredentials,
+    RedisCredentials,
+    CriadexCredentials,
+    BotExistsError,
+    BotCreateConfig,
+    BotNotFoundError,
+    AboutBot
+)
 from .bot.schemas import ChatNotFoundError
-from .cache.api import BotCacheAPI
-from .cache.objects.chats import ChatModel
 from .database.bots.bots import BotDatabaseAPI
 from .database.bots.tables.bot_params import BotParametersModel, BotParametersConfig, BotParametersBaseConfig
 from .database.bots.tables.bots import BotsModel, BotsConfig
@@ -44,26 +47,26 @@ class Criabot:
         self._criadex_credentials: CriadexCredentials = criadex_credentials
 
         # Criadex SDK
-        self._criadex: CriadexSDK = CriadexSDK(
+        self._criadex: RAGFlowSDK = RAGFlowSDK(
             api_base=self._criadex_credentials.api_base,
             error_stacktrace=criadex_stacktrace
         )
 
         # Database
-        self._mysql_engine: Optional[Pool] = None
-        self._mysql_api: Optional[BotDatabaseAPI] = None
+        self._mysql_engine = None
+        self._mysql_api = None
 
         # Cache
-        self._redis_pool: Optional[ConnectionPool] = None
-        self._redis_api: Optional[BotCacheAPI] = None
+        self._redis_pool = None
+        self._redis_api = None
 
         # Other
         try:
-            self._loop: AbstractEventLoop = asyncio.get_running_loop()
+            self._loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._loop: AbstractEventLoop = asyncio.get_event_loop()
+            self._loop = asyncio.get_event_loop()
 
-        self._already_initialized: bool = False
+        self._already_initialized = False
 
     async def initialize(self) -> None:
         """
@@ -95,7 +98,8 @@ class Criabot:
         await self._mysql_api.initialize()
 
         # Redis API Startup
-        self._redis_api: BotCacheAPI = BotCacheAPI(pool=self._redis_pool)
+        from .cache.api import BotCacheAPI
+        self._redis_api = BotCacheAPI(pool=self._redis_pool)
 
     async def _create_mysql_engine(self) -> AsyncEngine:
         """
@@ -218,6 +222,7 @@ class Criabot:
             raise BotNotFoundError()
 
         # Get the bot to delete it
+        from .bot.bot import Bot
         bot: Bot = await self.get(name=name)
 
         # Get index names
@@ -263,7 +268,7 @@ class Criabot:
             params=params_model
         )
 
-    async def get(self, name: str) -> Bot:
+    async def get(self, name: str):
         """
         Retrieve an existing bot
 
@@ -277,13 +282,14 @@ class Criabot:
             raise BotNotFoundError()
 
         # Create a bot (light-weight operation)
+        from .bot.bot import Bot
         return Bot(
             name=name,
             criadex=self._criadex,
             bot_cache=self._redis_api
         )
 
-    async def get_bot_chat(self, bot_name: str, chat_id: str) -> Chat:
+    async def get_bot_chat(self, bot_name: str, chat_id: str):
         """
         Get a bot chat given its ID
 
@@ -294,9 +300,10 @@ class Criabot:
 
         """
 
+        from .cache.objects.chats import ChatModel
         chat_model: ChatModel = await self._redis_api.chats.get(chat_id=chat_id)
         bot_parameters: AboutBot = await self.about(name=bot_name)
-        bot: Bot = await self.get(name=bot_name)
+        bot = await self.get(name=bot_name)
         group_info = await bot.retrieve_group_info()
 
         # If the chat DNE
@@ -304,6 +311,7 @@ class Criabot:
             raise ChatNotFoundError(chat_id=chat_id)
 
         # Create light-weight chat
+        from criabot.bot.chat.chat import Chat
         return Chat(
             bot=bot,
             llm_model_id=group_info.llm_model_id,
@@ -365,6 +373,7 @@ class Criabot:
 
 
         async def create_group(index_type):
+            from .bot.bot import Bot
             group_name = bot_name + Bot.INDEX_SUFFIX[index_type]
             new_group = await self._create_new_bot_group(
                 group_name=group_name,
@@ -433,7 +442,7 @@ class Criabot:
         return self._mysql_api
 
     @property
-    def redis_api(self) -> BotCacheAPI:
+    def redis_api(self):
         return self._redis_api
 
     @property

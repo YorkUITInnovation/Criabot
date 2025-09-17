@@ -7,8 +7,7 @@ from app.controllers.chats.send import BotChatSendResponse
 from app.controllers.schemas import SUCCESS_CODE, NOT_FOUND_CODE, ChatSendConfig, \
     exception_response, catch_exceptions
 from app.core.route import CriaRoute
-from criabot.bot.bot import Bot
-from criabot.bot.chat.chat import ChatReply, Chat
+
 from criabot.bot.schemas import ChatNotFoundError
 
 view = APIRouter()
@@ -40,11 +39,14 @@ class QueryChatRoute(CriaRoute):
             message="That chat does not exist or is expired...which doesn't make sense."
         )
     )
+
     async def execute(
-            self,
-            request: Request,
-            chat_config: ChatSendConfig
+        self,
+        request: Request,
+        chat_config: ChatSendConfig
     ) -> ResponseModel:
+        from criabot.bot.bot import Bot
+        from criabot.bot.chat.chat import Chat, ChatReply
 
         # Check the bots exist
         if not await request.app.criabot.exists(*[chat_config.bot_name, *chat_config.extra_bots]):

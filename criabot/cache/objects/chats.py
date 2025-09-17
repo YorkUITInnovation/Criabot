@@ -1,7 +1,7 @@
 import json
 from typing import List, Optional, Any
 
-import aioredis
+from redis import asyncio as aioredis
 from CriadexSDK.routers.agents.azure.chat import ChatMessage
 from pydantic import BaseModel
 

@@ -65,9 +65,10 @@ class ChatBuffer:
         return token_count
 
     @classmethod
-    def get_token_metadata(cls, message: ChatMessage) -> Optional[int]:
-        """Retrieve the metadata for a token"""
-        return message.metadata.get(cls.TOKEN_COUNT_META_NAME)
+    def get_token_metadata(cls, message: ChatMessage) -> int:
+        """Retrieve the metadata for a token, return 0 if missing"""
+        value = message.metadata.get(cls.TOKEN_COUNT_META_NAME)
+        return value if value is not None else 0
 
     @property
     def history(self) -> List[ChatMessage]:

@@ -1,1 +1,1 @@
-from  .criabot import Criabot
+from .criabot import Criabot

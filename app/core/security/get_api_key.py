@@ -11,7 +11,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from app.controllers.schemas import UnauthorizedResponse
-from criabot import Criabot
+from criabot.criabot import Criabot
 
 api_key_header: APIKeyQuery = APIKeyQuery(name="x-api-key", auto_error=False)
 api_key_query: APIKeyHeader = APIKeyHeader(name="x-api-key", auto_error=False)

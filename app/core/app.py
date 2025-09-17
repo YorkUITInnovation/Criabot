@@ -7,14 +7,14 @@ import warnings
 from contextlib import asynccontextmanager
 from typing import Any, List, AsyncContextManager
 
-import aioredis
+from redis import asyncio as aioredis
 from fastapi import FastAPI
 from starlette.datastructures import State
 from starlette.middleware.cors import CORSMiddleware
 
 from app.controllers import router
 from app.core.security.get_api_key import GetApiKey, BadAPIKeyException
-from criabot import Criabot
+from criabot.criabot import Criabot
 from . import config
 from .middleware import StatusMiddleware
 

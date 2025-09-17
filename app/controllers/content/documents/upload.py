@@ -10,7 +10,6 @@ from starlette.requests import Request
 from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, exception_response, catch_exceptions, APIResponse
 from app.core.route import CriaRoute
-from criabot.bot.bot import Bot
 from criabot.bot.schemas import GroupContentResponse
 from criabot.schemas import BotNotFoundError
 
@@ -53,12 +52,13 @@ class UploadDocumentRoute(CriaRoute):
         )
     )
     async def execute(
-            self,
-            request: Request,
-            bot_name: str,
-            file: DocumentUploadConfig
+        self,
+        request: Request,
+        bot_name: str,
+        file: DocumentUploadConfig
     ) -> ResponseModel:
         # Try to retrieve the bot
+        from criabot.bot.bot import Bot
         bot: Bot = await request.app.criabot.get(name=bot_name)
 
         # Add the documents

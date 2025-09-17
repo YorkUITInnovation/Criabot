@@ -2,8 +2,8 @@ import logging
 import traceback
 from typing import List, Optional, Dict, Tuple
 
-from RAGFlowSDK import RAGFlowSDK
-from RAGFlowSDK.schemas import ChatMessage, ChatResponse, CompletionUsage, Filter, TextNodeWithScore, GroupSearchResponse
+from CriadexSDK.ragflow_sdk import RAGFlowSDK
+from CriadexSDK.ragflow_schemas import ChatMessage, ChatResponse, CompletionUsage, Filter, TextNodeWithScore, GroupSearchResponse
 
 from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import ChatBuffer, History
@@ -42,6 +42,7 @@ class Chat:
         self._bot_parameters = bot_parameters
         self._llm_model_id = llm_model_id
         self._rerank_model_id = rerank_model_id
+        self.chat_reply_metadata = {}
 
         # Build the context retriever
         self._retriever = ContextRetriever(
@@ -56,9 +57,10 @@ class Chat:
         self._buffer = ChatBuffer(
             max_tokens=self._bot_parameters.max_input_tokens,
             history=chat_model.update_system_message(
-                system_message=ChatMessage.from_content(
+                system_message=ChatMessage(
                     role="system",
-                    content=bot_parameters.system_message,
+                    blocks=[{"type": "text", "text": bot_parameters.system_message}],
+                    additional_kwargs={},
                     metadata=self.chat_reply_metadata
                 )
             ).history
@@ -108,9 +110,10 @@ class Chat:
 
         # Add the user's prompt to the buffer
         self._buffer.add_message(
-            message=ChatMessage.from_content(
+            message=ChatMessage(
                 role="user",
-                content=prompt,
+                blocks=[{"type": "text", "text": prompt}],
+                additional_kwargs={},
                 metadata=self.chat_reply_metadata
             )
         )
@@ -146,7 +149,7 @@ class Chat:
                     model_id=self._llm_model_id,
                     agent_config={
                         "llm_prompt": prompt,
-                        "llm_reply": response_message.content,
+                        "llm_reply": response_message.blocks[0].text,
                         "max_reply_tokens": 500,
                         "temperature": 0.1
                     }
@@ -166,21 +169,21 @@ class Chat:
             prompt=prompt,
             content=ChatReplyContent.from_message(
                 message=response_message,
-                assets=extract_used_assets(assets=response.assets, text=response_message.content)
+                assets=extract_used_assets(assets=response.assets, text=response_message.blocks[0].text)
             ),
-            history=reply_history,  # Reply history, which INCLUDES the ephemeral for logging
-            group_responses=strip_asset_data_from_group_responses(response.group_responses),  # strip to save bandwidth
+            history=[m.model_dump() for m in reply_history],
+            group_responses=strip_asset_data_from_group_responses(response.group_responses),
             context=response.context,
             related_prompts=related_prompts,
             token_usage=token_usage,
             search_units=response.search_units,
             verified_response=response.context.context_type == "QUESTION" if response.context else False,
-            total_usage=CompletionUsage(
-                completion_tokens=sum(usage.completion_tokens for usage in token_usage),
-                prompt_tokens=sum(usage.prompt_tokens for usage in token_usage),
-                total_tokens=sum(usage.total_tokens for usage in token_usage),
-                usage_label="All"
-            ),
+            total_usage={
+                "completion_tokens": sum(usage.completion_tokens for usage in token_usage),
+                "prompt_tokens": sum(usage.prompt_tokens for usage in token_usage),
+                "total_tokens": sum(usage.total_tokens for usage in token_usage),
+                "usage_label": "All"
+            },
         )
 
     async def _query_llm(self, history):
@@ -222,9 +225,10 @@ class Chat:
     async def _text_context_reply(self, context):
         # Add the ephemeral context
         buffered_history = self._buffer.buffer(
-            system_ephemeral=ChatMessage.from_content(
+            system_ephemeral=ChatMessage(
                 role="system",
-                content=build_context_prompt(context, best_guess=self._bot_parameters.no_context_llm_guess),
+                blocks=[{"type": "text", "text": build_context_prompt(context, best_guess=self._bot_parameters.no_context_llm_guess)}],
+                additional_kwargs={},
                 metadata=self.chat_reply_metadata
             )
         )
@@ -232,8 +236,16 @@ class Chat:
         chat_response = await self._query_llm(history=buffered_history)
         # Update buffer & history with the assistant response
         if isinstance(chat_response, dict):
-            self._buffer.add_message(message=chat_response["message"])
-            buffered_history.append(chat_response["message"])
+            msg = chat_response["message"]
+            if isinstance(msg, dict):
+                msg = ChatMessage(
+                    role=msg.get("role", "assistant"),
+                    blocks=msg.get("blocks", [{"type": "text", "text": msg.get("content", "") }]),
+                    additional_kwargs=msg.get("additional_kwargs", {}),
+                    metadata=msg.get("metadata", {})
+                )
+            self._buffer.add_message(message=msg)
+            buffered_history.append(msg)
             return buffered_history, chat_response.get("usage", None), chat_response.get("message", {}).get("content", "")
         else:
             self._buffer.add_message(message=chat_response.message)
@@ -243,14 +255,15 @@ class Chat:
     async def _no_context_llm_guess(self):
         # Add the ephemeral best guess prompt
         buffered_history = self._buffer.buffer(
-            system_ephemeral=ChatMessage.from_content(
+            system_ephemeral=ChatMessage(
                 role="system",
-                content=build_no_context_guess_prompt(
+                blocks=[{"type": "text", "text": build_no_context_guess_prompt(
                     no_context_message=(
                         self._bot_parameters.no_context_message
                         if self._bot_parameters.no_context_use_message else None
                     )
-                ),
+                )}],
+                additional_kwargs={},
                 metadata=self.chat_reply_metadata
             )
         )
@@ -283,9 +296,10 @@ class Chat:
     async def _no_context_llm_message(self):
         # Add the ephemeral best guess prompt
         buffered_history = self._buffer.buffer(
-            system_ephemeral=ChatMessage.from_content(
+            system_ephemeral=ChatMessage(
                 role="system",
-                content=build_no_context_llm_prompt(),
+                blocks=[{"type": "text", "text": build_no_context_llm_prompt()}],
+                additional_kwargs={},
                 metadata=self.chat_reply_metadata
             )
         )
@@ -304,9 +318,10 @@ class Chat:
     def _no_context_saved_message(self):
 
         self._buffer.add_message(
-            message=ChatMessage.from_content(
+            message=ChatMessage(
                 role="assistant",
-                content=self._bot_parameters.no_context_message,
+                blocks=[{"type": "text", "text": self._bot_parameters.no_context_message}],
+                additional_kwargs={},
                 metadata=self.chat_reply_metadata
             )
         )
@@ -334,9 +349,10 @@ class Chat:
 
         # Generate the fake "AI" response
         self._buffer.add_message(
-            message=ChatMessage.from_content(
+            message=ChatMessage(
                 role="assistant",
-                content=context.node.node.metadata.get(ContextRetriever.ANSWER_METADATA_KEY),
+                blocks=[{"type": "text", "text": context.node.node.metadata.get(ContextRetriever.ANSWER_METADATA_KEY)}],
+                additional_kwargs={},
                 metadata={
                     "no_llm_reply": {
                         "file_name": context.node.node.metadata.get(ContextRetriever.FILE_NAME_METADATA_KEY),

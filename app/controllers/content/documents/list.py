@@ -8,7 +8,7 @@ from starlette.requests import Request
 from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, exception_response, catch_exceptions, APIResponse
 from app.core.route import CriaRoute
-from criabot.bot.bot import Bot
+
 from criabot.schemas import BotNotFoundError
 
 view = APIRouter()
@@ -39,11 +39,13 @@ class ListDocumentsRoute(CriaRoute):
             message="That bot could not be found!"
         )
     )
+
     async def execute(
-            self,
-            request: Request,
-            bot_name: str
+        self,
+        request: Request,
+        bot_name: str
     ) -> ResponseModel:
+        from criabot.bot.bot import Bot
         bot: Bot = await request.app.criabot.get(name=bot_name)
         content: GroupContentListRoute.Response = await bot.list_group_files(index_type="DOCUMENT")
 
