@@ -13,3 +13,6 @@ venv
 
 # Test
 __pycache__
+
+# data
+tiktoken

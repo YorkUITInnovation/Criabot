@@ -283,10 +283,9 @@ def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
     """
 
     extra_text: str = (
-        """If nothing from this information is relevant, use your knowledge to guess."""
+        "If nothing from this information is relevant, use your knowledge to guess."
         if best_guess else
-        """If nothing from this information is relevant, say your database don't have that information,
-         even if you do have a guess."""
+        "If nothing from this information is relevant, say your database don't have that information, even if you do have a guess."
     )
 
     return clean_text(

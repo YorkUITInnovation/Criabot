@@ -4,7 +4,7 @@ from typing import List, Optional, Dict, Union, Literal
 
 from CriadexSDK.routers.agents.azure.chat import ChatMessage
 from CriadexSDK.routers.agents.azure.related_prompts import RelatedPrompt
-from CriadexSDK.routers.content.search import CompletionUsage, GroupSearchResponse, TextNodeWithScore, Asset
+from CriadexSDK.ragflow_schemas import CompletionUsage, GroupSearchResponse, TextNodeWithScore, Asset
 from pydantic import BaseModel, Field
 
 from criabot.bot.chat.utils import embed_assets_in_message

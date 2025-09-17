@@ -1,4 +1,3 @@
-
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from criabot.bot.bot import Bot
@@ -32,3 +31,9 @@ async def test_search_group(bot, criadex_api):
         group_name="test_bot-document-index",
         search_config={}
     )
+
+@pytest.mark.asyncio
+async def test_set_chat_model(bot):
+    chat_model = MagicMock()
+    await bot.set_chat_model(chat_id="test_chat", chat_model=chat_model)
+    bot.cache_api.chats.set.assert_called_once_with(chat_id="test_chat", chat_model=chat_model)

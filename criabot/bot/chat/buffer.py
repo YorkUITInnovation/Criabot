@@ -182,16 +182,14 @@ class ChatBuffer:
 
             if print_debug:
                 print(
-                    "Prompt Characters:", len(message.content),
+                    "Prompt Characters:", len(message.blocks[0].text),
                     "| Prompt Tokens:", cls.get_token_metadata(message),
                     "| Remove N Characters:", remove_n_chars,
                     "| Exceeding N Tokens:", excess_tokens,
-                    "| Current Prompt: ", f"\"{message.content}\""
+                    "| Current Prompt: ", f"{message.blocks[0].text}"
                 )
 
-            message.blocks = TextBlock(
-                text=message.content[:-remove_n_chars]
-            )
+            message.blocks[0].text = message.blocks[0].text[:-remove_n_chars]
 
         # Update at the end
         message.metadata[cls.TOKEN_COUNT_META_NAME] = cls.get_token_metadata(message)

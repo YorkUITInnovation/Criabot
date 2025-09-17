@@ -285,8 +285,16 @@ class Chat:
                 )
         # Update buffer & history with the assistant response
         if isinstance(chat_response, dict):
-            self._buffer.add_message(message=chat_response["message"])
-            buffered_history.append(chat_response["message"])
+            msg = chat_response["message"]
+            if isinstance(msg, dict):
+                msg = ChatMessage(
+                    role=msg.get("role", "assistant"),
+                    blocks=[{"type": "text", "text": msg.get("content", "") }],
+                    additional_kwargs=msg.get("additional_kwargs", {}),
+                    metadata=msg.get("metadata", {})
+                )
+            self._buffer.add_message(message=msg)
+            buffered_history.append(msg)
             return buffered_history, chat_response.get("usage", None)
         else:
             self._buffer.add_message(message=chat_response.message)
@@ -307,8 +315,16 @@ class Chat:
         chat_response = await self._query_llm(history=buffered_history)
         # Update buffer & history with the assistant response
         if isinstance(chat_response, dict):
-            self._buffer.add_message(message=chat_response["message"])
-            buffered_history.append(chat_response["message"])
+            msg = chat_response["message"]
+            if isinstance(msg, dict):
+                msg = ChatMessage(
+                    role=msg.get("role", "assistant"),
+                    blocks=[{"type": "text", "text": msg.get("content", "") }],
+                    additional_kwargs=msg.get("additional_kwargs", {}),
+                    metadata=msg.get("metadata", {})
+                )
+            self._buffer.add_message(message=msg)
+            buffered_history.append(msg)
             return buffered_history, chat_response.get("usage", None)
         else:
             self._buffer.add_message(message=chat_response.message)
