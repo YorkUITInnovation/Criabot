@@ -63,6 +63,32 @@ services:
       volumes:
         - ./qdrant_data/storage:/qdrant/storage
         - ./qdrant_data/config:/qdrant/config/custom_config.yaml
+
+    # New PostgreSQL service for migration
+    postgres:
+      image: postgres:16
+      restart: always
+      environment:
+        POSTGRES_USER: cria
+        POSTGRES_PASSWORD: cria
+        POSTGRES_DB: criabot
+      ports:
+        - "127.0.0.1:5432:5432"
+      volumes:
+        - ./postgres_data:/var/lib/postgresql/data:cached
+
+    # New Elasticsearch service for migration (can be replaced with Infinite)
+    elasticsearch:
+      image: docker.io/elasticsearch:8.13.4
+      environment:
+        discovery.type: single-node
+        ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ELASTIC_PASSWORD: elastic
+      ports:
+        - "127.0.0.1:9200:9200"
+        - "127.0.0.1:9300:9300"
+      volumes:
+        - ./elasticsearch_data:/usr/share/elasticsearch/data:cached
     # Cria-Back Criadex
     criadex:
       image: uitadmin/criadex:v1.8.0

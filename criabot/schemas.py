@@ -50,12 +50,21 @@ class MySQLCredentials(BaseModel):
     database: str
 
 
+
+class PostgreSQLCredentials(BaseModel):
+    """
+    Credentials for accessing the PostgreSQL Database
+    """
+    host: str
+    port: int
+    username: str
+    password: str
+    database: str
+
 class RedisCredentials(BaseModel):
     """
     Credentials for accessing the Redis Memcache
-
     """
-
     host: str
     port: int
     username: str

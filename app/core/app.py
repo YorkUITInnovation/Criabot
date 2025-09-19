@@ -53,7 +53,7 @@ class CriabotAPI(FastAPI):
         _app: CriabotAPI = CriabotAPI(
             criabot=Criabot(
                 criadex_credentials=config.CRIADEX_CREDENTIALS,
-                mysql_credentials=config.MYSQL_CREDENTIALS,
+                postgres_credentials=config.POSTGRES_CREDENTIALS,
                 redis_credentials=config.REDIS_CREDENTIALS,
                 criadex_stacktrace=config.CRIADEX_STACKTRACE
             ),

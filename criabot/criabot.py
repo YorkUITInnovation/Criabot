@@ -6,13 +6,14 @@ from typing import Optional, Tuple
 from redis import asyncio as aioredis
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
 from CriadexSDK.ragflow_schemas import AuthCreateConfig  # Use new schemas if needed
-from aiomysql import Pool
+import asyncpg
 from redis.asyncio import ConnectionPool
 from sqlalchemy import URL, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 
 from criabot.schemas import (
-    MySQLCredentials,
+    # Use PostgreSQLCredentials for migration
+    PostgreSQLCredentials,
     RedisCredentials,
     CriadexCredentials,
     BotExistsError,
@@ -36,13 +37,13 @@ class Criabot:
     def __init__(
             self,
             criadex_credentials: CriadexCredentials,
-            mysql_credentials: MySQLCredentials,
+            postgres_credentials: PostgreSQLCredentials,
             redis_credentials: RedisCredentials,
             criadex_stacktrace: bool = False
     ):
 
         # Credentials
-        self._mysql_credentials: MySQLCredentials = mysql_credentials
+        self._postgres_credentials: PostgreSQLCredentials = postgres_credentials
         self._redis_credentials: RedisCredentials = redis_credentials
         self._criadex_credentials: CriadexCredentials = criadex_credentials
 
@@ -53,8 +54,8 @@ class Criabot:
         )
 
         # Database
-        self._mysql_engine = None
-        self._mysql_api = None
+        self._postgres_engine = None
+        self._postgres_api = None
 
         # Cache
         self._redis_pool = None
@@ -82,62 +83,57 @@ class Criabot:
         # Criadex Startup
         await self._criadex.authenticate(self._criadex_credentials.api_key)
 
-        # SQL DB Startup
-        self._mysql_engine: AsyncEngine = await self._create_mysql_engine()
+        # PostgreSQL DB Startup
+        self._postgres_engine = await self._create_postgres_engine()
 
         # Redis DB Startup
-        self._redis_pool: ConnectionPool = aioredis.ConnectionPool(
+        self._redis_pool = aioredis.ConnectionPool(
             host=self._redis_credentials.host,
             port=self._redis_credentials.port,
             username=self._redis_credentials.username,
             password=self._redis_credentials.password
         )
 
-        # SQL DB API Startup
-        self._mysql_api: BotDatabaseAPI = BotDatabaseAPI(engine=self._mysql_engine)
-        await self._mysql_api.initialize()
+        # PostgreSQL DB API Startup
+        self._postgres_api = BotDatabaseAPI(engine=self._postgres_engine)
+        await self._postgres_api.initialize()
 
         # Redis API Startup
         from .cache.api import BotCacheAPI
         self._redis_api = BotCacheAPI(pool=self._redis_pool)
 
-    async def _create_mysql_engine(self) -> AsyncEngine:
+    async def _create_postgres_engine(self) -> AsyncEngine:
         """
-        Create the MYSQL pool & database if not found
-        :return: The pool
-
+        Create the PostgreSQL engine & database if not found
+        :return: The engine
         """
-
+        # Create database if not exists (PostgreSQL)
         init_engine: AsyncEngine = create_async_engine(
             URL.create(
-                drivername="mysql+aiomysql",
-                host=self._mysql_credentials.host,
-                port=self._mysql_credentials.port,
-                username=self._mysql_credentials.username,
-                password=self._mysql_credentials.password,
+                drivername="postgresql+asyncpg",
+                host=self._postgres_credentials.host,
+                port=self._postgres_credentials.port,
+                username=self._postgres_credentials.username,
+                password=self._postgres_credentials.password,
             )
         )
-
         async with init_engine.begin() as connection:
             await connection.execute(
                 text(
-                    f"CREATE DATABASE IF NOT EXISTS "
-                    f"{self._mysql_credentials.database}"
+                    f"CREATE DATABASE {self._postgres_credentials.database}"
                 )
             )
-
-        self._mysql_engine = create_async_engine(
+        self._postgres_engine = create_async_engine(
             URL.create(
-                drivername="mysql+aiomysql",
-                host=self._mysql_credentials.host,
-                port=self._mysql_credentials.port,
-                username=self._mysql_credentials.username,
-                password=self._mysql_credentials.password,
-                database=self._mysql_credentials.database
+                drivername="postgresql+asyncpg",
+                host=self._postgres_credentials.host,
+                port=self._postgres_credentials.port,
+                username=self._postgres_credentials.username,
+                password=self._postgres_credentials.password,
+                database=self._postgres_credentials.database
             )
         )
-
-        return self._mysql_engine
+        return self._postgres_engine
 
     async def create(self, name: str, config: BotCreateConfig):
         """
@@ -165,14 +161,14 @@ class Criabot:
         )
 
         # Add the bot to MySQL
-        bot_id: int = await self._mysql_api.bots.insert(
+        bot_id = await self._postgres_api.bots.insert(
             BotsConfig(
                 name=name
             )
         )
 
         # Store the parameters
-        await self._mysql_api.bot_params.insert(
+        await self._postgres_api.bot_params.insert(
             config=BotParametersConfig(
                 bot_id=bot_id,
                 **config.model_dump()
@@ -188,11 +184,10 @@ class Criabot:
 
         """
 
-        bot_id: Optional[int] = await self._mysql_api.bots.retrieve_id(name=name)
+        bot_id = await self._postgres_api.bots.retrieve_id(name=name)
 
         if not bot_id:
             raise BotNotFoundError()
-
         return bot_id
 
     async def exists(self, *names: str) -> bool:
@@ -204,7 +199,7 @@ class Criabot:
 
         """
 
-        return await self._mysql_api.bots.exists(*names)
+        return await self._postgres_api.bots.exists(*names)
 
     async def delete(self, name: str) -> None:
         """
@@ -234,17 +229,16 @@ class Criabot:
 
         # Delete the indexes
         for group_name in group_names:
-            response: GroupDeleteRoute.Response = await self._criadex.manage.delete(
+            response = await self._criadex.manage.delete(
                 group_name=group_name
             )
-
-            response.verify()
+            # If needed, check response or log it
 
         # Delete the bot params.py
-        await self._mysql_api.bot_params.delete(bot_id=bot_id)
+        await self._postgres_api.bot_params.delete(bot_id=bot_id)
 
         # Delete from MySQL
-        await self._mysql_api.bots.delete(name=name)
+        await self._postgres_api.bots.delete(name=name)
 
     async def about(self, name: str) -> AboutBot:
         """
@@ -255,13 +249,11 @@ class Criabot:
 
         """
 
-        bots_model: BotsModel = await self._mysql_api.bots.retrieve(name=name)
+        bots_model = await self._postgres_api.bots.retrieve(name=name)
 
         if bots_model is None:
             raise BotNotFoundError()
-
-        params_model: BotParametersModel = await self._mysql_api.bot_params.retrieve(bot_id=bots_model.id)
-
+        params_model = await self._postgres_api.bot_params.retrieve(bot_id=bots_model.id)
         # Build an about-me
         return AboutBot(
             info=bots_model,
@@ -336,7 +328,7 @@ class Criabot:
 
     async def update_parameters(self, name: str, params: BotParametersBaseConfig) -> None:
 
-        bot_id: Optional[int] = await self._mysql_api.bots.retrieve_id(name=name)
+        bot_id = await self._postgres_api.bots.retrieve_id(name=name)
 
     async def _create_new_bot_auth(self):
         """
@@ -438,8 +430,8 @@ class Criabot:
         return result
 
     @property
-    def mysql_api(self) -> BotDatabaseAPI:
-        return self._mysql_api
+    def postgres_api(self) -> BotDatabaseAPI:
+        return self._postgres_api
 
     @property
     def redis_api(self):
