@@ -10,16 +10,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     services:
-      postgres:
-        image: postgres:16
+      mysql:
+        image: mysql:8.0
         env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: test
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: test
         ports:
-          - 5432:5432
+          - 3306:3306
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "mysqladmin ping -h localhost -u root -ptest"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -55,11 +54,11 @@ jobs:
       run: |
         echo "APP_API_MODE=TESTING" >> .env
         echo "APP_API_PORT=25575" >> .env
-        echo "POSTGRES_HOST=localhost" >> .env
-        echo "POSTGRES_PORT=5432" >> .env
-        echo "POSTGRES_USERNAME=test" >> .env
-        echo "POSTGRES_PASSWORD=test" >> .env
-        echo "POSTGRES_DATABASE=test" >> .env
+        echo "MYSQL_HOST=127.0.0.1" >> .env
+        echo "MYSQL_PORT=3306" >> .env
+        echo "MYSQL_USERNAME=root" >> .env
+        echo "MYSQL_PASSWORD=test" >> .env
+        echo "MYSQL_DATABASE=test" >> .env
         echo "CRIADEX_API_BASE=http://localhost:8000" >> .env
         echo "CRIADEX_API_KEY=test" >> .env
         echo "REDIS_HOST=localhost" >> .env

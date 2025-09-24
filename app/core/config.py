@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 from app.core.objects import AppMode, check_env_path
 
-from criabot.schemas import CriadexCredentials, RedisCredentials, PostgreSQLCredentials
+from criabot.schemas import CriadexCredentials, RedisCredentials, MySQLCredentials
 
 ENV_PATH: str = os.environ.get('ENV_PATH', "./.env")
 
@@ -31,12 +31,12 @@ An asynchronous REST API built on [LlamaIndex](https://github.com/jerryjliu/llam
 
 
 # PostgreSQL Config
-POSTGRES_CREDENTIALS: PostgreSQLCredentials = PostgreSQLCredentials(
-    host=os.environ.get("POSTGRES_HOST"),
-    port=os.environ.get("POSTGRES_PORT"),
-    username=os.environ.get("POSTGRES_USERNAME"),
-    password=os.environ.get("POSTGRES_PASSWORD"),
-    database=os.environ.get("POSTGRES_DATABASE")
+MYSQL_CREDENTIALS: MySQLCredentials = MySQLCredentials(
+    host=os.environ.get("MYSQL_HOST"),
+    port=os.environ.get("MYSQL_PORT"),
+    username=os.environ.get("MYSQL_USERNAME"),
+    password=os.environ.get("MYSQL_PASSWORD"),
+    database=os.environ.get("MYSQL_DATABASE")
 )
 
 # Criadex Config

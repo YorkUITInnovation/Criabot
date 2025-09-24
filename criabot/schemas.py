@@ -51,15 +51,7 @@ class MySQLCredentials(BaseModel):
 
 
 
-class PostgreSQLCredentials(BaseModel):
-    """
-    Credentials for accessing the PostgreSQL Database
-    """
-    host: str
-    port: int
-    username: str
-    password: str
-    database: str
+
 
 class RedisCredentials(BaseModel):
     """

@@ -14,7 +14,7 @@ fastapi-restful
 typing-inspect
 
 pydantic-settings
-asyncpg>=0.29.0
+
 
 # Don't freak out, the token is read-only on CriadexSDK
 # Due for renewal: November 20th, 2024
