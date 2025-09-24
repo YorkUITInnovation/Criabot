@@ -5,9 +5,11 @@ from typing import Optional, Tuple
 
 from redis import asyncio as aioredis
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
-from CriadexSDK.ragflow_schemas import AuthCreateConfig
-import aiomysql
+from CriadexSDK.ragflow_schemas import AuthCreateConfig  # Use new schemas if needed
+from aiomysql import Pool
 from redis.asyncio import ConnectionPool
+from sqlalchemy import URL, text
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 
 from criabot.schemas import (
     MySQLCredentials,
@@ -51,7 +53,7 @@ class Criabot:
         )
 
         # Database
-        self._mysql_pool = None
+        self._mysql_engine = None
         self._mysql_api = None
 
         # Cache
@@ -80,55 +82,62 @@ class Criabot:
         # Criadex Startup
         await self._criadex.authenticate(self._criadex_credentials.api_key)
 
-        # MySQL DB Startup
-        self._mysql_pool = await self._create_mysql_pool()
+        # SQL DB Startup
+        self._mysql_engine: AsyncEngine = await self._create_mysql_engine()
 
         # Redis DB Startup
-        self._redis_pool = aioredis.ConnectionPool(
+        self._redis_pool: ConnectionPool = aioredis.ConnectionPool(
             host=self._redis_credentials.host,
             port=self._redis_credentials.port,
             username=self._redis_credentials.username,
             password=self._redis_credentials.password
         )
 
-        # MySQL DB API Startup
-        self._mysql_api = BotDatabaseAPI(pool=self._mysql_pool)
+        # SQL DB API Startup
+        self._mysql_api: BotDatabaseAPI = BotDatabaseAPI(engine=self._mysql_engine)
         await self._mysql_api.initialize()
 
         # Redis API Startup
         from .cache.api import BotCacheAPI
         self._redis_api = BotCacheAPI(pool=self._redis_pool)
 
-    async def _create_mysql_pool(self) -> aiomysql.Pool:
+    async def _create_mysql_engine(self) -> AsyncEngine:
         """
-        Create the MySQL pool. If the database does not exist, create it.
-        :return: The pool instance
+        Create the MYSQL pool & database if not found
+        :return: The pool
 
         """
 
-        # First we initialize the DB
-        async with aiomysql.connect(
+        init_engine: AsyncEngine = create_async_engine(
+            URL.create(
+                drivername="mysql+aiomysql",
                 host=self._mysql_credentials.host,
                 port=self._mysql_credentials.port,
-                user=self._mysql_credentials.username,
+                username=self._mysql_credentials.username,
                 password=self._mysql_credentials.password,
-                autocommit=True
-        ) as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    f"CREATE DATABASE IF NOT EXISTS {self._mysql_credentials.database}"
-                )
-
-        # Then make a pool on the DB
-        return await aiomysql.create_pool(
-            host=self._mysql_credentials.host,
-            port=self._mysql_credentials.port,
-            user=self._mysql_credentials.username,
-            password=self._mysql_credentials.password,
-            autocommit=True,
-            loop=self._loop,
-            db=self._mysql_credentials.database
+            )
         )
+
+        async with init_engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"CREATE DATABASE IF NOT EXISTS "
+                    f"{self._mysql_credentials.database}"
+                )
+            )
+
+        self._mysql_engine = create_async_engine(
+            URL.create(
+                drivername="mysql+aiomysql",
+                host=self._mysql_credentials.host,
+                port=self._mysql_credentials.port,
+                username=self._mysql_credentials.username,
+                password=self._mysql_credentials.password,
+                database=self._mysql_credentials.database
+            )
+        )
+
+        return self._mysql_engine
 
     async def create(self, name: str, config: BotCreateConfig):
         """
@@ -156,7 +165,7 @@ class Criabot:
         )
 
         # Add the bot to MySQL
-        bot_id = await self._mysql_api.bots.insert(
+        bot_id: int = await self._mysql_api.bots.insert(
             BotsConfig(
                 name=name
             )
@@ -179,10 +188,11 @@ class Criabot:
 
         """
 
-        bot_id = await self._mysql_api.bots.retrieve_id(name=name)
+        bot_id: Optional[int] = await self._mysql_api.bots.retrieve_id(name=name)
 
         if not bot_id:
             raise BotNotFoundError()
+
         return bot_id
 
     async def exists(self, *names: str) -> bool:
@@ -224,10 +234,11 @@ class Criabot:
 
         # Delete the indexes
         for group_name in group_names:
-            response = await self._criadex.manage.delete(
+            response: GroupDeleteRoute.Response = await self._criadex.manage.delete(
                 group_name=group_name
             )
-            # If needed, check response or log it
+
+            response.verify()
 
         # Delete the bot params.py
         await self._mysql_api.bot_params.delete(bot_id=bot_id)
@@ -244,11 +255,13 @@ class Criabot:
 
         """
 
-        bots_model = await self._mysql_api.bots.retrieve(name=name)
+        bots_model: BotsModel = await self._mysql_api.bots.retrieve(name=name)
 
         if bots_model is None:
             raise BotNotFoundError()
-        params_model = await self._mysql_api.bot_params.retrieve(bot_id=bots_model.id)
+
+        params_model: BotParametersModel = await self._mysql_api.bot_params.retrieve(bot_id=bots_model.id)
+
         # Build an about-me
         return AboutBot(
             info=bots_model,
@@ -323,7 +336,7 @@ class Criabot:
 
     async def update_parameters(self, name: str, params: BotParametersBaseConfig) -> None:
 
-        bot_id = await self._mysql_api.bots.retrieve_id(name=name)
+        bot_id: Optional[int] = await self._mysql_api.bots.retrieve_id(name=name)
 
     async def _create_new_bot_auth(self):
         """

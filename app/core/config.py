@@ -29,8 +29,7 @@ SWAGGER_DESCRIPTION = f"""
 An asynchronous REST API built on [LlamaIndex](https://github.com/jerryjliu/llama_index) for indexing/semantic search.
 """
 
-
-# PostgreSQL Config
+# MySQL Config
 MYSQL_CREDENTIALS: MySQLCredentials = MySQLCredentials(
     host=os.environ.get("MYSQL_HOST"),
     port=os.environ.get("MYSQL_PORT"),

@@ -50,13 +50,12 @@ class MySQLCredentials(BaseModel):
     database: str
 
 
-
-
-
 class RedisCredentials(BaseModel):
     """
     Credentials for accessing the Redis Memcache
+
     """
+
     host: str
     port: int
     username: str
