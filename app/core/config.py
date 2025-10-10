@@ -26,7 +26,7 @@ SWAGGER_TITLE: str = "Criabot API"
 SWAGGER_FAVICON: str = "https://i.imgur.com/9XOI3qg.png"
 SWAGGER_DESCRIPTION = f"""
 <img width="40px" src="{SWAGGER_FAVICON}"/><br/><br/>
-An asynchronous REST API built on [LlamaIndex](https://github.com/jerryjliu/llama_index) for indexing/semantic search.
+An asynchronous REST API built on [Ragflow](https://github.com/infiniflow/ragflow) for indexing/semantic search.
 """
 
 # MySQL Config

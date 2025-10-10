@@ -2,7 +2,7 @@ import json
 from typing import List, Optional, Any
 
 from redis import asyncio as aioredis
-from CriadexSDK.routers.agents.azure.chat import ChatMessage
+from CriadexSDK.ragflow_schemas import ChatMessage, TextBlock
 from pydantic import BaseModel
 
 from criabot.bot.chat.buffer import ChatBuffer
@@ -19,9 +19,9 @@ class ChatModel(BaseModel):
 
     def add_user_message(self, prompt: str, bot_name: str, **kwargs) -> None:
         self.history.append(
-            ChatMessage.from_content(
+            ChatMessage(
                 role="user",
-                content=prompt,
+                blocks=[TextBlock(text=prompt)],
                 metadata={**kwargs.pop("metadata", dict()), "bot_asked": bot_name},
                 **kwargs
             )

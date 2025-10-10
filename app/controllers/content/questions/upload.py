@@ -1,7 +1,7 @@
 import uuid
 from typing import Type
 
-from CriadexSDK.routers.content.upload import ContentUploadConfig
+from CriadexSDK.ragflow_schemas import ContentUploadConfig
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from pydantic import Field

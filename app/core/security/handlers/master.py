@@ -1,4 +1,4 @@
-from CriadexSDK.routers.auth import AuthCheckRoute
+from CriadexSDK.ragflow_schemas import AuthCheckResponse
 
 from app.core.security.get_api_key import GetApiKey, BadAPIKeyException
 
@@ -7,7 +7,7 @@ class GetApiKeyMaster(GetApiKey):
 
     async def execute(self) -> str:
 
-        response: AuthCheckRoute.Response = await self.get_auth()
+        response: AuthCheckResponse = await self.get_auth()
 
         if not response.master:
             raise BadAPIKeyException(

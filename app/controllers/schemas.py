@@ -6,8 +6,8 @@ from functools import wraps
 from json import JSONDecodeError
 from typing import Optional, Type, List, TypeVar, Callable, Awaitable
 
-from CriadexSDK.core.api.route import CriadexError
-from CriadexSDK.routers.content.search import Filter
+import httpx
+from CriadexSDK.ragflow_schemas import Filter
 from fastapi import Form
 from pydantic import BaseModel, Field
 from starlette import status
@@ -34,7 +34,7 @@ class APIResponse(BaseModel):
     message: Optional[str] = None
     timestamp: int = round(time.time())
     code: str = "SUCCESS"
-    error: Optional[str] = Field(default=None, hidden=True)
+    error: Optional[str] = Field(default=None, exclude=True)
 
     def dict(self, *args, **kwargs):
 
@@ -52,16 +52,6 @@ class APIResponse(BaseModel):
             del data["error"]
 
         return data
-
-    class Config:
-        @staticmethod
-        def json_schema_extra(schema: dict, _):
-            """Via https://github.com/tiangolo/fastapi/issues/1378"""
-            props = {}
-            for k, v in schema.get('properties', {}).items():
-                if not v.get("hidden", False):
-                    props[k] = v
-            schema["properties"] = props
 
 
 APIResponseModel = TypeVar('APIResponseModel', bound=APIResponse)
@@ -83,20 +73,19 @@ def catch_exceptions(
         async def wrapper(*args, **kwargs) -> APIResponseModel:
             try:
                 return await func(*args, **kwargs)
-            except CriadexError as ex:
+            except httpx.HTTPStatusError as ex:
 
                 log_message: str = (
                         traceback.format_exc() +
-                        ex.response.model_dump_json(indent=4)
+                        ex.response.text
                 )
 
-                if ex.response.code == "ERROR":
-                    logging.error(log_message)
+                logging.error(log_message)
 
                 return output_shape(
-                    code=ex.response.code,
-                    status=ex.response.status,
-                    message=f"[Criadex]: " + ex.response.message,
+                    code=CRIADEX_ERROR,
+                    status=ex.response.status_code,
+                    message=f"[Criadex]: {ex.response.reason_phrase}",
                     error=log_message
                 )
 

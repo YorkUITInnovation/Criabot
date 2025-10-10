@@ -1,11 +1,10 @@
 import asyncio
 import secrets
-from asyncio import AbstractEventLoop
-from typing import Optional, Tuple
+from typing import Optional
 
 from redis import asyncio as aioredis
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
-from CriadexSDK.ragflow_schemas import AuthCreateConfig  # Use new schemas if needed
+from CriadexSDK.ragflow_schemas import AuthCreateConfig, GroupDeleteResponse
 from aiomysql import Pool
 from redis.asyncio import ConnectionPool
 from sqlalchemy import URL, text
@@ -59,12 +58,6 @@ class Criabot:
         # Cache
         self._redis_pool = None
         self._redis_api = None
-
-        # Other
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._loop = asyncio.get_event_loop()
 
         self._already_initialized = False
 
@@ -234,11 +227,9 @@ class Criabot:
 
         # Delete the indexes
         for group_name in group_names:
-            response: GroupDeleteRoute.Response = await self._criadex.manage.delete(
+            await self._criadex.manage.delete(
                 group_name=group_name
             )
-
-            response.verify()
 
         # Delete the bot params.py
         await self._mysql_api.bot_params.delete(bot_id=bot_id)

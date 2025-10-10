@@ -2,9 +2,8 @@ import logging
 from abc import abstractmethod
 from typing import Optional
 
-from CriadexSDK import CriadexSDK
-from CriadexSDK.routers.auth import AuthCheckRoute
-from CriadexSDK.routers.group_auth import GroupAuthCheckRoute
+from CriadexSDK.ragflow_sdk import RAGFlowSDK
+from CriadexSDK.ragflow_schemas import AuthCheckResponse, GroupAuthCheckResponse
 from fastapi import Security, HTTPException
 from fastapi.security import APIKeyQuery, APIKeyHeader
 from starlette.requests import Request
@@ -23,7 +22,7 @@ class GetApiKey:
         self.request: Optional[Request] = None
         self.api_key: Optional[str] = None
         self.criabot: Optional[Criabot] = None
-        self.criadex: Optional[CriadexSDK] = None
+        self.criadex: Optional[RAGFlowSDK] = None
 
     @abstractmethod
     async def execute(self) -> str:
@@ -65,34 +64,20 @@ class GetApiKey:
 
         return api_key
 
-    async def get_auth(self) -> AuthCheckRoute.Response:
+    async def get_auth(self) -> AuthCheckResponse:
 
-        response: AuthCheckRoute.Response = await self.criadex.auth.check(
+        response: AuthCheckResponse = await self.criadex.auth.check(
             api_key=self.api_key
         )
-
-        if not response.status == 200:
-            logging.error("Failed to check API key. Received payload: " + str(response))
-            raise BadAPIKeyException(
-                status_code=500,
-                detail="Failed to check API key due to an error!"
-            )
 
         return response
 
-    async def get_group_auth(self, group_name: str) -> GroupAuthCheckRoute.Response:
+    async def get_group_auth(self, group_name: str) -> GroupAuthCheckResponse:
 
-        response: AuthCheckRoute.Response = await self.criadex.group_auth.check(
+        response: GroupAuthCheckResponse = await self.criadex.group_auth.check(
             group_name=group_name,
             api_key=self.api_key
         )
-
-        if not response.status == 200:
-            logging.error("Failed to check API key. Received payload: " + str(response))
-            raise BadAPIKeyException(
-                status_code=500,
-                detail="Failed to check API key due to an error!"
-            )
 
         return response
 
@@ -110,7 +95,7 @@ class GetApiKey:
         )
 
         self.criabot: Criabot = request.app.criabot
-        self.criadex: CriadexSDK = request.app.criabot.criadex
+        self.criadex: RAGFlowSDK = request.app.criabot.criadex
         self.request: Request = request
 
         # Make sure an API key was passed

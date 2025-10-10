@@ -1,7 +1,6 @@
 from typing import Optional, List
 
-from CriadexSDK.routers.content.search import Asset
-from CriadexSDK.routers.content.upload import ContentUploadConfig
+from CriadexSDK.ragflow_schemas import Asset, ContentUploadConfig
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from pydantic import BaseModel, Field

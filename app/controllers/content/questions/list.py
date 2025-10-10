@@ -1,4 +1,4 @@
-from CriadexSDK.routers.content import GroupContentListRoute
+from CriadexSDK.ragflow_schemas import ContentListResponse
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
@@ -42,7 +42,7 @@ class ListQuestionsRoute(CriaRoute):
     ) -> ResponseModel:
         from criabot.bot.bot import Bot
         bot: Bot = await request.app.criabot.get(name=bot_name)
-        content: GroupContentListRoute.Response = await bot.list_group_files(index_type="QUESTION")
+        content: ContentListResponse = await bot.list_group_files(index_type="QUESTION")
 
         return self.ResponseModel(
             code=SUCCESS_CODE,

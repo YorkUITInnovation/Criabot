@@ -1,6 +1,6 @@
 from typing import Optional, List
 
-from CriadexSDK.routers.agents.azure.chat import ChatMessage
+from CriadexSDK.ragflow_schemas import ChatMessage
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request

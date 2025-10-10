@@ -108,6 +108,32 @@ services:
         interval: 5s
         timeout: 5s
         retries: 5
+    # MinIO for Ragflow
+    minio:
+      image: minio/minio:latest
+      command: server /data --console-address ":9001"
+      ports:
+        - "127.0.0.1:9000:9000"
+        - "127.0.0.1:9001:9001"
+      volumes:
+        - ./minio_data:/data
+      environment:
+        MINIO_ROOT_USER: admin
+        MINIO_ROOT_PASSWORD: password
+    # Ragflow
+    ragflow:
+      image: infiniflow/ragflow:v0.20.5
+      platform: linux/amd64
+      ports:
+        - "127.0.0.1:8080:80"
+      environment:
+        RAGFLOW_SERVER_CONF_PATH: /ragflow/conf/service_conf.yaml
+      volumes:
+        - ./ragflow_data:/ragflow/data
+      depends_on:
+        - minio
+        - elasticsearch
+        - mysql
     # Cria-Back CriaParse
     criaparse:
       image: uitadmin/criaparse:latest
