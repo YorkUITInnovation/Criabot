@@ -73,7 +73,7 @@ class Criabot:
             raise InitializedAlreadyError()
 
         # Criadex Startup
-        await self._criadex.authenticate(self._criadex_credentials.api_key)
+        await asyncio.to_thread(self._criadex.authenticate, self._criadex_credentials.api_key)
 
         # SQL DB Startup
         self._mysql_engine: AsyncEngine = await self._create_mysql_engine()
@@ -227,9 +227,7 @@ class Criabot:
 
         # Delete the indexes
         for group_name in group_names:
-            await self._criadex.manage.delete(
-                group_name=group_name
-            )
+            await asyncio.to_thread(self._criadex.manage.delete, group_name=group_name)
 
         # Delete the bot params.py
         await self._mysql_api.bot_params.delete(bot_id=bot_id)
@@ -337,7 +335,7 @@ class Criabot:
 
         """
 
-        result = await self._criadex.auth.create(
+        result = await asyncio.to_thread(self._criadex.auth.create,
             api_key=(secrets.token_urlsafe(32)),
             create_config=AuthCreateConfig(
                 master=False
@@ -400,7 +398,7 @@ class Criabot:
         :return: RAGFlow API Response
 
         """
-        result = await self._criadex.manage.create(
+        result = await asyncio.to_thread(self._criadex.manage.create,
             group_name=group_name,
             group_config=group_config
         )
@@ -421,7 +419,7 @@ class Criabot:
         :raises Exception: If request fails
 
         """
-        result = await self._criadex.group_auth.create(
+        result = await asyncio.to_thread(self._criadex.group_auth.create,
             group_name=group_name,
             api_key=bot_api_key
         )

@@ -1,4 +1,3 @@
-
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from criabot.criabot import Criabot, BotExistsError
@@ -31,9 +30,9 @@ def criabot_instance(criadex_credentials, mysql_credentials, redis_credentials):
 @pytest.mark.asyncio
 async def test_create_bot(criabot_instance):
     criabot_instance._mysql_api.bots.exists = AsyncMock(return_value=False)
-    criabot_instance._criadex.auth.create = AsyncMock(return_value=MagicMock(api_key="new_key"))
-    criabot_instance._criadex.manage.create = AsyncMock(return_value=MagicMock())
-    criabot_instance._criadex.group_auth.create = AsyncMock()
+    criabot_instance._criadex.auth.create = MagicMock(return_value=MagicMock(api_key="new_key"))
+    criabot_instance._criadex.manage.create = MagicMock(return_value=MagicMock())
+    criabot_instance._criadex.group_auth.create = MagicMock()
     criabot_instance._mysql_api.bots.insert = AsyncMock(return_value=1)
     criabot_instance._mysql_api.bot_params.insert = AsyncMock(return_value=None)
 
