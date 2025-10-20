@@ -192,7 +192,7 @@ class Bot:
 
         response = await self._upload_group_file(
             index_type,
-            file,
+            file.model_dump(),
             is_update=is_update
         )
         return response
