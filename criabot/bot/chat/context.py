@@ -110,7 +110,7 @@ class ContextRetriever:
             extra_groups
     ):
         return {
-            "prompt": prompt,
+            "query": prompt,
             "top_k": self._bot_params.top_k,
             "min_k": self._bot_params.min_k,
             "top_n": self._bot_params.top_n,

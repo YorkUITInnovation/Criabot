@@ -30,7 +30,7 @@ class BotParametersTable(BaseTable):
     no_context_message: Mapped[str] = mapped_column(Text, nullable=False)
     no_context_use_message: Mapped[bool] = mapped_column(Boolean, nullable=False)
     no_context_llm_guess: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    system_message: Mapped[str] = mapped_column(Text, nullable=False)
+    system_message: Mapped[str] = mapped_column(Text, nullable=True)
 
 
 class BotParametersBaseConfig(BaseModel):

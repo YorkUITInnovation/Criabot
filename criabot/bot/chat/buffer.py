@@ -59,7 +59,7 @@ class ChatBuffer:
     def create_chat_token_metadata(cls, message: ChatMessage) -> int:
         token_count: int = sum([
             string_tokens(block.text)
-            for block in message.blocks
+            for block in message.blocks if isinstance(block, TextBlock)
         ])
         message.metadata[cls.TOKEN_COUNT_META_NAME] = token_count
         return token_count

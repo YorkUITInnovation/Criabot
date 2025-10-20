@@ -1,8 +1,10 @@
 import time
+import asyncio
 import uuid
 from typing import Dict, Awaitable, Callable
 
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
+from CriadexSDK.ragflow_schemas import GroupSearchResponse
 
 from criabot.bot.schemas import GroupContentResponse
 from criabot.cache.api import BotCacheAPI
@@ -131,11 +133,13 @@ class Bot:
         :return: Vector DB Response
 
         """
-        result = await self._criadex.content.search(
-            group_name=self.group_name(index_type),
+        group_name = self.group_name(index_type)
+        search_result = await asyncio.to_thread(
+            self._criadex.content.search,
+            group_name=group_name,
             search_config=search_config
         )
-        return result
+        return {"group_name": group_name, "response": GroupSearchResponse(**search_result)}
 
     async def retrieve_group_info(self):
         """
@@ -145,7 +149,7 @@ class Bot:
 
         """
 
-        response = await self._criadex.manage.about(
+        response = self._criadex.manage.about(
             group_name=self.group_name("DOCUMENT")
         )
         return response

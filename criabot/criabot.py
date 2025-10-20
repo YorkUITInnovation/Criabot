@@ -153,7 +153,7 @@ class Criabot:
         # Create the indexes & authenticate on them
         await self._create_new_bot_groups(
             bot_name=name,
-            bot_api_key=new_auth.api_key,
+            bot_api_key=new_auth['api_key'],
             bot_config=config
         )
 
@@ -303,8 +303,8 @@ class Criabot:
         from criabot.bot.chat.chat import Chat
         return Chat(
             bot=bot,
-            llm_model_id=group_info.llm_model_id,
-            rerank_model_id=group_info.rerank_model_id,
+            llm_model_id=group_info['info']['llm_model_id'],
+            rerank_model_id=group_info['info']['rerank_model_id'],
             chat_model=chat_model,
             chat_id=chat_id,
             bot_parameters=bot_parameters.params

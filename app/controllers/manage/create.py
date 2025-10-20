@@ -5,8 +5,7 @@ from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
-from app.controllers.schemas import DUPLICATE_CODE, SUCCESS_CODE, exception_response, \
-    catch_exceptions, APIResponse
+from app.controllers.schemas import DUPLICATE_CODE, SUCCESS_CODE, exception_response, catch_exceptions, APIResponse
 from app.core.route import CriaRoute
 from criabot.schemas import BotCreateConfig, BotExistsError
 
@@ -55,7 +54,7 @@ class ManageCreateRoute(CriaRoute):
             code=SUCCESS_CODE,
             status=200,
             message="Successfully created the bot & their indexes.",
-            bot_api_key=auth_response.api_key
+            bot_api_key=auth_response['api_key']
         )
 
 
