@@ -1,6 +1,8 @@
 import time
 import asyncio
 import uuid
+import logging
+import json
 from typing import Dict, Awaitable, Callable
 
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
@@ -207,7 +209,7 @@ class Bot:
         """
 
         group_name = self.group_name(index_type=index_type)
-        response = await self._criadex.content.delete(
+        response = self._criadex.content.delete(
             group_name=group_name,
             document_name=document_name
         )
@@ -222,7 +224,7 @@ class Bot:
 
         """
 
-        response = await self._criadex.content.list(
+        response = self._criadex.content.list(
             group_name=self.group_name(index_type=index_type)
         )
         return response
@@ -242,9 +244,75 @@ class Bot:
 
         """
 
+        # Normalize node types in the document payload to the enum values
+        # expected by the Criadex service. This is a minimal, safe mapping
+        # so the API won't reject common simple values like "text".
+        file = self._normalize_document_payload(file)
+
         group_name = self.group_name(index_type=index_type)
         group_operation = self._criadex.content.update if is_update else self._criadex.content.upload
-        response = await group_operation(
-            group_name, file
-        )
+
+        # The Criadex SDK methods may be sync or async depending on
+        # implementation. Call it and handle both cases safely:
+        # - if it returns an awaitable, await it
+        # - otherwise run it in a thread to avoid blocking the event loop
+        # Always run the Criadex SDK call in a thread to avoid blocking the event loop.
+        # This assumes the Criadex SDK methods are synchronous.
+        response = await asyncio.to_thread(group_operation, group_name, file)
         return response
+
+    def _normalize_document_payload(self, file: dict) -> dict:
+        """
+        Ensure every node in file['file_contents']['nodes'] has a valid
+        `type` value expected by Criadex. Map common simple types to the
+        Criadex enum and fill missing/unknown types with
+        'UncategorizedText'. This is a defensive, backward-compatible
+        normalization to avoid hard failures on upload.
+        """
+        # mapping from common short names to Criadex enum values
+        type_map = {
+            "text": "NarrativeText",
+            "txt": "NarrativeText",
+            "image": "Image",
+            "figure": "FigureCaption",
+            "title": "Title",
+            "list": "ListItem",
+            "table": "Table",
+        }
+
+        try:
+            contents = file.get("file_contents") or {}
+            nodes = contents.get("nodes") or []
+        except Exception:
+            return file
+
+        for node in nodes:
+            # ensure metadata exists
+            if "metadata" not in node or node["metadata"] is None:
+                node["metadata"] = {}
+
+            # normalize type
+            t = node.get("type")
+            if isinstance(t, str) and t in type_map:
+                node["type"] = type_map[t]
+            elif isinstance(t, str):
+                # leave known full enum values unchanged; unknown short
+                # strings map to UncategorizedText to be accepted by Criadex
+                if not t or t.lower() in ("", "none"):
+                    node["type"] = "UncategorizedText"
+                else:
+                    # preserve if already looks like an enum (capitalized)
+                    if t[0].isupper():
+                        node["type"] = t
+                    else:
+                        node["type"] = "UncategorizedText"
+            else:
+                # missing or non-string -> fallback
+                node["type"] = "UncategorizedText"
+
+        # write back
+        if contents is not None:
+            contents["nodes"] = nodes
+            file["file_contents"] = contents
+
+        return file

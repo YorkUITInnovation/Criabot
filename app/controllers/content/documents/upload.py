@@ -70,8 +70,8 @@ class UploadDocumentRoute(CriaRoute):
             code=SUCCESS_CODE,
             status=200,
             message="Successfully added to the index. Save the 'document_name' field to be able to update it!",
-            document_name=result.document_name,
-            token_usage=result.response.token_usage
+            document_name=result.get("document_name"),
+            token_usage=result.get("token_usage")
         )
 
 

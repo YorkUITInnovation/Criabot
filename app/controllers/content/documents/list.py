@@ -53,7 +53,7 @@ class ListDocumentsRoute(CriaRoute):
             code=SUCCESS_CODE,
             status=200,
             message="Successfully retrieved all documents names.",
-            document_names=content.files
+            document_names=content.get("files")
         )
 
 
