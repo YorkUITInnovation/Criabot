@@ -59,8 +59,8 @@ class UpdateDocumentRoute(CriaRoute):
             code=SUCCESS_CODE,
             status=200,
             message="Successfully updated the index",
-            document_name=result.document_name,
-            token_usage=result.response.token_usage
+            document_name=result.get("document_name"),
+            token_usage=result.get("token_usage")
         )
 
 

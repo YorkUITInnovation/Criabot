@@ -48,7 +48,7 @@ class ListQuestionsRoute(CriaRoute):
             code=SUCCESS_CODE,
             status=200,
             message="Successfully retrieved all question (question 'document') names.",
-            document_names=content.files
+            document_names=content.get("files")
         )
 
 

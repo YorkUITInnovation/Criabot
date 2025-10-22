@@ -55,8 +55,8 @@ class UpdateQuestionRoute(CriaRoute):
             code=SUCCESS_CODE,
             status=200,
             message="Successfully updated the questions in the index!",
-            document_name=response.document_name,
-            token_usage=response.response.token_usage
+            document_name=response.get("document_name"),
+            token_usage=response.get("token_usage")
         )
 
 
