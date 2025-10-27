@@ -10,6 +10,8 @@ from redis.asyncio import ConnectionPool
 from sqlalchemy import URL, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 
+from criabot.database.table import BaseTable
+
 from criabot.schemas import (
     MySQLCredentials,
     RedisCredentials,
@@ -129,6 +131,10 @@ class Criabot:
                 database=self._mysql_credentials.database
             )
         )
+
+        # Create all tables defined in BaseTable.metadata
+        async with self._mysql_engine.begin() as connection:
+            await connection.run_sync(BaseTable.metadata.create_all)
 
         return self._mysql_engine
 
