@@ -96,12 +96,20 @@ class ContextRetriever:
             model_id=self._rerank_model_id,
             agent_config={
                 "prompt": prompt,
-                "nodes": nodes,
+                "nodes": [node.model_dump(mode='json') for node in nodes],
                 "top_n": self._bot_params.top_n,
                 "min_n": self._bot_params.min_n
             }
         )
-        return response["agent_response"] if isinstance(response, dict) else response.verify().agent_response
+
+        reranked_docs = response.get("reranked_documents", [])
+        if reranked_docs and isinstance(reranked_docs[0], dict):
+            reranked_docs = [TextNodeWithScore(**doc) for doc in reranked_docs]
+
+        return {
+            "ranked_nodes": reranked_docs,
+            "search_units": 0
+        }
 
     def build_search_group_config(
             self,
@@ -175,11 +183,11 @@ class ContextRetriever:
             prompt=prompt,
             nodes=nodes
         )
-        retriever_response.search_units += rerank_response.search_units
+        retriever_response.search_units += rerank_response["search_units"]
         # Make sure we have something
-        if len(rerank_response.ranked_nodes) > 0:
+        if len(rerank_response["ranked_nodes"]) > 0:
             retriever_response.context = self.build_context(
-                ranked_nodes=rerank_response.ranked_nodes,
+                ranked_nodes=rerank_response["ranked_nodes"],
             )
         # Give 'er
         return retriever_response

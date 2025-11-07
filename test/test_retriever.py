@@ -6,7 +6,7 @@ from CriadexSDK.ragflow_schemas import TextNodeWithScore, TextNode, GroupSearchR
 @pytest.fixture
 def criadex_api():
     mock = AsyncMock()
-    mock.agents.cohere.rerank = AsyncMock(return_value={"agent_response": RerankAgentResponse(ranked_nodes=[], search_units=1)})
+    mock.agents.cohere.rerank = AsyncMock(return_value={"reranked_documents": [], "search_units": 1})
     mock.agents.azure.transform = AsyncMock(return_value={"agent_response": TransformAgentResponse(new_prompt="hello", usage=[])})
     return mock
 
@@ -54,44 +54,53 @@ async def test_retrieve_no_nodes(retriever, bot_mock):
     retriever._criadex.agents.cohere.rerank.assert_not_called()
 
 @pytest.mark.asyncio
-async def test_retrieve_with_text_context(retriever, bot_mock, criadex_api):
+async def test_retrieve_with_text_context(retriever, bot_mock):
     nodes = [create_text_node("text 1")]
     bot_mock.search_group.return_value = {
         "group_name": "test_group",
         "response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[])
     }
-    rerank_response = RerankAgentResponse(ranked_nodes=nodes, search_units=1)
-    criadex_api.agents.cohere.rerank.return_value = {"agent_response": rerank_response}
+
+    # Mock hybrid_rerank to return what retrieve expects
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
 
     response = await retriever.retrieve(prompt="hello", metadata_filter=None, extra_bots=[])
     assert isinstance(response.context, TextContext)
     assert "text 1" in response.context.text
 
 @pytest.mark.asyncio
-async def test_retrieve_with_question_context_no_llm_reply(retriever, bot_mock, criadex_api):
-    question_node = create_text_node("question text", metadata={"answer": "the answer", "llm_reply": False, "file_name": "f", "group_name": "g"}, score=0.9)
+async def test_retrieve_with_question_context_no_llm_reply(retriever, bot_mock):
+    question_node = create_text_node(
+        "question text",
+        metadata={"answer": "the answer", "llm_reply": False, "file_name": "f", "group_name": "g"},
+        score=0.9
+    )
     nodes = [question_node, create_text_node("other text")]
     bot_mock.search_group.return_value = {
         "group_name": "test_group",
         "response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[])
     }
-    rerank_response = RerankAgentResponse(ranked_nodes=nodes, search_units=1)
-    criadex_api.agents.cohere.rerank.return_value = {"agent_response": rerank_response}
+
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
 
     response = await retriever.retrieve(prompt="hello", metadata_filter=None, extra_bots=[])
     assert isinstance(response.context, QuestionContext)
     assert response.context.node.model_dump() == question_node.model_dump()
 
 @pytest.mark.asyncio
-async def test_retrieve_with_question_context_with_llm_reply(retriever, bot_mock, criadex_api):
-    question_node = create_text_node("question text", metadata={"answer": "the answer", "llm_reply": True}, score=0.9)
+async def test_retrieve_with_question_context_with_llm_reply(retriever, bot_mock):
+    question_node = create_text_node(
+        "question text",
+        metadata={"answer": "the answer", "llm_reply": True},
+        score=0.9
+    )
     nodes = [question_node, create_text_node("other text")]
     bot_mock.search_group.return_value = {
         "group_name": "test_group",
         "response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[])
     }
-    rerank_response = RerankAgentResponse(ranked_nodes=nodes, search_units=1)
-    criadex_api.agents.cohere.rerank.return_value = {"agent_response": rerank_response}
+
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
 
     response = await retriever.retrieve(prompt="hello", metadata_filter=None, extra_bots=[])
     assert isinstance(response.context, TextContext)
@@ -119,7 +128,7 @@ async def test_hybrid_rerank(retriever, criadex_api):
         model_id=retriever._rerank_model_id,
         agent_config={
             "prompt": "hello",
-            "nodes": nodes,
+            "nodes": [node.model_dump(mode='json') for node in nodes],
             "top_n": retriever._bot_params.top_n,
             "min_n": retriever._bot_params.min_n
         }

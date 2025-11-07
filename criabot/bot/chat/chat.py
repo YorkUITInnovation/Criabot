@@ -154,10 +154,7 @@ class Chat:
                         "temperature": 0.1
                     }
                 )
-                if isinstance(related_prompts_response, dict):
-                    related_prompts = related_prompts_response.get("agent_response", {}).get("related_prompts", [])
-                    token_usage.extend(related_prompts_response.get("agent_response", {}).get("usage", []))
-                else:
+                if related_prompts_response and related_prompts_response.agent_response:
                     related_prompts = related_prompts_response.agent_response.related_prompts
                     token_usage.extend(related_prompts_response.agent_response.usage)
             except:
@@ -190,14 +187,21 @@ class Chat:
         """Send a chat to the LLM and receive a reply."""
 
         # Synthesize a reply based on our new info
+        agent_config = {
+            "history": [msg.model_dump() for msg in history],
+            **self._bot_parameters.model_dump()
+        }
         response = await self._criadex.agents.azure.chat(
             model_id=self._llm_model_id,
-            agent_config={
-                "history": history,
-                **self._bot_parameters.model_dump()
-            }
+            agent_config=agent_config
         )
-        chat_response = response["agent_response"]["chat_response"] if isinstance(response, dict) else response.verify().agent_response.chat_response
+        if isinstance(response, dict):
+            if "agent_response" in response:
+                chat_response = response["agent_response"]["chat_response"]
+            else:
+                raise KeyError("'agent_response' key missing in Criadex chat response")
+        else:
+            chat_response = response.verify().agent_response.chat_response
         chat_response["message"]["metadata"] = {**chat_response["message"].get("metadata", {}), **self.chat_reply_metadata} if isinstance(chat_response, dict) else {**chat_response.message.metadata, **self.chat_reply_metadata}
         return chat_response
 

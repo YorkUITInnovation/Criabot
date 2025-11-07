@@ -27,12 +27,16 @@ def test_group_name(bot):
 @pytest.mark.asyncio
 async def test_search_group(bot, criadex_api):
     # Mock the synchronous search method to return a dictionary
-    criadex_api.content.search = MagicMock(return_value={
-        'nodes': [],
-        'assets': [],
-        'search_units': 1,
-        'group_name': 'test_bot-document-index',
-        'metadata': {}
+    criadex_api.content.search = AsyncMock(return_value={
+        "status": 200,
+        "message": "Successfully queried the index group 'test_bot-document-index'.",
+        "code": "SUCCESS",
+        "response": {
+            'nodes': [],
+            'assets': [],
+            'search_units': 1,
+            'metadata': {}
+        }
     })
     await bot.search_group("DOCUMENT", {})
     criadex_api.content.search.assert_called_once_with(

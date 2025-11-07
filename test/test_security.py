@@ -1,5 +1,3 @@
-
-
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from app.core.security.handlers.master import GetApiKeyMaster
@@ -42,7 +40,7 @@ async def test_get_api_key_any_master_key():
     # Arrange
     get_api_key_any = GetApiKeyAny()
     get_api_key_any.api_key = "master_key"
-    get_api_key_any.get_auth = AsyncMock(return_value=AuthCheckResponse(api_key="master_key", master=True, authorized=True))
+    get_api_key_any.get_auth = AsyncMock(return_value={"api_key": "master_key", "master": True, "authorized": True})
 
     # Act
     result = await get_api_key_any.execute()
@@ -56,7 +54,7 @@ async def test_get_api_key_any_non_master_key_stack_trace_disabled():
     # Arrange
     get_api_key_any = GetApiKeyAny()
     get_api_key_any.api_key = "non_master_key"
-    get_api_key_any.get_auth = AsyncMock(return_value=AuthCheckResponse(api_key="non_master_key", master=False, authorized=True))
+    get_api_key_any.get_auth = AsyncMock(return_value={"api_key": "non_master_key", "master": False, "authorized": True})
     get_api_key_any.criadex = MagicMock()
     get_api_key_any.criadex._error_stacktrace = False
 
@@ -72,7 +70,7 @@ async def test_get_api_key_any_non_master_key_stack_trace_enabled():
     # Arrange
     get_api_key_any = GetApiKeyAny()
     get_api_key_any.api_key = "non_master_key"
-    get_api_key_any.get_auth = AsyncMock(return_value=AuthCheckResponse(api_key="non_master_key", master=False, authorized=True))
+    get_api_key_any.get_auth = AsyncMock(return_value={"api_key": "non_master_key", "master": False, "authorized": True})
     get_api_key_any.criadex = MagicMock()
     get_api_key_any.criadex._error_stacktrace = True
 
@@ -88,7 +86,7 @@ async def test_get_api_key_bots_master_key():
     # Arrange
     get_api_key_bots = GetApiKeyBots()
     get_api_key_bots.api_key = "master_key"
-    get_api_key_bots.get_auth = AsyncMock(return_value=AuthCheckResponse(api_key="master_key", master=True, authorized=True))
+    get_api_key_bots.get_auth = AsyncMock(return_value={"api_key": "master_key", "master": True, "authorized": True})
 
     # Act
     result = await get_api_key_bots.execute()
@@ -102,9 +100,9 @@ async def test_get_api_key_bots_non_master_key_with_access():
     # Arrange
     get_api_key_bots = GetApiKeyBots()
     get_api_key_bots.api_key = "non_master_key"
-    get_api_key_bots.get_auth = AsyncMock(return_value=AuthCheckResponse(api_key="non_master_key", master=False, authorized=True))
+    get_api_key_bots.get_auth = AsyncMock(return_value={"api_key": "non_master_key", "master": False, "authorized": True})
     get_api_key_bots.read_bot_name = AsyncMock(return_value="test_bot")
-    get_api_key_bots.get_group_auth = AsyncMock(return_value=GroupAuthCheckResponse(master=False, authorized=True))
+    get_api_key_bots.get_group_auth = AsyncMock(return_value={"master": False, "authorized": True})
     get_api_key_bots.criadex = MagicMock()
     get_api_key_bots.criadex._error_stacktrace = False
 
@@ -120,9 +118,9 @@ async def test_get_api_key_bots_non_master_key_no_access():
     # Arrange
     get_api_key_bots = GetApiKeyBots()
     get_api_key_bots.api_key = "non_master_key"
-    get_api_key_bots.get_auth = AsyncMock(return_value=AuthCheckResponse(api_key="non_master_key", master=False, authorized=True))
+    get_api_key_bots.get_auth = AsyncMock(return_value={"api_key": "non_master_key", "master": False, "authorized": True})
     get_api_key_bots.read_bot_name = AsyncMock(return_value="test_bot")
-    get_api_key_bots.get_group_auth = AsyncMock(return_value=GroupAuthCheckResponse(master=False, authorized=False))
+    get_api_key_bots.get_group_auth = AsyncMock(return_value={"master": False, "authorized": False})
     get_api_key_bots.criadex = MagicMock()
     get_api_key_bots.criadex._error_stacktrace = False
 
@@ -138,7 +136,7 @@ async def test_get_api_key_bots_non_master_key_no_bot_name():
     # Arrange
     get_api_key_bots = GetApiKeyBots()
     get_api_key_bots.api_key = "non_master_key"
-    get_api_key_bots.get_auth = AsyncMock(return_value=AuthCheckResponse(api_key="non_master_key", master=False, authorized=True))
+    get_api_key_bots.get_auth = AsyncMock(return_value={"api_key": "non_master_key", "master": False, "authorized": True})
     get_api_key_bots.read_bot_name = AsyncMock(return_value=None)
     get_api_key_bots.criadex = MagicMock()
     get_api_key_bots.criadex._error_stacktrace = False

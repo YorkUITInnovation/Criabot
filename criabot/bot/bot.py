@@ -136,12 +136,40 @@ class Bot:
 
         """
         group_name = self.group_name(index_type)
-        search_result = await asyncio.to_thread(
-            self._criadex.content.search,
+        # Ensure we await the SDK call (it is async) and support both
+        # dict and pydantic-style responses.
+        search_result = await self._criadex.content.search(
             group_name=group_name,
             search_config=search_config
         )
-        return {"group_name": group_name, "response": GroupSearchResponse(**search_result)}
+        if isinstance(search_result, dict):
+            # Some backends return the payload nested under 'response', others
+            # return the payload at the root, and some use 'result'/'data'.
+            # Extract flexibly and fall back to the root dict if it already
+            # looks like a GroupSearchResponse payload.
+            candidate = None
+            for key in ("response", "result", "data"):
+                value = search_result.get(key)
+                if isinstance(value, dict) and ("nodes" in value or "assets" in value or "search_units" in value):
+                    candidate = value
+                    break
+            if candidate is None:
+                # If the root dict already contains the expected fields, use it
+                if any(k in search_result for k in ("nodes", "assets", "search_units")):
+                    candidate = search_result
+                else:
+                    candidate = search_result.get("response", search_result)
+
+            response_obj = (
+                candidate
+                if isinstance(candidate, GroupSearchResponse)
+                else GroupSearchResponse(**candidate)
+            )
+        else:
+            # Assume SDK returned a model-like object with .verify()/.response
+            verified = getattr(search_result, 'verify', lambda: search_result)()
+            response_obj = getattr(verified, 'response', verified)
+        return {"group_name": group_name, "response": response_obj}
 
     async def retrieve_group_info(self):
         """
@@ -151,7 +179,7 @@ class Bot:
 
         """
 
-        response = self._criadex.manage.about(
+        response = await self._criadex.manage.about(
             group_name=self.group_name("DOCUMENT")
         )
         return response
@@ -209,7 +237,7 @@ class Bot:
         """
 
         group_name = self.group_name(index_type=index_type)
-        response = self._criadex.content.delete(
+        response = await self._criadex.content.delete(
             group_name=group_name,
             document_name=document_name
         )
@@ -224,7 +252,7 @@ class Bot:
 
         """
 
-        response = self._criadex.content.list(
+        response = await self._criadex.content.list(
             group_name=self.group_name(index_type=index_type)
         )
         return response
@@ -258,7 +286,7 @@ class Bot:
         # - otherwise run it in a thread to avoid blocking the event loop
         # Always run the Criadex SDK call in a thread to avoid blocking the event loop.
         # This assumes the Criadex SDK methods are synchronous.
-        response = await asyncio.to_thread(group_operation, group_name, file)
+        response = await group_operation(group_name, file)
         return response
 
     def _normalize_document_payload(self, file: dict) -> dict:

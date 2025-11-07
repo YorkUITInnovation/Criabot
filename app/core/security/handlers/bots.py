@@ -40,7 +40,7 @@ class GetApiKeyBots(GetApiKey):
         auth_response: AuthCheckResponse = await self.get_auth()
 
         # Master keys go brr
-        if auth_response.master:
+        if auth_response['master']:
             return self.api_key
 
         # Since they are NOT master but trying to access stack trace, throw an error
@@ -63,7 +63,7 @@ class GetApiKeyBots(GetApiKey):
         test_group_name: str = Bot.bot_group_name(bot_name, "DOCUMENT")
         group_response: GroupAuthCheckResponse = await self.get_group_auth(test_group_name)
 
-        if not group_response.authorized:
+        if not group_response['authorized']:
             raise BadAPIKeyException(
                 status_code=401,
                 detail="Your key is not authorized for accessing this bot."
