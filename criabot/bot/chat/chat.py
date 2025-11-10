@@ -7,7 +7,15 @@ from CriadexSDK.ragflow_schemas import ChatMessage, ChatResponse, CompletionUsag
 
 from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import ChatBuffer, History
-from criabot.bot.chat.context import build_context_prompt, ContextRetriever, QuestionContext, TextContext, build_no_context_guess_prompt, build_no_context_llm_prompt, ContextRetrieverResponse
+from criabot.bot.chat.context import (
+    build_context_prompt,
+    ContextRetriever,
+    QuestionContext,
+    TextContext,
+    build_no_context_guess_prompt,
+    build_no_context_llm_prompt,
+    ContextRetrieverResponse
+)
 from criabot.bot.chat.schemas import ChatReply, ChatReplyContent
 from criabot.bot.chat.utils import extract_used_assets, strip_asset_data_from_group_responses
 from criabot.cache.api import BotCacheAPI
@@ -18,17 +26,16 @@ from criabot.database.bots.tables.bot_params import BotParametersModel
 class Chat:
     """
     Lightweight, transient chat instance
-
     """
 
     def __init__(
-            self,
-            bot: Bot,
-            llm_model_id: int,
-            rerank_model_id: int,
-            chat_model: ChatModel,
-            bot_parameters: BotParametersModel,
-            chat_id: str
+        self,
+        bot: Bot,
+        llm_model_id: int,
+        rerank_model_id: int,
+        chat_model: ChatModel,
+        bot_parameters: BotParametersModel,
+        chat_id: str
     ):
 
         if not isinstance(chat_model, ChatModel):
@@ -68,38 +75,20 @@ class Chat:
 
     @property
     def bot(self) -> Bot:
-        """
-        Get the bot associated with a chat
-
-        :return: The bot
-
-        """
+        """Get the bot associated with a chat"""
         return self._bot
+
     def history(self) -> List[ChatMessage]:
-        """
-        Retrieve the chat history
-
-        :return: The chat history
-
-        """
-
+        """Retrieve the chat history"""
         return self._buffer.history
 
     async def send(
-            self,
-            prompt: str,
-            metadata_filter: Optional[Filter],
-            extra_bots: List[str]
+        self,
+        prompt: str,
+        metadata_filter: Optional[Filter],
+        extra_bots: List[str]
     ) -> ChatReply:
-        """
-        Send a message to the bot and receive a reply
-
-        :param prompt: The user's pre-context message
-        :param extra_bots: Extra bots to leverage for IR
-        :param metadata_filter: Search the node's metadata with a constraint filter
-        :return: None
-
-        """
+        """Send a message to the bot and receive a reply"""
 
         # Context, Dict(SearchResponse)
         response: ContextRetrieverResponse = await self._retriever.retrieve(
@@ -154,9 +143,13 @@ class Chat:
                         "temperature": 0.1
                     }
                 )
-                if related_prompts_response and related_prompts_response.agent_response:
-                    related_prompts = related_prompts_response.agent_response.related_prompts
-                    token_usage.extend(related_prompts_response.agent_response.usage)
+                if related_prompts_response and related_prompts_response.get('agent_response'):
+                    related_prompts = related_prompts_response['agent_response'].get('related_prompts', [])
+                    usage_from_related_prompts = related_prompts_response['agent_response'].get('usage', [])
+                    if usage_from_related_prompts and isinstance(usage_from_related_prompts[0], dict):
+                        token_usage.extend([CompletionUsage(**u) for u in usage_from_related_prompts])
+                    else:
+                        token_usage.extend(usage_from_related_prompts)
             except:
                 # Don't want this to actually cause issues if the agent fails because the LLM sucks
                 logging.error("Failed to generate related prompts! " + traceback.format_exc())
@@ -202,17 +195,19 @@ class Chat:
                 raise KeyError("'agent_response' key missing in Criadex chat response")
         else:
             chat_response = response.verify().agent_response.chat_response
-        chat_response["message"]["metadata"] = {**chat_response["message"].get("metadata", {}), **self.chat_reply_metadata} if isinstance(chat_response, dict) else {**chat_response.message.metadata, **self.chat_reply_metadata}
+
+        chat_response["message"]["metadata"] = {
+            **chat_response["message"].get("metadata", {}),
+            **self.chat_reply_metadata
+        } if isinstance(chat_response, dict) else {
+            **chat_response.message.metadata,
+            **self.chat_reply_metadata
+        }
+
         return chat_response
 
-    def _is_direct_question_reply(
-            self,
-            group_responses: Dict[str, GroupSearchResponse]
-    ) -> bool:
-        """
-        Check if the group response is a question that requires a direct reply.
-
-        """
+    def _is_direct_question_reply(self, group_responses: Dict[str, GroupSearchResponse]) -> bool:
+        """Check if the group response is a question that requires a direct reply."""
         question_response: Optional[GroupSearchResponse] = group_responses.get(self.bot.group_name("QUESTION"))
 
         if not question_response:
@@ -238,24 +233,26 @@ class Chat:
         )
         # Synthesize a reply based on our new info
         chat_response = await self._query_llm(history=buffered_history)
-        # Update buffer & history with the assistant response
         if isinstance(chat_response, dict):
             msg = chat_response["message"]
             if isinstance(msg, dict):
                 msg = ChatMessage(
                     role=msg.get("role", "assistant"),
-                    blocks=msg.get("blocks", [{"type": "text", "text": msg.get("content", "") }]),
+                    blocks=msg.get("blocks", [{"type": "text", "text": msg.get("content", "")}]),
                     additional_kwargs=msg.get("additional_kwargs", {}),
                     metadata=msg.get("metadata", {})
                 )
             self._buffer.add_message(message=msg)
             buffered_history.append(msg)
-            return buffered_history, chat_response.get("usage", None), chat_response.get("message", {}).get("content", "")
+            usage_dict = chat_response.get("usage", None)
+            reply_tokens = CompletionUsage(**usage_dict) if usage_dict else None
+            return buffered_history, reply_tokens, chat_response.get("message", {}).get("content", "")
         else:
             self._buffer.add_message(message=chat_response.message)
             buffered_history.append(chat_response.message)
             return buffered_history, chat_response.raw.usage, chat_response.message.content
 
+    # ↓↓↓ DE-INDENTED FUNCTIONS ↓↓↓
     async def _no_context_llm_guess(self):
         # Add the ephemeral best guess prompt
         buffered_history = self._buffer.buffer(
@@ -273,7 +270,6 @@ class Chat:
         )
         # Synthesize a reply based on our new info
         chat_response = await self._query_llm(history=buffered_history)
-        # Prepend no context message
         if self._bot_parameters.no_context_use_message:
             if isinstance(chat_response, dict):
                 chat_response["message"]["blocks"] = {
@@ -287,19 +283,21 @@ class Chat:
                         + chat_response.message.content
                     )
                 )
-        # Update buffer & history with the assistant response
+
         if isinstance(chat_response, dict):
             msg = chat_response["message"]
             if isinstance(msg, dict):
                 msg = ChatMessage(
                     role=msg.get("role", "assistant"),
-                    blocks=[{"type": "text", "text": msg.get("content", "") }],
+                    blocks=[{"type": "text", "text": msg.get("content", "")}],
                     additional_kwargs=msg.get("additional_kwargs", {}),
                     metadata=msg.get("metadata", {})
                 )
             self._buffer.add_message(message=msg)
             buffered_history.append(msg)
-            return buffered_history, chat_response.get("usage", None)
+            usage_dict = chat_response.get("usage", None)
+            reply_tokens = CompletionUsage(**usage_dict) if usage_dict else None
+            return buffered_history, reply_tokens
         else:
             self._buffer.add_message(message=chat_response.message)
             buffered_history.append(chat_response.message)
@@ -317,26 +315,26 @@ class Chat:
         )
         # Synthesize a reply based on our new info
         chat_response = await self._query_llm(history=buffered_history)
-        # Update buffer & history with the assistant response
         if isinstance(chat_response, dict):
             msg = chat_response["message"]
             if isinstance(msg, dict):
                 msg = ChatMessage(
                     role=msg.get("role", "assistant"),
-                    blocks=[{"type": "text", "text": msg.get("content", "") }],
+                    blocks=[{"type": "text", "text": msg.get("content", "")}],
                     additional_kwargs=msg.get("additional_kwargs", {}),
                     metadata=msg.get("metadata", {})
                 )
             self._buffer.add_message(message=msg)
             buffered_history.append(msg)
-            return buffered_history, chat_response.get("usage", None)
+            usage_dict = chat_response.get("usage", None)
+            reply_tokens = CompletionUsage(**usage_dict) if usage_dict else None
+            return buffered_history, reply_tokens
         else:
             self._buffer.add_message(message=chat_response.message)
             buffered_history.append(chat_response.message)
             return buffered_history, chat_response.raw.usage
 
     def _no_context_saved_message(self):
-
         self._buffer.add_message(
             message=ChatMessage(
                 role="assistant",
@@ -347,14 +345,10 @@ class Chat:
         )
         return self._buffer.history, None
 
-    async def _no_context_reply(
-        self,
-    ):
-
-        # Case 1) The LLM should guess
+    async def _no_context_reply(self):
         if self._bot_parameters.no_context_llm_guess:
             history, usage = await self._no_context_llm_guess()
-
+            
         # Case 2) LLM should NOT guess and the saved no context message gets used
         elif self._bot_parameters.no_context_message:
             history, usage = self._no_context_saved_message()
@@ -364,6 +358,8 @@ class Chat:
             history, usage = await self._no_context_llm_message()
 
         return history, usage
+
+    # ↑↑↑ END DE-INDENTED FUNCTIONS ↑↑↑
 
     def _question_context_reply(self, context):
 
@@ -382,5 +378,4 @@ class Chat:
                 }
             )
         )
-
         return self._buffer.history, None
