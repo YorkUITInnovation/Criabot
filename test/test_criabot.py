@@ -6,7 +6,7 @@ from criabot.database.table import BaseTable
 
 @pytest.fixture
 def criadex_credentials():
-    return CriadexCredentials(api_base="http://localhost", api_key="test_key")
+    return CriadexCredentials(api_base="http://localhost", api_key="test_key", master_api_key="master_key")
 
 @pytest.fixture
 def mysql_credentials():

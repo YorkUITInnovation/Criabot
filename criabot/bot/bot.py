@@ -30,6 +30,11 @@ class Bot:
         self._name: str = name
         self._criadex = criadex
         self._cache_api: BotCacheAPI = bot_cache
+        self.intents = [
+            {"name": "Greeting", "description": "User says hello"},
+            {"name": "Question", "description": "User asks a question"},
+            {"name": "Farewell", "description": "User says goodbye"}
+        ]
 
     @property
     def criadex(self):
@@ -273,17 +278,12 @@ class Bot:
         """
 
         # Normalize node types in the document payload to the enum values
-        # expected by the Criadex service. This is a minimal, safe mapping
         # so the API won't reject common simple values like "text".
         file = self._normalize_document_payload(file)
 
         group_name = self.group_name(index_type=index_type)
         group_operation = self._criadex.content.update if is_update else self._criadex.content.upload
 
-        # The Criadex SDK methods may be sync or async depending on
-        # implementation. Call it and handle both cases safely:
-        # - if it returns an awaitable, await it
-        # - otherwise run it in a thread to avoid blocking the event loop
         # Always run the Criadex SDK call in a thread to avoid blocking the event loop.
         # This assumes the Criadex SDK methods are synchronous.
         response = await group_operation(group_name, file)

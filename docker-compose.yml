@@ -71,6 +71,7 @@ services:
         - "127.0.0.1:25574:25574"
       environment:
         ENV_PATH: "./env/docker.env"
+        APP_INITIAL_MASTER_KEY: ${APP_INITIAL_MASTER_KEY}
       volumes:
         - ./criadex_data:/home/cria/env
       depends_on:

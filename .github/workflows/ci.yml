@@ -61,6 +61,7 @@ jobs:
         echo "MYSQL_DATABASE=test" >> .env
         echo "CRIADEX_API_BASE=http://localhost:8000" >> .env
         echo "CRIADEX_API_KEY=test" >> .env
+        echo "CRIADEX_MASTER_API_KEY=master_key" >> .env
         echo "REDIS_HOST=localhost" >> .env
         echo "REDIS_PORT=6379" >> .env
         echo "REDIS_USERNAME=" >> .env

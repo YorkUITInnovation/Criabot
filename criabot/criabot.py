@@ -75,7 +75,8 @@ class Criabot:
             raise InitializedAlreadyError()
 
         # Criadex Startup
-        self._criadex.authenticate(self._criadex_credentials.api_key)
+        # Authenticate with the initial master key
+        self._criadex.authenticate(self._criadex_credentials.master_api_key)
 
         # SQL DB Startup
         self._mysql_engine: AsyncEngine = await self._create_mysql_engine()
