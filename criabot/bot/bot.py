@@ -52,7 +52,7 @@ class Bot:
     async def start_chat(cls, cache_api: BotCacheAPI) -> str:
         """
         Add a new chat to the cache and return the ID. Users should insert the system message
-        as the FIRST message in history
+        as the FIRST message in history. Also ensures the dialog exists in Ragflow.
 
         :return: The new chat ID
 
@@ -71,6 +71,25 @@ class Bot:
             chat_id=chat_id,
             chat_model=chat_model
         )
+
+        # Ensure the dialog exists in Ragflow (attempt to create if not exists)
+        try:
+            import httpx
+            import os
+            criadex_url = os.getenv("CRIADEX_URL", "http://criadex:25574")
+            ragflow_tenant_id = os.getenv("RAGFLOW_TENANT_ID")
+            
+            if ragflow_tenant_id:
+                ensure_dialog_url = f"{criadex_url}/ragflow/chats/{chat_id}/ensure"
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        ensure_dialog_url,
+                        json={"tenant_id": ragflow_tenant_id},
+                        timeout=5
+                    )
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to pre-create Ragflow dialog for chat {chat_id}: {e}")
 
         return chat_id
 

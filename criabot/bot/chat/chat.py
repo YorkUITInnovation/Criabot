@@ -182,6 +182,7 @@ class Chat:
         # Synthesize a reply based on our new info
         agent_config = {
             "history": [msg.model_dump() for msg in history],
+            "chat_id": self._chat_id,
             **self._bot_parameters.model_dump()
         }
         response = await self._criadex.agents.azure.chat(

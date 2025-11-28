@@ -23,7 +23,7 @@ X-API-Key: ${API_KEY}
 
 ## 1. Bot Management Endpoints
 
-### 1.1 Create a Cria Bot
+### 1.1 Create a Bot
 POST /bots/{bot_name}/manage/create
 
 Request:
@@ -74,7 +74,7 @@ Response (200 OK):
 }
 ```
 
-### 1.3 Delete a Cria Bot
+### 1.3 Delete a Bot
 DELETE /bots/{bot_name}/manage/delete
 
 Request:
@@ -106,16 +106,32 @@ Response (200 OK):
 ```json
 {
   "status": 200,
-  "message": "Successfully retrieved bot information.",
+  "message": "Successfully retrieved the bot info.",
   "timestamp": "<timestamp>",
   "code": "SUCCESS",
-  "bot_info": {
-    "bot_name": "my-new-bot-name",
-    "llm_model_id": 4,
-    "embedding_model_id": 5,
-    "rerank_model_id": 6,
-    "created_at": "<timestamp>",
-    "updated_at": "<timestamp>"
+  "about": {
+    "info": {
+      "name": "test-bot-gemini",
+      "id": 165,
+      "created": "2025-11-19T14:05:26"
+    },
+    "params": {
+      "max_input_tokens": 2000,
+      "max_reply_tokens": 1024,
+      "temperature": 0.9,
+      "top_p": 0.0,
+      "top_k": 10,
+      "min_k": 0.5,
+      "top_n": 3,
+      "min_n": 0.7,
+      "llm_generate_related_prompts": true,
+      "no_context_message": "Sorry, I'm not sure about that.",
+      "no_context_use_message": false,
+      "no_context_llm_guess": false,
+      "system_message": null,
+      "bot_id": 165,
+      "id": 165
+    }
   }
 }
 ```
@@ -130,11 +146,7 @@ POST /bots/chats/start
 Request:
 ```bash
 curl -X POST "${HOST}:${PORT}/bots/chats/start" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: ${API_KEY}" \
-  -d '{
-    "bot_name": "my-new-bot-name"
-}'
+  -H "X-API-Key: ${API_KEY}"
 ```
 
 Response (200 OK):
@@ -254,11 +266,29 @@ Response (200 OK):
   "history": [
     {
       "role": "user",
-      "content": "Hello, bot!"
+      "blocks": [
+        {
+          "block_type": "text",
+          "text": "Hello, bot!"
+        }
+      ],
+      "additional_kwargs": {},
+      "metadata": {
+        "token_count": 4
+      }
     },
     {
       "role": "assistant",
-      "content": "Hello! How can I help you today?"
+      "blocks": [
+        {
+          "block_type": "text",
+          "text": "Hello! How can I help you today?"
+        }
+      ],
+      "additional_kwargs": {},
+      "metadata": {
+        "token_count": 9
+      }
     }
   ]
 }
@@ -530,9 +560,13 @@ curl "${HOST}:${PORT}/health" \
 
 Response (200 OK):
 ```json
-{ "status": "ok", "uptime": "...", "version": "1.0.0" }
+{
+  "status": "ok",
+  "uptime": "...",
+  "version": "1.0.0"
+}
 ```
 
 ---
 
-End of CriaBot API User Guide. For more details, see `API_SPECIFICATION.md` or the `/docs` UI.
+End of Bot API User Guide. For more details, see `API_SPECIFICATION.md` or the `/docs` UI.

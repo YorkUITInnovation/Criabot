@@ -14,7 +14,7 @@ Authentication: API key via HTTP header `X-API-Key` or query parameter `?api_key
 ## 1. Bot Management
 Endpoints to manage bot definitions and lifecycle.
 
-### 1.1 Create a Cria Bot
+### 1.1 Create a Bot
 POST /bots/{bot_name}/manage/create
 - Description: Register a new bot configuration.
 - Path Parameters:
@@ -61,7 +61,7 @@ PATCH /bots/{bot_name}/manage/update
   }
   ```
 
-### 1.3 Delete a Cria Bot
+### 1.3 Delete a Bot
 DELETE /bots/{bot_name}/manage/delete
 - Description: Remove a bot and all related data.
 - Path Parameters:
@@ -76,7 +76,7 @@ DELETE /bots/{bot_name}/manage/delete
   }
   ```
 
-### 1.4 About a Cria Bot
+### 1.4 About a Bot
 GET /bots/{bot_name}/manage/about
 - Description: Retrieve metadata and status for a bot.
 - Path Parameters:
@@ -85,16 +85,32 @@ GET /bots/{bot_name}/manage/about
   ```json
   {
     "status": 200,
-    "message": "Successfully retrieved bot information.",
+    "message": "Successfully retrieved the bot info.",
     "timestamp": "<timestamp>",
     "code": "SUCCESS",
-    "bot_info": {
-      "bot_name": "my-new-bot-name",
-      "llm_model_id": 4,
-      "embedding_model_id": 5,
-      "rerank_model_id": 6,
-      "created_at": "<timestamp>",
-      "updated_at": "<timestamp>"
+    "about": {
+      "info": {
+        "name": "test-bot-gemini",
+        "id": 165,
+        "created": "2025-11-19T14:05:26"
+      },
+      "params": {
+        "max_input_tokens": 2000,
+        "max_reply_tokens": 1024,
+        "temperature": 0.9,
+        "top_p": 0.0,
+        "top_k": 10,
+        "min_k": 0.5,
+        "top_n": 3,
+        "min_n": 0.7,
+        "llm_generate_related_prompts": true,
+        "no_context_message": "Sorry, I'm not sure about that.",
+        "no_context_use_message": false,
+        "no_context_llm_guess": false,
+        "system_message": null,
+        "bot_id": 165,
+        "id": 165
+      }
     }
   }
   ```
@@ -106,13 +122,8 @@ Group of endpoints to manage chat sessions and messages.
 
 ### 2.1 Start a chat with a bot
 POST /bots/chats/start
-- Description: Initialize a new chat session with a given bot.
-- Request Body (application/json):
-  ```json
-  {
-    "bot_name": "my-new-bot-name"
-  }
-  ```
+- Description: Initialize a new chat session.
+- Request Body: None
 - Response 200 OK:
   ```json
   {
@@ -218,11 +229,29 @@ GET /bots/chats/{chat_id}/history
     "history": [
       {
         "role": "user",
-        "content": "Hello, bot!"
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Hello, bot!"
+          }
+        ],
+        "additional_kwargs": {},
+        "metadata": {
+          "token_count": 4
+        }
       },
       {
         "role": "assistant",
-        "content": "Hello! How can I help you today?"
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Hello! How can I help you today?"
+          }
+        ],
+        "additional_kwargs": {},
+        "metadata": {
+          "token_count": 9
+        }
       }
     ]
   }
