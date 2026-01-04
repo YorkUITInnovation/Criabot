@@ -1,7 +1,6 @@
 from typing import Optional, List
 
-from CriadexSDK.routers.content.search import Asset
-from CriadexSDK.routers.content.upload import ContentUploadConfig
+from CriadexSDK.ragflow_schemas import Asset, ContentUploadConfig
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from pydantic import BaseModel, Field
@@ -10,7 +9,6 @@ from starlette.requests import Request
 from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, exception_response, catch_exceptions, APIResponse
 from app.core.route import CriaRoute
-from criabot.bot.bot import Bot
 from criabot.bot.schemas import GroupContentResponse
 from criabot.schemas import BotNotFoundError
 
@@ -53,12 +51,13 @@ class UploadDocumentRoute(CriaRoute):
         )
     )
     async def execute(
-            self,
-            request: Request,
-            bot_name: str,
-            file: DocumentUploadConfig
+        self,
+        request: Request,
+        bot_name: str,
+        file: DocumentUploadConfig
     ) -> ResponseModel:
         # Try to retrieve the bot
+        from criabot.bot.bot import Bot
         bot: Bot = await request.app.criabot.get(name=bot_name)
 
         # Add the documents
@@ -71,8 +70,8 @@ class UploadDocumentRoute(CriaRoute):
             code=SUCCESS_CODE,
             status=200,
             message="Successfully added to the index. Save the 'document_name' field to be able to update it!",
-            document_name=result.document_name,
-            token_usage=result.response.token_usage
+            document_name=result.get("document_name"),
+            token_usage=result.get("token_usage")
         )
 
 

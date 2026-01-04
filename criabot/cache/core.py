@@ -2,8 +2,8 @@ from abc import abstractmethod
 from contextlib import asynccontextmanager
 from typing import TypeVar
 
-import aioredis
-from aioredis import ConnectionPool, Redis
+from redis import asyncio as aioredis
+from redis.asyncio import ConnectionPool, Redis
 from pydantic import BaseModel
 
 T = TypeVar('T', bound=BaseModel)

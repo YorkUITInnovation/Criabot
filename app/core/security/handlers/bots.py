@@ -1,13 +1,11 @@
 from json import JSONDecodeError
 from typing import Optional, Type, Awaitable
 
-from CriadexSDK.routers.auth import AuthCheckRoute
-from CriadexSDK.routers.group_auth import GroupAuthCheckRoute
+from CriadexSDK.ragflow_schemas import AuthCheckResponse, GroupAuthCheckResponse
 from starlette.requests import Request
 
 from app.controllers.schemas import APIResponse
 from app.core.security.get_api_key import GetApiKey, BadAPIKeyException
-from criabot.bot.bot import Bot
 
 BotNameFuncType: Type = Awaitable[str]
 
@@ -39,15 +37,15 @@ class GetApiKeyBots(GetApiKey):
         return bot_name
 
     async def execute(self) -> str:
-        auth_response: AuthCheckRoute.Response = await self.get_auth()
+        auth_response: AuthCheckResponse = await self.get_auth()
 
         # Master keys go brr
-        if auth_response.master:
+        if auth_response['master']:
             return self.api_key
 
         # Since they are NOT master but trying to access stack trace, throw an error
         # It's a security concern to give stacktraces as it leaks implementation
-        if APIResponse.stack_trace_enabled(self.request):
+        if self.criadex._error_stacktrace:
             raise BadAPIKeyException(
                 status_code=401,
                 detail="Only master keys can access stacktraces!"
@@ -61,10 +59,11 @@ class GetApiKeyBots(GetApiKey):
                 detail="Bot name not included in params!"
             )
 
+        from criabot.bot.bot import Bot
         test_group_name: str = Bot.bot_group_name(bot_name, "DOCUMENT")
-        group_response: GroupAuthCheckRoute.Response = await self.get_group_auth(test_group_name)
+        group_response: GroupAuthCheckResponse = await self.get_group_auth(test_group_name)
 
-        if not group_response.authorized:
+        if not group_response['authorized']:
             raise BadAPIKeyException(
                 status_code=401,
                 detail="Your key is not authorized for accessing this bot."

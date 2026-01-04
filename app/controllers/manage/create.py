@@ -1,12 +1,11 @@
 from typing import Optional
 
-from CriadexSDK.routers.auth import AuthCreateRoute
+from CriadexSDK.ragflow_schemas import AuthCreateResponse
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
-from app.controllers.schemas import DUPLICATE_CODE, SUCCESS_CODE, exception_response, \
-    catch_exceptions, APIResponse
+from app.controllers.schemas import DUPLICATE_CODE, SUCCESS_CODE, exception_response, catch_exceptions, APIResponse
 from app.core.route import CriaRoute
 from criabot.schemas import BotCreateConfig, BotExistsError
 
@@ -45,7 +44,7 @@ class ManageCreateRoute(CriaRoute):
             config: BotCreateConfig
     ) -> ResponseModel:
         # Try to create the bot
-        auth_response: AuthCreateRoute.Response = await request.app.criabot.create(
+        auth_response: AuthCreateResponse = await request.app.criabot.create(
             name=bot_name,
             config=config
         )
@@ -55,7 +54,7 @@ class ManageCreateRoute(CriaRoute):
             code=SUCCESS_CODE,
             status=200,
             message="Successfully created the bot & their indexes.",
-            bot_api_key=auth_response.api_key
+            bot_api_key=auth_response['api_key']
         )
 
 

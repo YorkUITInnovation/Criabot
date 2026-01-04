@@ -1,4 +1,4 @@
-from CriadexSDK.routers.content import GroupContentUploadRoute
+from CriadexSDK.ragflow_schemas import ContentUploadResponse
 from pydantic import BaseModel
 
 
@@ -14,5 +14,5 @@ class ChatNotFoundError(RuntimeError):
 
 
 class GroupContentResponse(BaseModel):
-    response: GroupContentUploadRoute.Response
+    response: ContentUploadResponse
     document_name: str

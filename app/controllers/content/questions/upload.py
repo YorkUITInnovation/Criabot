@@ -1,7 +1,7 @@
 import uuid
 from typing import Type
 
-from CriadexSDK.routers.content.upload import ContentUploadConfig
+from CriadexSDK.ragflow_schemas import ContentUploadConfig
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from pydantic import Field
@@ -12,7 +12,6 @@ from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, APIResponseModel, QuestionConfig, exception_response, \
     catch_exceptions
 from app.core.route import CriaRoute
-from criabot.bot.bot import Bot
 from criabot.bot.schemas import GroupContentResponse
 from criabot.schemas import BotNotFoundError
 
@@ -53,7 +52,8 @@ class UploadQuestionRoute(CriaRoute):
             bot_name: str,
             file: QuestionUploadConfig
     ) -> ResponseModel:
-        # Try to retrieve the bot
+    # Try to retrieve the bot
+        from criabot.bot.bot import Bot
         bot: Bot = await request.app.criabot.get(name=bot_name)
 
         response: GroupContentResponse = await bot.add_group_content(
@@ -65,8 +65,8 @@ class UploadQuestionRoute(CriaRoute):
             code=SUCCESS_CODE,
             status=200,
             message="Successfully added to the index. Save the 'document_name' field to be able to update it!",
-            document_name=response.document_name,
-            token_usage=response.response.token_usage
+            document_name=response.get("document_name"),
+            token_usage=response.get("token_usage")
         )
 
 

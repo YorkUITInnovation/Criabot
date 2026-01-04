@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 from app.core.objects import AppMode, check_env_path
 
-from criabot.schemas import CriadexCredentials, RedisCredentials, MySQLCredentials
+from criabot.schemas import CriadexCredentials, RedisCredentials, MySQLCredentials, CriadexCredentials
 
 ENV_PATH: str = os.environ.get('ENV_PATH', "./.env")
 
@@ -26,7 +26,7 @@ SWAGGER_TITLE: str = "Criabot API"
 SWAGGER_FAVICON: str = "https://i.imgur.com/9XOI3qg.png"
 SWAGGER_DESCRIPTION = f"""
 <img width="40px" src="{SWAGGER_FAVICON}"/><br/><br/>
-An asynchronous REST API built on [LlamaIndex](https://github.com/jerryjliu/llama_index) for indexing/semantic search.
+An asynchronous REST API built on [Ragflow](https://github.com/infiniflow/ragflow) for indexing/semantic search.
 """
 
 # MySQL Config
@@ -41,7 +41,8 @@ MYSQL_CREDENTIALS: MySQLCredentials = MySQLCredentials(
 # Criadex Config
 CRIADEX_CREDENTIALS: CriadexCredentials = CriadexCredentials(
     api_base=os.environ.get("CRIADEX_API_BASE"),
-    api_key=os.environ.get("CRIADEX_API_KEY")
+    api_key=os.environ.get("CRIADEX_API_KEY"),
+    master_api_key=os.environ.get("CRIADEX_MASTER_API_KEY")
 )
 
 # Redis Config

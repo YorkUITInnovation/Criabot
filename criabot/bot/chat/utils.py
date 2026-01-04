@@ -4,7 +4,7 @@ import urllib.parse
 import uuid
 from typing import Dict
 
-from CriadexSDK.routers.content.search import Asset, GroupSearchResponse
+from CriadexSDK.ragflow_schemas import Asset, GroupSearchResponse
 
 EXTRACTION_PATTER: re.Pattern = re.compile(r'!\[(.*?)\]\((.*?)\)')
 

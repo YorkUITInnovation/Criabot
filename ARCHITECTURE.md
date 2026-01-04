@@ -53,7 +53,7 @@ Key features:
 - **API Key Auth**: `app/core/security/get_api_key.py` validates each request; handlers in `app/core/security/handlers`.
 - **Middleware**: `app/core/middleware.py` handles logging, CORS, and request tracing.
 
-## 6. Bot Engine (CristaBot)
+## 6. Bot Engine (Criabot)
 
 - **Orchestration**: `criabot/criabot.py` manages sessions, parameters, retry logic, and error handling.
 - **Schemas**: Pydantic schemas in `criabot/schemas.py` and `criabot/bot/schemas.py` for validation.

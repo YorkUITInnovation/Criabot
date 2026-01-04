@@ -2,7 +2,7 @@ from pprint import pprint
 from typing import List, Optional, Type
 
 import tiktoken
-from CriadexSDK.routers.agents.azure.chat import ChatMessage, TextBlock
+from CriadexSDK.ragflow_schemas import ChatMessage, TextBlock
 
 
 def string_tokens(string: str, encoding_name: str = "cl100k_base") -> int:
@@ -59,15 +59,16 @@ class ChatBuffer:
     def create_chat_token_metadata(cls, message: ChatMessage) -> int:
         token_count: int = sum([
             string_tokens(block.text)
-            for block in message.blocks
+            for block in message.blocks if isinstance(block, TextBlock)
         ])
         message.metadata[cls.TOKEN_COUNT_META_NAME] = token_count
         return token_count
 
     @classmethod
-    def get_token_metadata(cls, message: ChatMessage) -> Optional[int]:
-        """Retrieve the metadata for a token"""
-        return message.metadata.get(cls.TOKEN_COUNT_META_NAME)
+    def get_token_metadata(cls, message: ChatMessage) -> int:
+        """Retrieve the metadata for a token, return 0 if missing"""
+        value = message.metadata.get(ChatBuffer.TOKEN_COUNT_META_NAME)
+        return value if value is not None else 0
 
     @property
     def history(self) -> List[ChatMessage]:
@@ -181,16 +182,14 @@ class ChatBuffer:
 
             if print_debug:
                 print(
-                    "Prompt Characters:", len(message.content),
+                    "Prompt Characters:", len(message.blocks[0].text),
                     "| Prompt Tokens:", cls.get_token_metadata(message),
                     "| Remove N Characters:", remove_n_chars,
                     "| Exceeding N Tokens:", excess_tokens,
-                    "| Current Prompt: ", f"\"{message.content}\""
+                    "| Current Prompt: ", f"{message.blocks[0].text}"
                 )
 
-            message.blocks = TextBlock(
-                text=message.content[:-remove_n_chars]
-            )
+            message.blocks[0].text = message.blocks[0].text[:-remove_n_chars]
 
         # Update at the end
         message.metadata[cls.TOKEN_COUNT_META_NAME] = cls.get_token_metadata(message)
@@ -203,34 +202,31 @@ if __name__ == '__main__':
         history=[
             ChatMessage(
                 role="system",
-                content="This has to be included no matter what lol"
+                blocks=[TextBlock(text="This has to be included no matter what lol")]
             ),
             ChatMessage(
                 role="user",
-                content="What's the weather like in New York today?"
+                blocks=[TextBlock(text="What's the weather like in New York today?")]
             ),
             ChatMessage(
                 role="assistant",
-                content="I'm sorry, I cannot provide real-time updates. Would you like me to bot_auth for the weather "
-                        "forecast for New York?"
+                blocks=[TextBlock(text="I'm sorry, I cannot provide real-time updates. Would you like me to bot_auth for the weather forecast for New York?")]
             ),
             ChatMessage(
                 role="user",
-                content="Yes, please do that"
+                blocks=[TextBlock(text="Yes, please do that")]
             ),
             ChatMessage(
                 role="assistant",
-                content="No can do buckaroo"
+                blocks=[TextBlock(text="No can do buckaroo")]
             ),
             ChatMessage(
                 role="user",
-                content="How can I improve my French language skills quickly?"
+                blocks=[TextBlock(text="How can I improve my French language skills quickly?")]
             ),
             ChatMessage(
                 role="assistant",
-                content="To improve your French quickly, you could immerse yourself in the language, practice regularly "
-                        "with native speakers, use language learning apps, and take formal classes. Consistent daily "
-                        "practice and immersion are key to rapid progress."
+                blocks=[TextBlock(text="To improve your French quickly, you could immerse yourself in the language, practice regularly with native speakers, use language learning apps, and take formal classes. Consistent daily practice and immersion are key to rapid progress.")]
             )
         ]
     )
@@ -239,11 +235,10 @@ if __name__ == '__main__':
         chat_buffer.buffer(
             print_debug=False,
             system_ephemeral=ChatMessage(
-                content="Hey there this is a long message",
+                blocks=[TextBlock(text="Hey there this is a long message")],
                 role="system"
             )
         )
     )
 
     pprint(chat_buffer.history)
-

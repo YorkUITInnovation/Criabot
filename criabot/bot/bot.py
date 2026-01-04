@@ -1,14 +1,12 @@
 import time
+import asyncio
 import uuid
+import logging
+import json
 from typing import Dict, Awaitable, Callable
 
-from CriadexSDK import CriadexSDK
-from CriadexSDK.routers.content import GroupContentDeleteRoute, GroupContentListRoute, GroupContentUploadRoute
-from CriadexSDK.routers.content.search import SearchGroupConfig, GroupContentSearchRoute
-from CriadexSDK.routers.content.upload import ContentUploadConfig
-from CriadexSDK.routers.groups import GroupAboutRoute
-from CriadexSDK.routers.groups.about import GroupInfo
-from CriadexSDK.routers.groups.create import IndexTypes
+from CriadexSDK.ragflow_sdk import RAGFlowSDK
+from CriadexSDK.ragflow_schemas import GroupSearchResponse
 
 from criabot.bot.schemas import GroupContentResponse
 from criabot.cache.api import BotCacheAPI
@@ -17,7 +15,7 @@ from criabot.cache.objects.chats import ChatModel
 
 class Bot:
     # This must NOT be changed lol
-    INDEX_SUFFIX: Dict[IndexTypes, str] = {
+    INDEX_SUFFIX: Dict[str, str] = {
         "QUESTION": "-question-index",
         "DOCUMENT": "-document-index",
         # "CACHE": "-cache-index"
@@ -26,15 +24,20 @@ class Bot:
     def __init__(
             self,
             name: str,
-            criadex: CriadexSDK,
+            criadex,
             bot_cache: BotCacheAPI
     ):
         self._name: str = name
-        self._criadex: CriadexSDK = criadex
+        self._criadex = criadex
         self._cache_api: BotCacheAPI = bot_cache
+        self.intents = [
+            {"name": "Greeting", "description": "User says hello"},
+            {"name": "Question", "description": "User asks a question"},
+            {"name": "Farewell", "description": "User says goodbye"}
+        ]
 
     @property
-    def criadex(self) -> CriadexSDK:
+    def criadex(self):
         return self._criadex
 
     @property
@@ -49,7 +52,7 @@ class Bot:
     async def start_chat(cls, cache_api: BotCacheAPI) -> str:
         """
         Add a new chat to the cache and return the ID. Users should insert the system message
-        as the FIRST message in history
+        as the FIRST message in history. Also ensures the dialog exists in Ragflow.
 
         :return: The new chat ID
 
@@ -68,6 +71,25 @@ class Bot:
             chat_id=chat_id,
             chat_model=chat_model
         )
+
+        # Ensure the dialog exists in Ragflow (attempt to create if not exists)
+        try:
+            import httpx
+            import os
+            criadex_url = os.getenv("CRIADEX_URL", "http://criadex:25574")
+            ragflow_tenant_id = os.getenv("RAGFLOW_TENANT_ID")
+            
+            if ragflow_tenant_id:
+                ensure_dialog_url = f"{criadex_url}/ragflow/chats/{chat_id}/ensure"
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        ensure_dialog_url,
+                        json={"tenant_id": ragflow_tenant_id},
+                        timeout=5
+                    )
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to pre-create Ragflow dialog for chat {chat_id}: {e}")
 
         return chat_id
 
@@ -104,7 +126,7 @@ class Bot:
             chat_model=chat_model
         )
 
-    def group_name(self, index_type: IndexTypes) -> str:
+    def group_name(self, index_type) -> str:
         """
         Get the index name from the index type
 
@@ -116,7 +138,7 @@ class Bot:
         return self.bot_group_name(self._name, index_type)
 
     @classmethod
-    def bot_group_name(cls, bot_name: str, index_type: IndexTypes) -> str:
+    def bot_group_name(cls, bot_name: str, index_type) -> str:
         """
         Get the name of a given index for a bot
 
@@ -125,10 +147,10 @@ class Bot:
         return bot_name + cls.INDEX_SUFFIX[index_type]
 
     async def search_group(
-            self,
-            index_type: IndexTypes,
-            search_config: SearchGroupConfig
-    ) -> GroupContentSearchRoute.Response:
+        self,
+        index_type,
+        search_config
+    ):
         """
         Ask a documents on one of the Bot's indexes
 
@@ -137,15 +159,43 @@ class Bot:
         :return: Vector DB Response
 
         """
-
-        result: GroupContentSearchRoute.Response = await self._criadex.content.search(
-            group_name=self.group_name(index_type),
+        group_name = self.group_name(index_type)
+        # Ensure we await the SDK call (it is async) and support both
+        # dict and pydantic-style responses.
+        search_result = await self._criadex.content.search(
+            group_name=group_name,
             search_config=search_config
         )
+        if isinstance(search_result, dict):
+            # Some backends return the payload nested under 'response', others
+            # return the payload at the root, and some use 'result'/'data'.
+            # Extract flexibly and fall back to the root dict if it already
+            # looks like a GroupSearchResponse payload.
+            candidate = None
+            for key in ("response", "result", "data"):
+                value = search_result.get(key)
+                if isinstance(value, dict) and ("nodes" in value or "assets" in value or "search_units" in value):
+                    candidate = value
+                    break
+            if candidate is None:
+                # If the root dict already contains the expected fields, use it
+                if any(k in search_result for k in ("nodes", "assets", "search_units")):
+                    candidate = search_result
+                else:
+                    candidate = search_result.get("response", search_result)
 
-        return result.verify()
+            response_obj = (
+                candidate
+                if isinstance(candidate, GroupSearchResponse)
+                else GroupSearchResponse(**candidate)
+            )
+        else:
+            # Assume SDK returned a model-like object with .verify()/.response
+            verified = getattr(search_result, 'verify', lambda: search_result)()
+            response_obj = getattr(verified, 'response', verified)
+        return {"group_name": group_name, "response": response_obj}
 
-    async def retrieve_group_info(self) -> GroupInfo:
+    async def retrieve_group_info(self):
         """
         Retrieve the LLM model ID from the database
 
@@ -153,18 +203,16 @@ class Bot:
 
         """
 
-        response: GroupAboutRoute.Response = await self._criadex.manage.about(
+        response = await self._criadex.manage.about(
             group_name=self.group_name("DOCUMENT")
         )
-
-        response.verify()
-        return response.info
+        return response
 
     async def update_group_content(
-            self,
-            index_type: IndexTypes,
-            file: ContentUploadConfig
-    ) -> GroupContentResponse:
+        self,
+        index_type,
+        file
+    ):
         """
         Update a documents currently in the index
 
@@ -181,11 +229,11 @@ class Bot:
         )
 
     async def add_group_content(
-            self,
-            index_type: IndexTypes,
-            file: ContentUploadConfig,
-            is_update: bool = False
-    ) -> GroupContentResponse:
+        self,
+        index_type,
+        file,
+        is_update: bool = False
+    ):
         """
         Upload a documents to the index
 
@@ -196,18 +244,14 @@ class Bot:
 
         """
 
-        response: GroupContentUploadRoute.Response = await self._upload_group_file(
+        response = await self._upload_group_file(
             index_type,
-            file,
+            file.model_dump(),
             is_update=is_update
         )
+        return response
 
-        return GroupContentResponse(
-            response=response,
-            document_name=file.file_name
-        )
-
-    async def delete_group_file(self, index_type: IndexTypes, document_name: str) -> GroupContentDeleteRoute.Response:
+    async def delete_group_file(self, index_type, document_name):
         """
         Delete an item from an index
 
@@ -216,16 +260,14 @@ class Bot:
 
         """
 
-        group_name: str = self.group_name(index_type=index_type)
-
-        response: GroupContentDeleteRoute.Response = await self._criadex.content.delete(
+        group_name = self.group_name(index_type=index_type)
+        response = await self._criadex.content.delete(
             group_name=group_name,
             document_name=document_name
         )
+        return response
 
-        return response.verify()
-
-    async def list_group_files(self, index_type: IndexTypes) -> GroupContentListRoute.Response:
+    async def list_group_files(self, index_type):
         """
         List the content for a given index
 
@@ -234,18 +276,17 @@ class Bot:
 
         """
 
-        response: GroupContentListRoute.Response = await self._criadex.content.list(
+        response = await self._criadex.content.list(
             group_name=self.group_name(index_type=index_type)
         )
-
-        return response.verify()
+        return response
 
     async def _upload_group_file(
             self,
-            index_type: IndexTypes,
-            file: ContentUploadConfig,
+            index_type: str,
+            file: dict,
             is_update: bool
-    ) -> GroupContentUploadRoute.Response:
+    ):
         """
         Upload a file to the index
 
@@ -255,18 +296,70 @@ class Bot:
 
         """
 
-        # Get the associated name
-        group_name: str = self.group_name(index_type=index_type)
+        # Normalize node types in the document payload to the enum values
+        # so the API won't reject common simple values like "text".
+        file = self._normalize_document_payload(file)
 
-        # Update the index
-        group_operation: Callable[[group_name, ContentUploadConfig], Awaitable] = (
-            self._criadex.content.update.execute if is_update else self._criadex.content.upload.execute
-        )
+        group_name = self.group_name(index_type=index_type)
+        group_operation = self._criadex.content.update if is_update else self._criadex.content.upload
 
-        # Upload the file
-        response: GroupContentUploadRoute.Response = await group_operation(
-            group_name, file
-        )
+        # Always run the Criadex SDK call in a thread to avoid blocking the event loop.
+        # This assumes the Criadex SDK methods are synchronous.
+        response = await group_operation(group_name, file)
+        return response
 
-        # Verify
-        return response.verify()
+    def _normalize_document_payload(self, file: dict) -> dict:
+        """
+        Ensure every node in file['file_contents']['nodes'] has a valid
+        `type` value expected by Criadex. Map common simple types to the
+        Criadex enum and fill missing/unknown types with
+        'UncategorizedText'. This is a defensive, backward-compatible
+        normalization to avoid hard failures on upload.
+        """
+        # mapping from common short names to Criadex enum values
+        type_map = {
+            "text": "NarrativeText",
+            "txt": "NarrativeText",
+            "image": "Image",
+            "figure": "FigureCaption",
+            "title": "Title",
+            "list": "ListItem",
+            "table": "Table",
+        }
+
+        try:
+            contents = file.get("file_contents") or {}
+            nodes = contents.get("nodes") or []
+        except Exception:
+            return file
+
+        for node in nodes:
+            # ensure metadata exists
+            if "metadata" not in node or node["metadata"] is None:
+                node["metadata"] = {}
+
+            # normalize type
+            t = node.get("type")
+            if isinstance(t, str) and t in type_map:
+                node["type"] = type_map[t]
+            elif isinstance(t, str):
+                # leave known full enum values unchanged; unknown short
+                # strings map to UncategorizedText to be accepted by Criadex
+                if not t or t.lower() in ("", "none"):
+                    node["type"] = "UncategorizedText"
+                else:
+                    # preserve if already looks like an enum (capitalized)
+                    if t[0].isupper():
+                        node["type"] = t
+                    else:
+                        node["type"] = "UncategorizedText"
+            else:
+                # missing or non-string -> fallback
+                node["type"] = "UncategorizedText"
+
+        # write back
+        if contents is not None:
+            contents["nodes"] = nodes
+            file["file_contents"] = contents
+
+        return file

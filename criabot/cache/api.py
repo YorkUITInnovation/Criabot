@@ -1,4 +1,4 @@
-from aioredis import ConnectionPool
+from redis.asyncio import ConnectionPool
 
 from criabot.cache.core import BaseCacheAPI
 from criabot.cache.objects.chats import Chats

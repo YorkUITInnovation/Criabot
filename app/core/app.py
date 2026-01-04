@@ -7,14 +7,14 @@ import warnings
 from contextlib import asynccontextmanager
 from typing import Any, List, AsyncContextManager
 
-import aioredis
+from redis import asyncio as aioredis
 from fastapi import FastAPI
 from starlette.datastructures import State
 from starlette.middleware.cors import CORSMiddleware
 
 from app.controllers import router
 from app.core.security.get_api_key import GetApiKey, BadAPIKeyException
-from criabot import Criabot
+from criabot.criabot import Criabot
 from . import config
 from .middleware import StatusMiddleware
 
@@ -28,7 +28,6 @@ class CriabotAPI(FastAPI):
 
     def __init__(
             self,
-            criabot: Criabot,
             **extra: Any
     ):
         super().__init__(**extra)
@@ -38,7 +37,7 @@ class CriabotAPI(FastAPI):
         self.logger: logging.Logger = logging.getLogger('uvicorn.info')
 
         # Criadex Setup
-        self.criabot: Criabot = criabot
+        self.criabot: Optional[Criabot] = None
 
     @classmethod
     def create(cls) -> CriabotAPI:
@@ -51,12 +50,6 @@ class CriabotAPI(FastAPI):
 
         # Make more stuff
         _app: CriabotAPI = CriabotAPI(
-            criabot=Criabot(
-                criadex_credentials=config.CRIADEX_CREDENTIALS,
-                mysql_credentials=config.MYSQL_CREDENTIALS,
-                redis_credentials=config.REDIS_CREDENTIALS,
-                criadex_stacktrace=config.CRIADEX_STACKTRACE
-            ),
             title=config.APP_TITLE,
             description=config.SWAGGER_DESCRIPTION,
             docs_url=None,
@@ -147,7 +140,15 @@ class CriabotAPI(FastAPI):
             exit()
 
         # Initialization
-        await criabot_api.criabot.initialize()
+        # Create and initialize Criabot here
+        criabot_instance = Criabot(
+            criadex_credentials=config.CRIADEX_CREDENTIALS,
+            mysql_credentials=config.MYSQL_CREDENTIALS,
+            redis_credentials=config.REDIS_CREDENTIALS,
+            criadex_stacktrace=config.CRIADEX_STACKTRACE
+        )
+        await criabot_instance.initialize()
+        criabot_api.criabot = criabot_instance # Assign to app instance
 
         # Postflight checks
         if not await criabot_api.postflight_checks():
@@ -157,6 +158,7 @@ class CriabotAPI(FastAPI):
         yield
 
         criabot_api.logger.info("Shutting down Criabot...")
+        # Optionally, add shutdown logic for criabot_instance here
 
 
 # Instance of the app, started by Uvicorn.

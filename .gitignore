@@ -1,4 +1,38 @@
+# Ignore data and log directories
+*_data/
+*data/
+log/
+html/
+user_*
+
+# JetBrains
 .idea
 venv
-*.test
+
+# Sensitive Files
+*.pdf
+*.docs
+*.env
 .env
+
+# Doc
+doc/
+
+# Python
+__pycache__/
+*.py[cod]
+*.class
+
+# IDE
+.vscode/
+.idea/
+
+# Test
+.pytest_cache
+.coverage
+
+# data
+tiktoken
+
+# Os
+.DS_Store 

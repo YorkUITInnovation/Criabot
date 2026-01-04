@@ -4,15 +4,8 @@ import re
 import textwrap
 from typing import List, Optional, Dict, Awaitable, Union, Type
 
-from CriadexSDK import CriadexSDK
-from CriadexSDK.routers.agents import AgentRerankRoute
-from CriadexSDK.routers.agents.azure import AgentTransformRoute
-from CriadexSDK.routers.agents.azure.transform import TransformAgentConfig, TransformAgentResponse
-from CriadexSDK.routers.agents.cohere.rerank import RerankAgentConfig, RerankAgentResponse
-from CriadexSDK.routers.content.search import TextNodeWithScore, Filter, GroupSearchResponse, \
-    SearchGroupConfig, \
-    GroupContentSearchRoute, CompletionUsage, Asset
-from CriadexSDK.routers.groups.create import IndexTypes
+from CriadexSDK.ragflow_sdk import RAGFlowSDK
+from CriadexSDK.ragflow_schemas import TextNodeWithScore, Filter, GroupSearchResponse, CompletionUsage, Asset
 from pydantic import BaseModel
 
 from criabot.bot.bot import Bot
@@ -24,13 +17,13 @@ GroupSearchResponses: Type = Dict[str, GroupSearchResponse]
 
 
 class ContextRetrieverResponse(BaseModel):
-    context: Optional[Context] = None
-    group_responses: GroupSearchResponses
-    token_usage: List[CompletionUsage] = []
+    context: object = None
+    group_responses: dict = None
+    token_usage: list = []
     search_units: int = 0
 
     @classmethod
-    def get_search_units(cls, group_responses: GroupSearchResponses):
+    def get_search_units(cls, group_responses):
         search_units: int = 0
 
         for group_response in group_responses.values():
@@ -52,7 +45,7 @@ class ContextRetrieverResponse(BaseModel):
 
 
 class ContextRetriever:
-    INDEX_TYPES: List[IndexTypes] = ["DOCUMENT", "QUESTION"]
+    INDEX_TYPES = ["DOCUMENT", "QUESTION"]
     FILE_NAME_METADATA_KEY: str = "file_name"
     LLM_REPLY_METADATA_KEY: str = "llm_reply"
     GROUP_NAME_METADATA_KEY: str = "group_name"
@@ -61,26 +54,25 @@ class ContextRetriever:
 
     def __init__(
             self,
-            criadex: CriadexSDK,
-            rerank_model_id: int,
-            llm_model_id: int,
-            bot: Bot,
-            bot_params: BotParametersModel
+            criadex,
+            rerank_model_id,
+            llm_model_id,
+            bot,
+            bot_params
     ):
-        self._criadex: CriadexSDK = criadex
-        self._rerank_model_id: int = rerank_model_id
-        self._llm_model_id: int = llm_model_id
-        self._bot: Bot = bot
-        self._bot_params: BotParametersModel = bot_params
+        self._criadex = criadex
+        self._rerank_model_id = rerank_model_id
+        self._llm_model_id = llm_model_id
+        self._bot = bot
+        self._bot_params = bot_params
 
     async def search_groups(
             self,
-            prompt: str,
-            metadata_filter: Optional[Filter],
-            extra_bots: List[str]
-    ) -> Dict[str, GroupSearchResponse]:
-
-        index_queries: List[Awaitable[GroupContentSearchRoute.Response]] = []
+            prompt,
+            metadata_filter,
+            extra_bots
+    ):
+        index_queries = []
 
         for index_type in self.INDEX_TYPES:
             search_config = self.build_search_group_config(
@@ -88,73 +80,69 @@ class ContextRetriever:
                 metadata_filter=metadata_filter,
                 extra_groups=[Bot.bot_group_name(extra_bot, index_type) for extra_bot in extra_bots]
             )
-
             index_queries.append(
                 self._bot.search_group(index_type=index_type, search_config=search_config)
             )
 
-        return (
-            {
-                criadex_response.group_name: criadex_response.response
-                for criadex_response in await asyncio.gather(*index_queries)
-            }
-        )
+        results = await asyncio.gather(*index_queries)
+        return {r["group_name"] if isinstance(r, dict) else r.group_name: r["response"] if isinstance(r, dict) else r.response for r in results}
 
     async def hybrid_rerank(
             self,
-            prompt: str,
-            nodes: List[TextNodeWithScore],
-    ) -> RerankAgentResponse:
-
-        response: AgentRerankRoute.Response = await self._criadex.agents.cohere.rerank(
+            prompt,
+            nodes,
+    ):
+        response = await self._criadex.agents.cohere.rerank(
             model_id=self._rerank_model_id,
-            agent_config=RerankAgentConfig(
-                prompt=prompt,
-                nodes=nodes,
-                top_n=self._bot_params.top_n,
-                min_n=self._bot_params.min_n
-            )
+            agent_config={
+                "prompt": prompt,
+                "nodes": [node.model_dump(mode='json') for node in nodes],
+                "top_n": self._bot_params.top_n,
+                "min_n": self._bot_params.min_n
+            }
         )
 
-        return response.verify().agent_response
+        reranked_docs = response.get("reranked_documents", [])
+        if reranked_docs and isinstance(reranked_docs[0], dict):
+            reranked_docs = [TextNodeWithScore(**doc) for doc in reranked_docs]
+
+        return {
+            "ranked_nodes": reranked_docs,
+            "search_units": 0
+        }
 
     def build_search_group_config(
             self,
-            prompt: str,
-            metadata_filter: Filter,
-            extra_groups: List[str]
-    ) -> SearchGroupConfig:
+            prompt,
+            metadata_filter,
+            extra_groups
+    ):
+        return {
+            "query": prompt,
+            "top_k": self._bot_params.top_k,
+            "min_k": self._bot_params.min_k,
+            "top_n": self._bot_params.top_n,
+            "min_n": self._bot_params.min_n,
+            "search_filter": metadata_filter,
+            "extra_groups": extra_groups,
+        }
 
-        return SearchGroupConfig(
-            prompt=prompt,
-            top_k=self._bot_params.top_k,
-            min_k=self._bot_params.min_k,
-            top_n=self._bot_params.top_n,  # Ignored (rerank_enabled=False)
-            min_n=self._bot_params.min_n,  # Ignored (rerank_enabled=False)
-            search_filter=metadata_filter,
-            extra_groups=extra_groups,
-        )
-
-    async def transform_prompt(self, prompt: str, history: History) -> TransformAgentResponse:
-
-        response: AgentTransformRoute.Response = await self._criadex.agents.azure.transform(
+    async def transform_prompt(self, prompt, history):
+        response = await self._criadex.agents.azure.transform(
             model_id=self._llm_model_id,
-            agent_config=TransformAgentConfig(
-                prompt=prompt,
-                history=history
-            )
+            agent_config={
+                "prompt": prompt,
+                "history": history
+            }
         )
-
-        response.verify()
-        return response.agent_response
+        return response["agent_response"] if isinstance(response, dict) else response.verify().agent_response
 
     @classmethod
     def merge_responses(
             cls,
-            *response_lists: GroupSearchResponses
-    ) -> Dict[str, GroupSearchResponse]:
-        output: Dict[str, GroupSearchResponse] = {}
-
+            *response_lists
+    ):
+        output = {}
         for response_list in response_lists:
             for name, index_response in response_list.items():
                 if name not in output:
@@ -163,52 +151,44 @@ class ContextRetriever:
                     output[name].nodes.extend(index_response.nodes)
                     output[name].search_units += index_response.search_units
                     output[name].metadata = {**output[name].metadata, **index_response.metadata}
-
         return output
 
     @classmethod
-    def is_first_prompt(cls, history: History) -> bool:
+    def is_first_prompt(cls, history):
         return len(history) <= 2
 
     async def retrieve(
             self,
-            prompt: str,
-            metadata_filter: Optional[Filter],
-            extra_bots: List[str]
-    ) -> ContextRetrieverResponse:
-        retriever_response: ContextRetrieverResponse = ContextRetrieverResponse(
+            prompt,
+            metadata_filter,
+            extra_bots
+    ):
+        retriever_response = ContextRetrieverResponse(
             group_responses={}
         )
-
         # Retrieve using original prompt
-        group_responses: GroupSearchResponses = await self.search_groups(
+        group_responses = await self.search_groups(
             prompt=prompt,
             metadata_filter=metadata_filter,
             extra_bots=extra_bots
         )
-
         retriever_response.search_units = ContextRetrieverResponse.get_search_units(group_responses)
         retriever_response.group_responses = group_responses
-        nodes: List[TextNodeWithScore] = retriever_response.nodes
-
+        nodes = retriever_response.nodes
         # If there are no nodes
         if len(nodes) < 1:
             return retriever_response
-
         # Execute hybrid re-rank
-        rerank_response: Optional[RerankAgentResponse] = await self.hybrid_rerank(
+        rerank_response = await self.hybrid_rerank(
             prompt=prompt,
             nodes=nodes
         )
-
-        retriever_response.search_units += rerank_response.search_units
-
+        retriever_response.search_units += rerank_response["search_units"]
         # Make sure we have something
-        if len(rerank_response.ranked_nodes) > 0:
+        if len(rerank_response["ranked_nodes"]) > 0:
             retriever_response.context = self.build_context(
-                ranked_nodes=rerank_response.ranked_nodes,
+                ranked_nodes=rerank_response["ranked_nodes"],
             )
-
         # Give 'er
         return retriever_response
 
@@ -311,10 +291,9 @@ def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
     """
 
     extra_text: str = (
-        """If nothing from this information is relevant, use your knowledge to guess."""
+        "If nothing from this information is relevant, use your knowledge to guess."
         if best_guess else
-        """If nothing from this information is relevant, say your database don't have that information,
-         even if you do have a guess."""
+        "If nothing from this information is relevant, say your database don't have that information, even if you do have a guess."
     )
 
     return clean_text(

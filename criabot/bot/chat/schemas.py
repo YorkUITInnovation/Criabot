@@ -2,9 +2,14 @@ import enum
 from abc import ABC
 from typing import List, Optional, Dict, Union, Literal
 
-from CriadexSDK.routers.agents.azure.chat import ChatMessage
-from CriadexSDK.routers.agents.azure.related_prompts import RelatedPrompt
-from CriadexSDK.routers.content.search import CompletionUsage, GroupSearchResponse, TextNodeWithScore, Asset
+from CriadexSDK.ragflow_schemas import (
+    ChatMessage,
+    RelatedPrompt,
+    CompletionUsage,
+    GroupSearchResponse,
+    TextNodeWithScore,
+    Asset
+)
 from pydantic import BaseModel, Field
 
 from criabot.bot.chat.utils import embed_assets_in_message
@@ -47,15 +52,12 @@ class ChatReplyContent(BaseModel):
 
     @classmethod
     def from_message(
-            cls,
-            message: ChatMessage,
-            assets: list[Asset]
+        cls,
+        message: ChatMessage,
+        assets: list[Asset]
     ) -> "ChatReplyContent":
         # Combine blocks into a single string, embed assets into it
-        content: str = embed_assets_in_message(message.content, assets)
-
-        # Add the assets to the content
-
+        content: str = embed_assets_in_message(message.blocks[0].text, assets)
         return cls(
             role=message.role,
             content=content,

@@ -1,28 +1,27 @@
 import asyncio
 import secrets
-from asyncio import AbstractEventLoop
-from typing import Optional, Tuple
+from typing import Optional
 
-import aioredis
-from CriadexSDK import CriadexSDK
-from CriadexSDK.routers.auth import AuthCreateRoute
-from CriadexSDK.routers.auth.create import AuthCreateConfig
-from CriadexSDK.routers.group_auth import GroupAuthCreateRoute
-from CriadexSDK.routers.groups import GroupDeleteRoute, GroupCreateRoute
-from CriadexSDK.routers.groups.about import GroupInfo
-from CriadexSDK.routers.groups.create import PartialGroupConfig, IndexTypes
+from redis import asyncio as aioredis
+from CriadexSDK.ragflow_sdk import RAGFlowSDK
+from CriadexSDK.ragflow_schemas import AuthCreateConfig, GroupDeleteResponse
 from aiomysql import Pool
-from aioredis import ConnectionPool
+from redis.asyncio import ConnectionPool
 from sqlalchemy import URL, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 
-from criabot.bot.chat.chat import Chat
-from criabot.schemas import MySQLCredentials, RedisCredentials, CriadexCredentials, BotExistsError, \
-    BotCreateConfig, BotNotFoundError, AboutBot
-from .bot.bot import Bot
+from criabot.database.table import BaseTable
+
+from criabot.schemas import (
+    MySQLCredentials,
+    RedisCredentials,
+    CriadexCredentials,
+    BotExistsError,
+    BotCreateConfig,
+    BotNotFoundError,
+    AboutBot
+)
 from .bot.schemas import ChatNotFoundError
-from .cache.api import BotCacheAPI
-from .cache.objects.chats import ChatModel
 from .database.bots.bots import BotDatabaseAPI
 from .database.bots.tables.bot_params import BotParametersModel, BotParametersConfig, BotParametersBaseConfig
 from .database.bots.tables.bots import BotsModel, BotsConfig
@@ -49,26 +48,20 @@ class Criabot:
         self._criadex_credentials: CriadexCredentials = criadex_credentials
 
         # Criadex SDK
-        self._criadex: CriadexSDK = CriadexSDK(
+        self._criadex: RAGFlowSDK = RAGFlowSDK(
             api_base=self._criadex_credentials.api_base,
             error_stacktrace=criadex_stacktrace
         )
 
         # Database
-        self._mysql_engine: Optional[Pool] = None
-        self._mysql_api: Optional[BotDatabaseAPI] = None
+        self._mysql_engine = None
+        self._mysql_api = None
 
         # Cache
-        self._redis_pool: Optional[ConnectionPool] = None
-        self._redis_api: Optional[BotCacheAPI] = None
+        self._redis_pool = None
+        self._redis_api = None
 
-        # Other
-        try:
-            self._loop: AbstractEventLoop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._loop: AbstractEventLoop = asyncio.get_event_loop()
-
-        self._already_initialized: bool = False
+        self._already_initialized = False
 
     async def initialize(self) -> None:
         """
@@ -82,7 +75,8 @@ class Criabot:
             raise InitializedAlreadyError()
 
         # Criadex Startup
-        await self._criadex.authenticate(self._criadex_credentials.api_key)
+        # Authenticate with the initial master key
+        self._criadex.authenticate(self._criadex_credentials.master_api_key)
 
         # SQL DB Startup
         self._mysql_engine: AsyncEngine = await self._create_mysql_engine()
@@ -100,7 +94,8 @@ class Criabot:
         await self._mysql_api.initialize()
 
         # Redis API Startup
-        self._redis_api: BotCacheAPI = BotCacheAPI(pool=self._redis_pool)
+        from .cache.api import BotCacheAPI
+        self._redis_api = BotCacheAPI(pool=self._redis_pool)
 
     async def _create_mysql_engine(self) -> AsyncEngine:
         """
@@ -140,7 +135,7 @@ class Criabot:
 
         return self._mysql_engine
 
-    async def create(self, name: str, config: BotCreateConfig) -> AuthCreateRoute.Response:
+    async def create(self, name: str, config: BotCreateConfig):
         """
         Create a bot, including all the required indexes
 
@@ -156,12 +151,12 @@ class Criabot:
             raise BotExistsError()
 
         # Make a new access token
-        new_auth: AuthCreateRoute.Response = await self._create_new_bot_auth()
+        new_auth = await self._create_new_bot_auth()
 
         # Create the indexes & authenticate on them
         await self._create_new_bot_groups(
             bot_name=name,
-            bot_api_key=new_auth.api_key,
+            bot_api_key=new_auth['api_key'],
             bot_config=config
         )
 
@@ -223,6 +218,7 @@ class Criabot:
             raise BotNotFoundError()
 
         # Get the bot to delete it
+        from .bot.bot import Bot
         bot: Bot = await self.get(name=name)
 
         # Get index names
@@ -234,11 +230,7 @@ class Criabot:
 
         # Delete the indexes
         for group_name in group_names:
-            response: GroupDeleteRoute.Response = await self._criadex.manage.delete(
-                group_name=group_name
-            )
-
-            response.verify()
+            await self._criadex.manage.delete(group_name=group_name)
 
         # Delete the bot params.py
         await self._mysql_api.bot_params.delete(bot_id=bot_id)
@@ -268,7 +260,7 @@ class Criabot:
             params=params_model
         )
 
-    async def get(self, name: str) -> Bot:
+    async def get(self, name: str):
         """
         Retrieve an existing bot
 
@@ -282,13 +274,14 @@ class Criabot:
             raise BotNotFoundError()
 
         # Create a bot (light-weight operation)
+        from .bot.bot import Bot
         return Bot(
             name=name,
             criadex=self._criadex,
             bot_cache=self._redis_api
         )
 
-    async def get_bot_chat(self, bot_name: str, chat_id: str) -> Chat:
+    async def get_bot_chat(self, bot_name: str, chat_id: str):
         """
         Get a bot chat given its ID
 
@@ -299,20 +292,22 @@ class Criabot:
 
         """
 
+        from .cache.objects.chats import ChatModel
         chat_model: ChatModel = await self._redis_api.chats.get(chat_id=chat_id)
         bot_parameters: AboutBot = await self.about(name=bot_name)
-        bot: Bot = await self.get(name=bot_name)
-        group_info: GroupInfo = await bot.retrieve_group_info()
+        bot = await self.get(name=bot_name)
+        group_info = await bot.retrieve_group_info()
 
         # If the chat DNE
         if chat_model is None:
             raise ChatNotFoundError(chat_id=chat_id)
 
         # Create light-weight chat
+        from criabot.bot.chat.chat import Chat
         return Chat(
             bot=bot,
-            llm_model_id=group_info.llm_model_id,
-            rerank_model_id=group_info.rerank_model_id,
+            llm_model_id=group_info['info']['llm_model_id'],
+            rerank_model_id=group_info['info']['rerank_model_id'],
             chat_model=chat_model,
             chat_id=chat_id,
             bot_parameters=bot_parameters.params
@@ -335,12 +330,7 @@ class Criabot:
 
         bot_id: Optional[int] = await self._mysql_api.bots.retrieve_id(name=name)
 
-        if bot_id is None:
-            raise BotNotFoundError()
-
-        await self._mysql_api.bot_params.update(bot_id=bot_id, config=params)
-
-    async def _create_new_bot_auth(self) -> AuthCreateRoute.Response:
+    async def _create_new_bot_auth(self):
         """
         Create a new authentication token for use with the bot
 
@@ -348,21 +338,21 @@ class Criabot:
 
         """
 
-        result: AuthCreateRoute.Response = await self._criadex.auth.create(
+        result = await self._criadex.auth.create(
             api_key=(secrets.token_urlsafe(32)),
             create_config=AuthCreateConfig(
                 master=False
             )
         )
-
-        return result.verify()
+        # Optionally: check response for success or error
+        return result
 
     async def _create_new_bot_groups(
-            self,
-            bot_name: str,
-            bot_config: BotCreateConfig,
-            bot_api_key: str
-    ) -> Tuple[GroupCreateRoute.Response, GroupCreateRoute.Response]:
+        self,
+        bot_name: str,
+        bot_config: BotCreateConfig,
+        bot_api_key: str
+    ):
         """
         Create the necessary indexes for the bot
 
@@ -373,27 +363,23 @@ class Criabot:
 
         """
 
-        async def create_group(index_type: IndexTypes) -> GroupCreateRoute.Response:
-            group_name: str = bot_name + Bot.INDEX_SUFFIX[index_type]
 
-            # Create the index
-            new_group: GroupCreateRoute.Response = await self._create_new_bot_group(
+        async def create_group(index_type):
+            from .bot.bot import Bot
+            group_name = bot_name + Bot.INDEX_SUFFIX[index_type]
+            new_group = await self._create_new_bot_group(
                 group_name=group_name,
-                group_config=PartialGroupConfig(
-                    type=index_type,
-                    llm_model_id=bot_config.llm_model_id,
-                    embedding_model_id=bot_config.embedding_model_id,
-                    rerank_model_id=bot_config.rerank_model_id
-                )
+                group_config={
+                    "type": index_type,
+                    "llm_model_id": bot_config.llm_model_id,
+                    "embedding_model_id": bot_config.embedding_model_id,
+                    "rerank_model_id": bot_config.rerank_model_id
+                }
             )
-
-            # Authenticate the token on the index
             await self._create_new_bot_auth_group(
                 group_name=group_name,
                 bot_api_key=bot_api_key
             )
-
-            # Return the index
             return new_group
 
         return (
@@ -405,54 +391,52 @@ class Criabot:
     async def _create_new_bot_group(
             self,
             group_name: str,
-            group_config: PartialGroupConfig
-    ) -> GroupCreateRoute.Response:
+            group_config: dict
+    ):
         """
         Create a new Bot Index for a new Bot
 
         :param group_name: The name of the index
         :param group_config: Partial config for the SDK
-        :return: Criadex API Response
+        :return: RAGFlow API Response
 
         """
-
-        result: GroupCreateRoute.Response = await self._criadex.manage.create(
+        result = await self._criadex.manage.create(
             group_name=group_name,
             group_config=group_config
         )
-
-        return result.verify()
+        # Optionally: check response for success or error
+        return result
 
     async def _create_new_bot_auth_group(
             self,
             group_name: str,
             bot_api_key: str
-    ) -> GroupAuthCreateRoute.Response:
+    ):
         """
         Create a new Index Authorization with the newly created API key
 
         :param group_name: The name of the index to add the key to
         :param bot_api_key: The key to add
-        :return: Criadex API Response
-        :raises CriadexError: If request fails
+        :return: RAGFlow API Response
+        :raises Exception: If request fails
 
         """
-
-        result: GroupAuthCreateRoute.Response = await self._criadex.group_auth.create(
+        result = await self._criadex.group_auth.create(
             group_name=group_name,
             api_key=bot_api_key
         )
-
-        return result.verify()
+        # Optionally: check response for success or error
+        return result
 
     @property
     def mysql_api(self) -> BotDatabaseAPI:
         return self._mysql_api
 
     @property
-    def redis_api(self) -> BotCacheAPI:
+    def redis_api(self):
         return self._redis_api
 
     @property
-    def criadex(self) -> CriadexSDK:
+    def criadex(self):
         return self._criadex

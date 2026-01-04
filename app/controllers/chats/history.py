@@ -1,6 +1,6 @@
 from typing import Optional, List
 
-from CriadexSDK.routers.agents.azure.chat import ChatMessage
+from CriadexSDK.ragflow_schemas import ChatMessage
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
@@ -9,7 +9,7 @@ from app.controllers.schemas import SUCCESS_CODE, NOT_FOUND_CODE, exception_resp
     catch_exceptions, APIResponse
 from app.core.route import CriaRoute
 from criabot.bot.schemas import ChatNotFoundError
-from criabot.cache.objects.chats import ChatModel
+
 
 view = APIRouter()
 
@@ -39,12 +39,14 @@ class ChatHistoryRoute(CriaRoute):
             message="That chat does not exist or is expired!"
         )
     )
+
     async def execute(
-            self,
-            request: Request,
-            chat_id: str
+        self,
+        request: Request,
+        chat_id: str
     ) -> ResponseModel:
         # Try to get the chat
+        from criabot.cache.objects.chats import ChatModel
         chat_model: ChatModel = await request.app.criabot.redis_api.chats.get(chat_id=chat_id)
 
         return self.ResponseModel(

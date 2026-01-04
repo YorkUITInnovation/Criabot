@@ -1,6 +1,6 @@
-from typing import Optional
+from typing import Optional, Any
 
-from CriadexSDK.routers.content.search import CompletionUsage
+from CriadexSDK.ragflow_schemas import CompletionUsage
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
@@ -8,7 +8,7 @@ from starlette.requests import Request
 from app.controllers.schemas import SUCCESS_CODE, NOT_FOUND_CODE, ChatSendConfig, exception_response, catch_exceptions, \
     APIResponse
 from app.core.route import CriaRoute
-from criabot.bot.chat.chat import Chat, ChatReply
+
 from criabot.bot.schemas import ChatNotFoundError
 from criabot.schemas import BotNotFoundError
 
@@ -16,7 +16,7 @@ view = APIRouter()
 
 
 class BotChatSendResponse(APIResponse):
-    reply: Optional[ChatReply] = None
+    reply: Optional[Any] = None  # Accepts ChatReply, avoids circular import
 
 
 @cbv(view)
@@ -49,13 +49,15 @@ class SendChatRoute(CriaRoute):
             message="That bot could not be found!"
         )
     )
+
     async def execute(
-            self,
-            request: Request,
-            chat_id: str,
-            chat_config: ChatSendConfig
+        self,
+        request: Request,
+        chat_id: str,
+        chat_config: ChatSendConfig
     ) -> ResponseModel:
         # Try to get the chat
+        from criabot.bot.chat.chat import Chat, ChatReply
         chat: Chat = await request.app.criabot.get_bot_chat(
             bot_name=chat_config.bot_name,
             chat_id=chat_id

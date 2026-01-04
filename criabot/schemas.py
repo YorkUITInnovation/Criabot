@@ -35,6 +35,7 @@ class CriadexCredentials(BaseModel):
 
     api_base: str
     api_key: str  # Must be a master key
+    master_api_key: str
 
 
 class MySQLCredentials(BaseModel):
