@@ -327,8 +327,12 @@ class Criabot:
         await self._redis_api.chats.delete(chat_id=chat_id)
 
     async def update_parameters(self, name: str, params: BotParametersBaseConfig) -> None:
-
+        """Update bot parameters"""
         bot_id: Optional[int] = await self._mysql_api.bots.retrieve_id(name=name)
+        if bot_id is None:
+            raise BotNotFoundError()
+        
+        await self._mysql_api.bot_params.update(bot_id=bot_id, config=params)
 
     async def _create_new_bot_auth(self):
         """
