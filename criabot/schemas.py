@@ -33,9 +33,18 @@ class BotCreateConfig(BotParametersBaseConfig):
     parent_priorities: Optional[Dict[str, int]] = Field(default=None)
 
 
+class BotUpdateConfig(BotParametersBaseConfig):
+    """Configuration for updating bot parameters and parent relationships"""
+    parent_bot_names: Optional[List[str]] = Field(default=None)
+    parent_priorities: Optional[Dict[str, int]] = Field(default=None)
+
+
 class AboutBot(BaseModel):
     info: BotsModel
     params: BotParametersModel
+    parent_bot_names: List[str] = Field(default_factory=list)
+    children: List[str] = Field(default_factory=list)
+    effective_config: BotParametersModel
 
 
 class CriadexCredentials(BaseModel):

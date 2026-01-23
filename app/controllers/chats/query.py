@@ -1,4 +1,4 @@
-from typing import Optional, Any
+from typing import Optional, Any, List
 
 from CriadexSDK.ragflow_schemas import CompletionUsage
 from fastapi import APIRouter
@@ -55,8 +55,28 @@ class QueryChatRoute(CriaRoute):
         chat_id: str,
         chat_config: ChatSendConfig
     ) -> ResponseModel:
-        import logging
-        logging.info("Executing query endpoint")
+        # Input validation
+        if not chat_id or not chat_id.strip():
+            return self.ResponseModel(
+                code="INVALID_INPUT",
+                status=400,
+                message="Chat ID cannot be empty."
+            )
+        
+        if not chat_config.bot_name or not chat_config.bot_name.strip():
+            return self.ResponseModel(
+                code="INVALID_INPUT",
+                status=400,
+                message="Bot name cannot be empty."
+            )
+        
+        if not chat_config.prompt or not chat_config.prompt.strip():
+            return self.ResponseModel(
+                code="INVALID_INPUT",
+                status=400,
+                message="Prompt cannot be empty."
+            )
+        
         # Try to get the chat
         from criabot.bot.chat.chat import Chat, ChatReply
         chat: Chat = await request.app.criabot.get_bot_chat(
@@ -64,8 +84,17 @@ class QueryChatRoute(CriaRoute):
             chat_id=chat_id
         )
 
-        # Check the bots exist
-        if chat_config.extra_bots and not await request.app.criabot.exists(*chat_config.extra_bots):
+        # Resolve inherited parent bots for this bot and merge with explicitly requested extra_bots.
+        parent_bot_names: List[str] = await request.app.criabot.get_parent_bot_names(
+            name=chat_config.bot_name
+        )
+        requested_extra_bots: List[str] = chat_config.extra_bots or []
+        effective_extra_bots: List[str] = list(
+            dict.fromkeys(parent_bot_names + requested_extra_bots)
+        )
+
+        # Check explicitly requested extra bots exist (parents are guaranteed by relationships)
+        if requested_extra_bots and not await request.app.criabot.exists(*requested_extra_bots):
             return self.ResponseModel(
                 code=NOT_FOUND_CODE,
                 status=404,
@@ -75,7 +104,7 @@ class QueryChatRoute(CriaRoute):
         reply: ChatReply = await chat.send(
             prompt=chat_config.prompt,
             metadata_filter=chat_config.metadata_filter,
-            extra_bots=chat_config.extra_bots
+            extra_bots=effective_extra_bots
         )
 
         return self.ResponseModel(

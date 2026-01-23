@@ -106,3 +106,17 @@ class BotParametersAPI(TableAPI):
 
     async def exists(self, bot_id: int) -> bool:
         return bool(await self.retrieve(bot_id=bot_id))
+
+    async def retrieve_by_bot_ids(self, bot_ids: List[int]) -> List[BotParametersModel]:
+        """Batch retrieve bot parameters by bot IDs to avoid N+1 queries"""
+        if not bot_ids:
+            return []
+        
+        async with self.get_async_session() as session:
+            result: Optional[ChunkedIteratorResult] = await session.execute(
+                select(self.Schema)
+                .where(self.Schema.bot_id.in_(bot_ids))
+            )
+            entries: List[BotParametersTable] = result.scalars().all()
+        
+        return [self.to_model(entry, BotParametersModel) for entry in entries]

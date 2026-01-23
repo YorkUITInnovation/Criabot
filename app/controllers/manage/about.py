@@ -42,8 +42,15 @@ class ManageAboutRoute(CriaRoute):
             request: Request,
             bot_name: str
     ) -> ResponseModel:
+        # Input validation
+        if not bot_name or not bot_name.strip():
+            return self.ResponseModel(
+                code="INVALID_INPUT",
+                status=400,
+                message="Bot name cannot be empty."
+            )
 
-        # Try to create the bot
+        # Retrieve bot information
         about_model: AboutBot = await request.app.criabot.about(
             name=bot_name
         )

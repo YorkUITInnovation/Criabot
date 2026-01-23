@@ -6,7 +6,7 @@ from app.controllers.schemas import SUCCESS_CODE, \
     NOT_FOUND_CODE, exception_response, catch_exceptions, APIResponse
 from app.core.route import CriaRoute
 from criabot.database.bots.tables.bot_params import BotParametersBaseConfig
-from criabot.schemas import BotNotFoundError
+from criabot.schemas import BotNotFoundError, BotUpdateConfig, CircularDependencyError, ParentNotFoundError
 
 view = APIRouter()
 
@@ -36,17 +36,59 @@ class ManageUpdateRoute(CriaRoute):
             message="That bot could not be found!"
         )
     )
+    @exception_response(
+        CircularDependencyError,
+        ResponseModel(
+            code="CIRCULAR_DEPENDENCY",
+            status=400,
+            message="Updating parent relationships would create a circular dependency."
+        )
+    )
+    @exception_response(
+        ParentNotFoundError,
+        ResponseModel(
+            code=NOT_FOUND_CODE,
+            status=404,
+            message="One or more specified parent bots do not exist."
+        )
+    )
     async def execute(
             self,
             request: Request,
             bot_name: str,
-            config: BotParametersBaseConfig
+            config: BotUpdateConfig
     ) -> ResponseModel:
-        # Try to create the bot
+        # Input validation
+        if not bot_name or not bot_name.strip():
+            return self.ResponseModel(
+                code="INVALID_INPUT",
+                status=400,
+                message="Bot name cannot be empty."
+            )
+        
+        # Validate parent bot names if provided
+        if config.parent_bot_names is not None:
+            invalid_names = [name for name in config.parent_bot_names if not name or not name.strip()]
+            if invalid_names:
+                return self.ResponseModel(
+                    code="INVALID_INPUT",
+                    status=400,
+                    message="Parent bot names cannot be empty."
+                )
+        
+        # Update bot parameters if provided
         await request.app.criabot.update_parameters(
             name=bot_name,
             params=config
         )
+        
+        # Update parent relationships if provided
+        if config.parent_bot_names is not None:
+            await request.app.criabot.update_parent_relationships(
+                child_name=bot_name,
+                new_parent_names=config.parent_bot_names,
+                parent_priorities=config.parent_priorities,
+            )
 
         # Success!
         return self.ResponseModel(

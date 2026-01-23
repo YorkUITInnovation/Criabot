@@ -35,7 +35,11 @@ def merge_configurations(
     configs: List[BotParametersModel],
     priorities: Optional[Dict[int, int]] = None
 ) -> BotParametersModel:
-    """Merge multiple bot configurations based on priority"""
+    """
+    Merge multiple bot configurations based on priority.
+    Later configs override earlier ones (last-write-wins).
+    Child configs should be merged separately after this.
+    """
     if not configs:
         raise ValueError("Cannot merge empty configuration list")
     
@@ -69,8 +73,34 @@ def merge_configurations(
         system_message=base.system_message
     )
     
+    # Merge all remaining configs (later overrides earlier)
     for config in sorted_configs[1:]:
-        if config.system_message and not merged.system_message:
+        # Merge all fields - later configs override earlier ones
+        if config.max_input_tokens is not None:
+            merged.max_input_tokens = config.max_input_tokens
+        if config.max_reply_tokens is not None:
+            merged.max_reply_tokens = config.max_reply_tokens
+        if config.temperature is not None:
+            merged.temperature = config.temperature
+        if config.top_p is not None:
+            merged.top_p = config.top_p
+        if config.top_k is not None:
+            merged.top_k = config.top_k
+        if config.min_k is not None:
+            merged.min_k = config.min_k
+        if config.top_n is not None:
+            merged.top_n = config.top_n
+        if config.min_n is not None:
+            merged.min_n = config.min_n
+        if config.llm_generate_related_prompts is not None:
+            merged.llm_generate_related_prompts = config.llm_generate_related_prompts
+        if config.no_context_message is not None:
+            merged.no_context_message = config.no_context_message
+        if config.no_context_use_message is not None:
+            merged.no_context_use_message = config.no_context_use_message
+        if config.no_context_llm_guess is not None:
+            merged.no_context_llm_guess = config.no_context_llm_guess
+        if config.system_message is not None:
             merged.system_message = config.system_message
     
     return merged
