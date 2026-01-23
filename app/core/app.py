@@ -11,12 +11,16 @@ from redis import asyncio as aioredis
 from fastapi import FastAPI
 from starlette.datastructures import State
 from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
 
 from app.controllers import router
 from app.core.security.get_api_key import GetApiKey, BadAPIKeyException
 from criabot.criabot import Criabot
 from . import config
 from .middleware import StatusMiddleware
+from slowapi.errors import RateLimitExceeded
+from starlette.responses import JSONResponse
+from app.controllers.schemas import RateLimitResponse
 
 
 class CriabotAPI(FastAPI):
@@ -49,10 +53,16 @@ class CriabotAPI(FastAPI):
         """
 
         # Make more stuff
+        # Enable API docs in non-production mode
+        from app.core.objects import AppMode
+        docs_url = "/docs" if config.APP_MODE != AppMode.PRODUCTION else None
+        openapi_url = "/openapi.json" if config.APP_MODE != AppMode.PRODUCTION else None
+        
         _app: CriabotAPI = CriabotAPI(
             title=config.APP_TITLE,
             description=config.SWAGGER_DESCRIPTION,
-            docs_url=None,
+            docs_url=docs_url,
+            openapi_url=openapi_url,
             version=config.APP_VERSION,
             lifespan=cls.app_lifespan
         )
@@ -60,6 +70,14 @@ class CriabotAPI(FastAPI):
         # Add extra bells & whistles
         _app.include_router(router)
         _app.add_exception_handler(BadAPIKeyException, GetApiKey.handle_no_auth)
+        _app.add_exception_handler(RateLimitExceeded, _app.rate_limit_handler)
+        
+        # Initialize rate limiters on app state
+        from app.controllers.schemas import bot_management_limiter, chat_limiter, general_limiter
+        _app.state.bot_management_limiter = bot_management_limiter
+        _app.state.chat_limiter = chat_limiter
+        _app.state.general_limiter = general_limiter
+        
         _app.include_middlewares()
 
         # Please shut up
@@ -86,6 +104,25 @@ class CriabotAPI(FastAPI):
 
         self.add_middleware(
             StatusMiddleware
+        )
+
+    @classmethod
+    def rate_limit_handler(cls, request: Request, _: RateLimitExceeded) -> JSONResponse:
+        """
+        Handle rate limit exceeded errors
+        
+        :param request: The request
+        :param _: The rate limit exception
+        :return: JSON response with rate limit error
+        """
+        response = RateLimitResponse(
+            message="Rate limit exceeded. Please try again later.",
+            code="RATE_LIMIT",
+            status=429
+        )
+        return JSONResponse(
+            content=response.dict(),
+            status_code=429
         )
 
     async def preflight_checks(self) -> bool:

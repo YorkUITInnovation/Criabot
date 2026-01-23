@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Security
@@ -17,14 +18,22 @@ view = APIRouter()
 class DocsRedirectRoute(CriaRoute):
     ResponseModel = Response
     CSS_FP: Path = Path(__file__).parent.joinpath("theme.css")
-    CSS: str = open(CSS_FP, "r").read()
+    _css_cache: str = None
 
-    def get_css(self) -> str:
+    async def _read_css(self) -> str:
+        """Read CSS file asynchronously"""
+        if self._css_cache is None:
+            self._css_cache = await asyncio.to_thread(self._read_css_sync)
+        return self._css_cache
+
+    def _read_css_sync(self) -> str:
+        """Synchronous CSS file reading (runs in thread)"""
+        with open(self.CSS_FP, "r", encoding="utf-8") as f:
+            return f.read()
+
+    async def get_css(self) -> str:
         """Get CSS for theme"""
-
-        if config.APP_MODE == AppMode.PRODUCTION:
-            return self.CSS
-        return open(self.CSS_FP, "r").read()
+        return await self._read_css()
 
     @view.get(
         "/styles",
@@ -34,8 +43,9 @@ class DocsRedirectRoute(CriaRoute):
         APIResponse
     )
     async def execute(self) -> ResponseModel:
+        css_content = await self.get_css()
         return Response(
-            content=self.get_css(),
+            content=css_content,
             headers={"Content-Type": "text/css"}
         )
 

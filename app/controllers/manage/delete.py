@@ -40,7 +40,15 @@ class ManageDeleteRoute(CriaRoute):
             request: Request,
             bot_name: str
     ) -> ResponseModel:
-        # Try to create the bot
+        # Input validation
+        if not bot_name or not bot_name.strip():
+            return self.ResponseModel(
+                code="INVALID_INPUT",
+                status=400,
+                message="Bot name cannot be empty."
+            )
+        
+        # Try to delete the bot
         await request.app.criabot.delete(
             name=bot_name
         )

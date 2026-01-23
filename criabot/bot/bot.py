@@ -3,7 +3,7 @@ import asyncio
 import uuid
 import logging
 import json
-from typing import Dict, Awaitable, Callable
+from typing import Dict, Awaitable, Callable, Any
 
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
 from CriadexSDK.ragflow_schemas import GroupSearchResponse
@@ -195,7 +195,7 @@ class Bot:
             response_obj = getattr(verified, 'response', verified)
         return {"group_name": group_name, "response": response_obj}
 
-    async def retrieve_group_info(self):
+    async def retrieve_group_info(self) -> Dict[str, Any]:
         """
         Retrieve the LLM model ID from the database
 

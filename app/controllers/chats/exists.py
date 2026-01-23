@@ -35,7 +35,7 @@ class ExistsChatRoute(CriaRoute):
         return self.ResponseModel(
             code=SUCCESS_CODE,
             status=200,
-            messsage=f"Checked if the chat '{chat_id}' is active!",
+            message=f"Checked if the chat '{chat_id}' is active!",
             exists=await request.app.criabot.redis_api.chats.exists(chat_id=chat_id)
         )
 
