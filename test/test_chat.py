@@ -116,6 +116,15 @@ async def test_send_with_criadex_error(chat):
         await chat.send(prompt="hello", metadata_filter=None, extra_bots=[])
 
 @pytest.mark.asyncio
+async def test_send_with_parent_bots_in_extra_bots(chat, bot_mock):
+    parent_bots = ["parent1", "parent2"]
+    await chat.send(prompt="hello", metadata_filter=None, extra_bots=parent_bots)
+    
+    call_args = chat._retriever.retrieve.call_args
+    assert call_args[1]['extra_bots'] == parent_bots
+    chat._retriever.retrieve.assert_called_once()
+
+@pytest.mark.asyncio
 async def test_history_management(bot_mock, chat_model, bot_parameters):
     bot_parameters.max_input_tokens = 30
     chat = Chat(

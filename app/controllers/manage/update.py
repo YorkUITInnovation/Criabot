@@ -77,9 +77,12 @@ class ManageUpdateRoute(CriaRoute):
                 )
         
         # Update bot parameters if provided
+        # Extract only the base parameters, excluding parent-related fields
+        from criabot.database.bots.tables.bot_params import BotParametersBaseConfig
+        base_params = BotParametersBaseConfig(**config.model_dump(exclude={"parent_bot_names", "parent_priorities"}))
         await request.app.criabot.update_parameters(
             name=bot_name,
-            params=config
+            params=base_params
         )
         
         # Update parent relationships if provided

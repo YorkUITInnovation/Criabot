@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 
 from pydantic import BaseModel
 from sqlalchemy import Integer, Numeric, Boolean, Text, ForeignKey, insert, delete, select, update, \
@@ -55,7 +55,7 @@ class BotParametersBaseConfig(BaseModel):
     no_context_message: str = "Sorry, I'm not sure about that."  # No context reply message
     no_context_use_message: bool = False
     no_context_llm_guess: bool = False
-    system_message: Optional[str] = None  # System message to embed
+    system_message: Optional[str] = ""  # System message to embed (default empty string)
 
 
 class BotParametersConfig(BotParametersBaseConfig):

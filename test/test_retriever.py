@@ -121,6 +121,20 @@ async def test_search_groups(retriever, bot_mock):
     )
 
 @pytest.mark.asyncio
+async def test_search_groups_with_parent_bots(retriever, bot_mock):
+    parent_bots = ["parent1", "parent2"]
+    await retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=parent_bots)
+    assert bot_mock.search_group.call_count == len(retriever.INDEX_TYPES)
+    bot_mock.search_group.assert_any_call(
+        index_type="DOCUMENT",
+        search_config=retriever.build_search_group_config(
+            prompt="hello",
+            metadata_filter=None,
+            extra_groups=["parent1-document-index", "parent2-document-index"]
+        )
+    )
+
+@pytest.mark.asyncio
 async def test_hybrid_rerank(retriever, criadex_api):
     nodes = [create_text_node("text 1")]
     await retriever.hybrid_rerank(prompt="hello", nodes=nodes)

@@ -25,6 +25,10 @@ class ParentNotFoundError(RuntimeError):
     """Thrown when a specified parent bot doesn't exist"""
 
 
+class InvalidModelsError(RuntimeError):
+    """Thrown when specified model IDs are invalid and don't exist"""
+
+
 class BotCreateConfig(BotParametersBaseConfig):
     llm_model_id: int
     embedding_model_id: int
@@ -45,6 +49,8 @@ class AboutBot(BaseModel):
     parent_bot_names: List[str] = Field(default_factory=list)
     children: List[str] = Field(default_factory=list)
     effective_config: BotParametersModel
+    # Optionally include the active bot API key for admin/master requests only
+    bot_api_key: Optional[str] = None
 
 
 class CriadexCredentials(BaseModel):

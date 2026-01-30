@@ -23,6 +23,7 @@ from criabot.schemas import (
     AboutBot,
     ParentNotFoundError,
     CircularDependencyError,
+    InvalidModelsError,
 )
 from criabot.bot.inheritance import check_circular_dependency, merge_configurations
 from .bot.schemas import ChatNotFoundError
@@ -31,6 +32,8 @@ from .database.bots.tables.bot_params import BotParametersModel, BotParametersCo
 from .database.bots.tables.bots import BotsModel, BotsConfig
 from .schemas import InitializedAlreadyError
 
+import logging
+logger = logging.getLogger(__name__)
 
 class Criabot:
     """
@@ -171,20 +174,19 @@ class Criabot:
                 bot_api_key=api_key,
                 bot_config=config,
             )
-            created_groups.extend(
-                [
-                    document_group["group_name"]
-                    if isinstance(document_group, dict)
-                    else document_group.group_name
-                ]
-            )
-            created_groups.extend(
-                [
-                    question_group["group_name"]
-                    if isinstance(question_group, dict)
-                    else question_group.group_name
-                ]
-            )
+            # Extract group names from responses (API returns 'name', but we use 'group_name' internally)
+            def extract_group_name(group_response, expected_name):
+                if isinstance(group_response, dict):
+                    return group_response.get("group_name") or group_response.get("name") or expected_name
+                else:
+                    return getattr(group_response, "group_name", None) or getattr(group_response, "name", None) or expected_name
+            
+            from .bot.bot import Bot
+            doc_group_name = Bot.bot_group_name(name, "DOCUMENT")
+            question_group_name = Bot.bot_group_name(name, "QUESTION")
+            
+            created_groups.append(extract_group_name(document_group, doc_group_name))
+            created_groups.append(extract_group_name(question_group, question_group_name))
 
             # Step 3: persist bot and parameters in MySQL
             bot_id = await self._mysql_api.bots.insert(
@@ -199,6 +201,15 @@ class Criabot:
                     **config.model_dump(),
                 )
             )
+
+            # Persist the created API key for this bot so parent/child flows can find it
+            from criabot.database.bots.tables.bot_api_keys import BotApiKeyConfig
+            import inspect
+            insert_candidate = self._mysql_api.bot_api_keys.insert(
+                BotApiKeyConfig(bot_id=bot_id, api_key=api_key)
+            )
+            if inspect.isawaitable(insert_candidate):
+                await insert_candidate
 
             # Step 4: if parents specified, validate and create parent-child relationships
             if config.parent_bot_names:
@@ -252,7 +263,18 @@ class Criabot:
                 bot_id=bot_id,
             )
             raise BotExistsError()
-        except Exception:
+        except Exception as e:
+            # Check if this is a Criadex API error with model validation failure
+            error_str = str(e)
+            if "INVALID_MODEL" in error_str or "does not exist" in error_str:
+                await self._rollback_failed_bot_creation(
+                    name=name,
+                    created_groups=created_groups,
+                    new_auth=new_auth,
+                    bot_id=bot_id,
+                )
+                raise InvalidModelsError(error_str)
+            
             # Best-effort rollback of created external resources and DB rows
             await self._rollback_failed_bot_creation(
                 name=name,
@@ -284,8 +306,33 @@ class Criabot:
         # 2) delete API key in Criadex
         if new_auth is not None:
             try:
-                await self._criadex.auth.delete(api_key=new_auth["api_key"])
+                api_preview = None
+                if isinstance(new_auth, dict) and 'api_key' in new_auth:
+                    api_preview = new_auth['api_key'][:20] + '...'
+                logger.debug("Rollback: attempting to delete API key %s", api_preview)
             except Exception:
+                # best-effort; ignore if new_auth malformed
+                pass
+
+            try:
+                import inspect
+                delete_candidate = self._criadex.auth.delete(api_key=new_auth["api_key"])
+                if inspect.isawaitable(delete_candidate):
+                    result = await delete_candidate
+                else:
+                    result = delete_candidate
+                try:
+                    # Mask any api_key in the result when logging
+                    log_result = result.copy() if isinstance(result, dict) else result
+                    if isinstance(log_result, dict) and 'api_key' in log_result:
+                        log_result['api_key'] = str(log_result['api_key'])[:6] + '...'
+                    logger.debug("Rollback: auth.delete result: %s", log_result)
+                except Exception:
+                    pass
+            except Exception as e:
+                # Log the exception so we can see what failed during rollback
+                logger.debug("Rollback: auth.delete raised: %s", e, exc_info=True)
+                # continue - rollback should be best-effort and not crash the handler
                 pass
 
         # 3) delete partially created DB rows
@@ -478,13 +525,34 @@ class Criabot:
         else:
             effective_config = params_model
 
-        # Build an about-me including hierarchy info and effective config
+        # Look up the bot's active API key (if any) and include it in the about response
+        import inspect
+        bot_key_candidate = self._mysql_api.bot_api_keys.get_active_by_bot(bot_id=bots_model.id)
+        if inspect.isawaitable(bot_key_candidate):
+            bot_key_model = await bot_key_candidate
+        else:
+            bot_key_model = bot_key_candidate
+        # Ensure the returned API key is a string (tests may return MagicMock objects)
+        bot_api_key = None
+        if bot_key_model is not None:
+            candidate_key = getattr(bot_key_model, "api_key", None)
+            if isinstance(candidate_key, str):
+                bot_api_key = candidate_key
+            else:
+                # Best-effort coerce to string, otherwise treat as not present
+                try:
+                    bot_api_key = str(candidate_key)
+                except Exception:
+                    bot_api_key = None
+
+        # Build an about-me including hierarchy info, effective config, and optionally the API key
         return AboutBot(
             info=bots_model,
             params=params_model,
             parent_bot_names=parent_names,
             children=child_names,
             effective_config=effective_config,
+            bot_api_key=bot_api_key,
         )
 
     async def get(self, name: str) -> "Bot":
@@ -590,7 +658,12 @@ class Criabot:
         to_add = new_set - current_set
         
         # Get child's API key
-        child_key = await self._mysql_api.bot_api_keys.get_active_by_bot(bot_id=bot_id)
+        import inspect
+        child_key_candidate = self._mysql_api.bot_api_keys.get_active_by_bot(bot_id=bot_id)
+        if inspect.isawaitable(child_key_candidate):
+            child_key = await child_key_candidate
+        else:
+            child_key = child_key_candidate
         if child_key is None:
             raise RuntimeError(f"Child bot '{child_name}' has no active API key")
         child_api_key = child_key.api_key
@@ -621,9 +694,14 @@ class Criabot:
                     pass
             
             # Revoke parent's access to child groups
-            parent_key = await self._mysql_api.bot_api_keys.get_active_by_bot(
+            import inspect
+            parent_key_candidate = self._mysql_api.bot_api_keys.get_active_by_bot(
                 bot_id=parent_id
             )
+            if inspect.isawaitable(parent_key_candidate):
+                parent_key = await parent_key_candidate
+            else:
+                parent_key = parent_key_candidate
             if parent_key is not None:
                 for index_type in ("DOCUMENT", "QUESTION"):
                     group_name = Bot.bot_group_name(child_name, index_type)
@@ -681,13 +759,25 @@ class Criabot:
         :return: The new Criadex API key
 
         """
-
+        api_key = secrets.token_urlsafe(32)
+        try:
+            logger.debug("Creating bot auth (masked): %s", api_key[:6] + '...')
+        except Exception:
+            pass
         result = await self._criadex.auth.create(
-            api_key=(secrets.token_urlsafe(32)),
+            api_key=api_key,
             create_config=AuthCreateConfig(
                 master=False
             )
         )
+        try:
+            # Mask any api_key in the result when logging
+            log_result = result.copy() if isinstance(result, dict) else result
+            if isinstance(log_result, dict) and 'api_key' in log_result:
+                log_result['api_key'] = str(log_result['api_key'])[:6] + '...'
+            logger.debug("Bot auth creation result: %s", log_result)
+        except Exception:
+            pass
         # Optionally: check response for success or error
         return result
 
@@ -794,9 +884,15 @@ class Criabot:
         from criabot.bot.bot import Bot
 
         for parent_name, parent_id in parent_ids_by_name.items():
-            parent_key = await self._mysql_api.bot_api_keys.get_active_by_bot(
+            import inspect
+            parent_key_candidate = self._mysql_api.bot_api_keys.get_active_by_bot(
                 bot_id=parent_id
             )
+            if inspect.isawaitable(parent_key_candidate):
+                parent_key = await parent_key_candidate
+            else:
+                parent_key = parent_key_candidate
+
             if parent_key is None:
                 continue
 
@@ -836,10 +932,19 @@ class Criabot:
                     "rerank_model_id": bot_config.rerank_model_id
                 }
             )
-            await self._create_new_bot_auth_group(
-                group_name=group_name,
-                bot_api_key=bot_api_key
-            )
+            try:
+                await self._create_new_bot_auth_group(
+                    group_name=group_name,
+                    bot_api_key=bot_api_key
+                )
+            except Exception as e:
+                import sys
+                print(f"[ERROR] Failed to authorize bot API key on group {group_name}: {e}", file=sys.stderr)
+                raise
+            # Ensure the response has the group_name for consistency
+            if isinstance(new_group, dict):
+                if "group_name" not in new_group:
+                    new_group["group_name"] = new_group.get("name", group_name)
             return new_group
 
         return (
@@ -861,12 +966,39 @@ class Criabot:
         :return: RAGFlow API Response
 
         """
-        result = await self._criadex.manage.create(
-            group_name=group_name,
-            group_config=group_config
-        )
-        # Optionally: check response for success or error
-        return result
+        import httpx
+
+        try:
+            result = await self._criadex.manage.create(
+                group_name=group_name,
+                group_config=group_config
+            )
+            # Optionally: check response for success or error
+            return result
+        except Exception as e:
+            # Normalize HTTP status extraction for different exception types
+            status_code = None
+            if isinstance(e, httpx.HTTPStatusError):
+                try:
+                    status_code = e.response.status_code
+                except Exception:
+                    status_code = None
+            else:
+                status_code = getattr(e, 'status_code', None) or getattr(getattr(e, 'response', None), 'status_code', None)
+
+            # If the group already exists, treat it as success and fetch its info
+            if status_code == 409:
+                try:
+                    about = await self._criadex.manage.about(group_name=group_name)
+                    if isinstance(about, dict) and 'group_name' not in about:
+                        about['group_name'] = group_name
+                    return about
+                except Exception:
+                    # Fall back to a minimal response indicating existence
+                    return {"group_name": group_name}
+
+            # Re-raise for other errors
+            raise
 
     async def _create_new_bot_auth_group(
             self,
@@ -882,12 +1014,27 @@ class Criabot:
         :raises Exception: If request fails
 
         """
-        result = await self._criadex.group_auth.create(
-            group_name=group_name,
-            api_key=bot_api_key
-        )
-        # Optionally: check response for success or error
-        return result
+        try:
+            logger.debug("Creating group auth for group='%s' (masked api_key)" , group_name)
+        except Exception:
+            pass
+        try:
+            result = await self._criadex.group_auth.create(
+                group_name=group_name,
+                api_key=bot_api_key
+            )
+            try:
+                log_result = result.copy() if isinstance(result, dict) else result
+                if isinstance(log_result, dict) and 'api_key' in log_result:
+                    log_result['api_key'] = str(log_result['api_key'])[:6] + '...'
+                logger.debug("Group auth creation succeeded: %s", log_result)
+            except Exception:
+                pass
+            # Optionally: check response for success or error
+            return result
+        except Exception as e:
+            logger.debug("Group auth creation FAILED: %s", e, exc_info=True)
+            raise
 
     @property
     def mysql_api(self) -> BotDatabaseAPI:

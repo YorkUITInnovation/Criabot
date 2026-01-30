@@ -10,7 +10,7 @@ from typing import Optional, Type, List, TypeVar, Callable, Awaitable
 import httpx
 from CriadexSDK.ragflow_schemas import Filter
 from fastapi import Form
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from starlette import status
 from starlette.exceptions import HTTPException
 
@@ -69,12 +69,13 @@ class APIResponse(BaseModel):
     Global API Response format that ALL responses must follow
 
     """
+    model_config = ConfigDict()
 
     status: int = 200
     message: Optional[str] = None
     timestamp: int = round(time.time())
     code: str = "SUCCESS"
-    error: Optional[str] = Field(default=None, exclude=True)
+    error: Optional[str] = Field(default=None)
 
     def dict(self, *args, **kwargs):
 
@@ -86,10 +87,10 @@ class APIResponse(BaseModel):
             404: 'Womp womp. Not found!'
         }.get(self.status)
 
-        data: dict = super().model_dump(*args, **kwargs)
+        data: dict = super().model_dump(*args, exclude={'error'}, **kwargs)
 
-        if data["error"] is None:
-            del data["error"]
+        if data.get("error") is None:
+            data.pop("error", None)
 
         return data
 

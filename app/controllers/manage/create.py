@@ -7,7 +7,7 @@ from starlette.requests import Request
 
 from app.controllers.schemas import DUPLICATE_CODE, SUCCESS_CODE, exception_response, catch_exceptions, APIResponse, bot_management_limiter
 from app.core.route import CriaRoute
-from criabot.schemas import BotCreateConfig, BotExistsError, ParentNotFoundError, CircularDependencyError
+from criabot.schemas import BotCreateConfig, BotExistsError, ParentNotFoundError, CircularDependencyError, InvalidModelsError
 
 view = APIRouter()
 
@@ -52,6 +52,14 @@ class ManageCreateRoute(CriaRoute):
             code="INVALID_PARENT_RELATIONSHIP",
             status=400,
             message="The specified parents would create a circular dependency."
+        )
+    )
+    @exception_response(
+        InvalidModelsError,
+        ResponseModel(
+            code="INVALID_MODEL",
+            status=400,
+            message="One or more specified model IDs are invalid."
         )
     )
     async def execute(

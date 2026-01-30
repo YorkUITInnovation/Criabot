@@ -55,6 +55,17 @@ class ManageAboutRoute(CriaRoute):
             name=bot_name
         )
 
+        # Only expose the bot API key if the caller is authenticated as the master/admin
+        caller_key = request.headers.get("x-api-key")
+        try:
+            master_key = request.app.criabot._criadex_credentials.master_api_key
+        except Exception:
+            master_key = None
+
+        if caller_key != master_key:
+            # Ensure we don't leak the key to non-admin callers
+            about_model.bot_api_key = None
+
         # Success!
         return self.ResponseModel(
             code=SUCCESS_CODE,
