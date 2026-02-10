@@ -57,25 +57,40 @@ services:
       image: docker.io/elasticsearch:8.13.4
       environment:
         discovery.type: single-node
+        # Heap size for Elasticsearch.
+        # - Current dev/test setting:
         ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+        # - For production or heavier loads, replace the line above with one of:
+        # ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+        # ES_JAVA_OPTS: "-Xms2g -Xmx2g"
         ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
       ports:
         - "127.0.0.1:9200:9200"
         - "127.0.0.1:9300:9300"
       volumes:
         - ./elasticsearch_data:/usr/share/elasticsearch/data:cached
+      # For production deployments, you may also want to enable these limits
+      # to avoid OS-level constraints under higher load:
+      # ulimits:
+      #   memlock:
+      #     soft: -1
+      #     hard: -1
+      #   nofile:
+      #     soft: 65536
+      #     hard: 65536
+      
     # Cria-Back Criadex
     criadex:
       image: uitadmin/criadex:latest
       ports:
         - "127.0.0.1:25574:25574"
       environment:
-        ENV_PATH: "./env/docker.env"
+        ENV_PATH: "./.env"
         APP_INITIAL_MASTER_KEY: ${APP_INITIAL_MASTER_KEY}
         RAGFLOW_API_KEY: ${RAGFLOW_API_KEY}
         RAGFLOW_SECRET_KEY: ${RAGFLOW_SECRET_KEY}
       volumes:
-        - ./criadex_data:/home/cria/env
+        - ./criadex_data/docker.env:/home/cria/.env
       depends_on:
         mysql:
           condition: service_healthy
@@ -95,9 +110,9 @@ services:
       ports:
         - "127.0.0.1:25575:25575"
       environment:
-        ENV_PATH: "./env/docker.env"
+        ENV_PATH: "./.env"
       volumes:
-        - ./criabot_data:/home/cria/env
+        - ./criabot_data/docker.env:/home/cria/.env
       depends_on:
         mysql:
           condition: service_healthy
@@ -166,9 +181,9 @@ services:
       ports:
         - "127.0.0.1:25576:25576"
       environment:
-        ENV_PATH: "./env/docker.env"
+        ENV_PATH: "./.env"
       volumes:
-        - ./criaparse_data:/home/cria/env
+        - ./criaparse_data/docker.env:/home/cria/.env
       depends_on:
         criadex:
           condition: service_healthy
@@ -178,9 +193,9 @@ services:
       ports:
         - "127.0.0.1:3003:3003"
       environment:
-        ENV_PATH: "./env/docker.env"
+        ENV_PATH: "./.env"
       volumes:
-        - ./criaembed-api_data:/home/cria/env
+        - ./criaembed-api_data/docker.env:/home/cria/.env
       depends_on:
         criabot:
           condition: service_healthy
