@@ -834,10 +834,26 @@ class Criabot:
         for parent_name in parent_names:
             for index_type in ("DOCUMENT", "QUESTION"):
                 group_name = Bot.bot_group_name(parent_name, index_type)
-                await self._criadex.group_auth.create(
-                    group_name=group_name,
-                    api_key=child_api_key,
-                )
+                try:
+                    await self._criadex.group_auth.create(
+                        group_name=group_name,
+                        api_key=child_api_key,
+                    )
+                except Exception as e:
+                    status_code = getattr(e, "status_code", None)
+                    response = getattr(e, "response", None)
+                    if status_code is None and response is not None:
+                        status_code = getattr(response, "status_code", None)
+
+                    message = str(e)
+                    if status_code == 404 or "GROUP_NOT_FOUND" in message or "Group not found" in message:
+                        logger.warning(
+                            "Skipping authorization of child API key on missing parent group '%s': %s",
+                            group_name,
+                            message,
+                        )
+                        continue
+                    raise
 
     async def get_parent_bot_names(self, name: str) -> List[str]:
         """
