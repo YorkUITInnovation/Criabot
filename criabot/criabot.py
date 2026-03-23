@@ -202,6 +202,17 @@ class Criabot:
                 )
             )
 
+            # Persist model IDs so chat creation doesn't depend on Criadex
+            # group metadata being available at request time.
+            from criabot.database.bots.tables.bot_models import BotModelConfig
+            await self._mysql_api.bot_models.insert(
+                config=BotModelConfig(
+                    bot_id=bot_id,
+                    llm_model_id=config.llm_model_id,
+                    rerank_model_id=config.rerank_model_id,
+                )
+            )
+
             # Persist the created API key for this bot so parent/child flows can find it
             from criabot.database.bots.tables.bot_api_keys import BotApiKeyConfig
             import inspect
@@ -591,18 +602,28 @@ class Criabot:
         chat_model: ChatModel = await self._redis_api.chats.get(chat_id=chat_id)
         bot_parameters: AboutBot = await self.about(name=bot_name)
         bot = await self.get(name=bot_name)
-        group_info = await bot.retrieve_group_info()
 
         # If the chat DNE
         if chat_model is None:
             raise ChatNotFoundError(chat_id=chat_id)
 
+        bot_id = bot_parameters.info.id
+        model_config = await self._mysql_api.bot_models.retrieve_by_bot_id(bot_id=bot_id)
+        if model_config is not None:
+            llm_model_id = model_config.llm_model_id
+            rerank_model_id = model_config.rerank_model_id
+        else:
+            # Backward compatibility: fall back to Criadex group metadata.
+            group_info = await bot.retrieve_group_info()
+            llm_model_id = group_info["info"]["llm_model_id"]
+            rerank_model_id = group_info["info"]["rerank_model_id"]
+
         # Create light-weight chat
         from criabot.bot.chat.chat import Chat
         return Chat(
             bot=bot,
-            llm_model_id=group_info['info']['llm_model_id'],
-            rerank_model_id=group_info['info']['rerank_model_id'],
+            llm_model_id=llm_model_id,
+            rerank_model_id=rerank_model_id,
             chat_model=chat_model,
             chat_id=chat_id,
             bot_parameters=bot_parameters.params

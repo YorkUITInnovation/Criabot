@@ -4,6 +4,7 @@ from criabot.database.bots.tables.bot_params import BotParametersAPI
 from criabot.database.bots.tables.bot_parents import BotParentsAPI
 from criabot.database.bots.tables.bot_api_keys import BotApiKeysAPI
 from criabot.database.bots.tables.bots import BotsAPI
+from criabot.database.bots.tables.bot_models import BotModelsAPI
 from criabot.database.table import BaseDatabaseAPI
 
 
@@ -26,6 +27,7 @@ class BotDatabaseAPI(BaseDatabaseAPI):
         self.bot_params: BotParametersAPI = BotParametersAPI(engine)
         self.bot_parents: BotParentsAPI = BotParentsAPI(engine)
         self.bot_api_keys: BotApiKeysAPI = BotApiKeysAPI(engine)
+        self.bot_models: BotModelsAPI = BotModelsAPI(engine)
 
     async def initialize(self) -> None:
         """
@@ -39,3 +41,4 @@ class BotDatabaseAPI(BaseDatabaseAPI):
         await self.bot_params.initialize()
         await self.bot_parents.initialize()
         await self.bot_api_keys.initialize()
+        await self.bot_models.initialize()

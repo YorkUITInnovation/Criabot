@@ -31,6 +31,7 @@ def criabot_instance(criadex_credentials, mysql_credentials, redis_credentials):
         criabot = Criabot(criadex_credentials, mysql_credentials, redis_credentials)
         criabot._criadex = MockRAGFlowSDK()
         criabot._mysql_api = MockBotDatabaseAPI()
+        criabot._mysql_api.bot_models.insert = AsyncMock(return_value=None)
         criabot._redis_api = MockBotCacheAPI()
         yield criabot
 

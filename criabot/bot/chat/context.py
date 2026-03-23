@@ -72,20 +72,28 @@ class ContextRetriever:
             metadata_filter,
             extra_bots
     ):
-        index_queries = []
-
-        for index_type in self.INDEX_TYPES:
+        async def safe_search(index_type: str):
             search_config = self.build_search_group_config(
                 prompt=prompt,
                 metadata_filter=metadata_filter,
                 extra_groups=[Bot.bot_group_name(extra_bot, index_type) for extra_bot in extra_bots]
             )
-            index_queries.append(
-                self._bot.search_group(index_type=index_type, search_config=search_config)
-            )
+            try:
+                return await self._bot.search_group(index_type=index_type, search_config=search_config)
+            except Exception as e:
+                # Missing index groups should not crash chat. Treat as "no context".
+                message = str(e)
+                if "GROUP_NOT_FOUND" in message or "Group not found" in message:
+                    return None
+                raise
 
-        results = await asyncio.gather(*index_queries)
-        return {r["group_name"] if isinstance(r, dict) else r.group_name: r["response"] if isinstance(r, dict) else r.response for r in results}
+        tasks = [safe_search(index_type) for index_type in self.INDEX_TYPES]
+        results = await asyncio.gather(*tasks)
+        results = [r for r in results if r is not None]
+        return {
+            (r["group_name"] if isinstance(r, dict) else r.group_name): (r["response"] if isinstance(r, dict) else r.response)
+            for r in results
+        }
 
     async def hybrid_rerank(
             self,
