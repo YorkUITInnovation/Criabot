@@ -935,9 +935,9 @@ class Criabot:
 
             for index_type in ("DOCUMENT", "QUESTION"):
                 group_name = Bot.bot_group_name(child_name, index_type)
-                await self._criadex.group_auth.create(
+                await self._create_new_bot_auth_group(
                     group_name=group_name,
-                    api_key=parent_key.api_key,
+                    bot_api_key=parent_key.api_key,
                 )
 
     async def _create_new_bot_groups(
@@ -1055,23 +1055,42 @@ class Criabot:
             logger.debug("Creating group auth for group='%s' (masked api_key)" , group_name)
         except Exception:
             pass
-        try:
-            result = await self._criadex.group_auth.create(
-                group_name=group_name,
-                api_key=bot_api_key
-            )
+        max_attempts = 5
+        last_error: Exception | None = None
+
+        for attempt in range(max_attempts):
             try:
-                log_result = result.copy() if isinstance(result, dict) else result
-                if isinstance(log_result, dict) and 'api_key' in log_result:
-                    log_result['api_key'] = str(log_result['api_key'])[:6] + '...'
-                logger.debug("Group auth creation succeeded: %s", log_result)
-            except Exception:
-                pass
-            # Optionally: check response for success or error
-            return result
-        except Exception as e:
-            logger.debug("Group auth creation FAILED: %s", e, exc_info=True)
-            raise
+                result = await self._criadex.group_auth.create(
+                    group_name=group_name,
+                    api_key=bot_api_key
+                )
+                try:
+                    log_result = result.copy() if isinstance(result, dict) else result
+                    if isinstance(log_result, dict) and 'api_key' in log_result:
+                        log_result['api_key'] = str(log_result['api_key'])[:6] + '...'
+                    logger.debug("Group auth creation succeeded: %s", log_result)
+                except Exception:
+                    pass
+                return result
+            except Exception as e:
+                last_error = e
+                message = str(e).lower()
+                is_group_not_found = "group not found" in message or "group_not_found" in message
+
+                if not is_group_not_found or attempt == max_attempts - 1:
+                    logger.debug("Group auth creation FAILED: %s", e, exc_info=True)
+                    raise
+
+                logger.warning(
+                    "Group '%s' not ready for auth creation yet; retrying (%d/%d).",
+                    group_name,
+                    attempt + 1,
+                    max_attempts,
+                )
+                await asyncio.sleep(1 + attempt)
+
+        if last_error is not None:
+            raise last_error
 
     @property
     def mysql_api(self) -> BotDatabaseAPI:

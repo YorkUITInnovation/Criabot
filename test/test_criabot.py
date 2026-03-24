@@ -165,6 +165,25 @@ async def test_create_bot_that_exists(criabot_instance):
     with pytest.raises(BotExistsError):
         await criabot_instance.create(name="existing_bot", config=MagicMock())
 
+
+@pytest.mark.asyncio
+async def test_create_new_bot_auth_group_retries_when_group_not_ready(criabot_instance):
+    criabot_instance._criadex.group_auth.create = AsyncMock(
+        side_effect=[
+            Exception('[404] {"code":"GROUP_NOT_FOUND","message":"Group not found"}'),
+            {"status": 200},
+        ]
+    )
+
+    result = await criabot_instance._create_new_bot_auth_group(
+        group_name="child_bot-document-index",
+        bot_api_key="child_key",
+    )
+
+    assert result == {"status": 200}
+    assert criabot_instance._criadex.group_auth.create.await_count == 2
+
+
 @pytest.mark.asyncio
 async def test_table_creation_on_initialize(criabot_instance):
     with patch('criabot.criabot.create_async_engine') as mock_create_async_engine, \
