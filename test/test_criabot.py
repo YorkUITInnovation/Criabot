@@ -185,6 +185,32 @@ async def test_create_new_bot_auth_group_retries_when_group_not_ready(criabot_in
 
 
 @pytest.mark.asyncio
+async def test_create_bot_rollback_does_not_delete_preexisting_groups(criabot_instance):
+    criabot_instance._mysql_api.bots.exists = AsyncMock(return_value=False)
+    criabot_instance._criadex.auth.create = AsyncMock(return_value={"api_key": "new_key"})
+    criabot_instance._criadex.auth.delete = AsyncMock()
+    criabot_instance._criadex.manage.delete = AsyncMock()
+    criabot_instance._create_new_bot_groups = AsyncMock(
+        return_value=(
+            {"group_name": "existing_bot-question-index", "created": False},
+            {"group_name": "existing_bot-document-index", "created": False},
+        )
+    )
+    criabot_instance._mysql_api.bots.insert = AsyncMock(return_value=1)
+    criabot_instance._mysql_api.bot_params.insert = AsyncMock(side_effect=Exception("boom"))
+    criabot_instance._mysql_api.bot_params.delete = AsyncMock()
+    criabot_instance._mysql_api.bots.delete = AsyncMock()
+
+    config = BotCreateConfig(llm_model_id=1, embedding_model_id=1, rerank_model_id=1)
+
+    with pytest.raises(Exception, match="boom"):
+        await criabot_instance.create(name="existing_bot", config=config)
+
+    criabot_instance._criadex.manage.delete.assert_not_called()
+    criabot_instance._criadex.auth.delete.assert_awaited_once_with(api_key="new_key")
+
+
+@pytest.mark.asyncio
 async def test_table_creation_on_initialize(criabot_instance):
     with patch('criabot.criabot.create_async_engine') as mock_create_async_engine, \
          patch('criabot.criabot.BotDatabaseAPI') as MockBotDatabaseAPI:

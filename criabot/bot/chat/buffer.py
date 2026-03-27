@@ -108,6 +108,19 @@ class ChatBuffer:
         history: History = self._history.copy()
         system_message: Optional[ChatMessage] = self.pop_system(history=history)
 
+        if system_message is not None and system_ephemeral is not None:
+            combined_text = "\n\n".join([
+                system_message.blocks[0].text,
+                system_ephemeral.blocks[0].text,
+            ]).strip()
+            system_message = ChatMessage(
+                role="system",
+                blocks=[TextBlock(text=combined_text)],
+                additional_kwargs=system_message.additional_kwargs,
+                metadata={**system_message.metadata, **system_ephemeral.metadata},
+            )
+            system_ephemeral = None
+
         # Calculate the tokens for the whole history
         self.create_history_token_metadata(history=history)
 

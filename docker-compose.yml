@@ -69,6 +69,16 @@ services:
         - "127.0.0.1:9300:9300"
       volumes:
         - ./elasticsearch_data:/usr/share/elasticsearch/data:cached
+      healthcheck:
+        test:
+          [
+            "CMD-SHELL",
+            "curl -fsS -u elastic:$$ELASTIC_PASSWORD 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s' >/dev/null || exit 1",
+          ]
+        start_period: 10s
+        interval: 5s
+        timeout: 5s
+        retries: 20
       # For production deployments, you may also want to enable these limits
       # to avoid OS-level constraints under higher load:
       # ulimits:
@@ -95,7 +105,7 @@ services:
         mysql:
           condition: service_healthy
         elasticsearch:
-          condition: service_started
+          condition: service_healthy
         ragflow:
           condition: service_healthy
       healthcheck:

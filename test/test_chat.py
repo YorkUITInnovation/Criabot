@@ -84,10 +84,11 @@ async def test_send_no_context_with_llm_guess(chat, bot_mock, bot_parameters):
     
     await chat.send(prompt="hello", metadata_filter=None, extra_bots=[])
     bot_mock.criadex.agents.azure.chat.assert_called_once()
-    # Assert that the prompt sent to the LLM contains the "guess" instructions
+    # The chat buffer now merges grounding instructions into the main system message.
     call_args = bot_mock.criadex.agents.azure.chat.call_args
     history = call_args[1]['agent_config']['history']
-    assert "guess" in history[1]["blocks"][0]["text"] # ephemeral system message
+    assert "guess" in history[0]["blocks"][0]["text"]
+    assert history[1]["blocks"][0]["text"] == "hello"
 
 @pytest.mark.asyncio
 async def test_send_no_context_with_saved_message(chat, bot_mock, bot_parameters):
@@ -104,10 +105,11 @@ async def test_send_no_context_with_llm_message(chat, bot_mock):
     
     await chat.send(prompt="hello", metadata_filter=None, extra_bots=[])
     bot_mock.criadex.agents.azure.chat.assert_called_once()
-    # Assert that the prompt sent to the LLM contains the "do not know" instructions
+    # The chat buffer now merges grounding instructions into the main system message.
     call_args = bot_mock.criadex.agents.azure.chat.call_args
     history = call_args[1]['agent_config']['history']
-    assert "do not know" in history[1]["blocks"][0]["text"] # ephemeral system message
+    assert "do not know" in history[0]["blocks"][0]["text"]
+    assert history[1]["blocks"][0]["text"] == "hello"
 
 @pytest.mark.asyncio
 async def test_send_with_criadex_error(chat):

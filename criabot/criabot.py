@@ -169,24 +169,29 @@ class Criabot:
             # Step 2: create the bot's own groups and authorize its key on them
             from .bot.bot import Bot
 
-            document_group, question_group = await self._create_new_bot_groups(
+            question_group, document_group = await self._create_new_bot_groups(
                 bot_name=name,
                 bot_api_key=api_key,
                 bot_config=config,
             )
-            # Extract group names from responses (API returns 'name', but we use 'group_name' internally)
             def extract_group_name(group_response, expected_name):
                 if isinstance(group_response, dict):
                     return group_response.get("group_name") or group_response.get("name") or expected_name
-                else:
-                    return getattr(group_response, "group_name", None) or getattr(group_response, "name", None) or expected_name
-            
+                return getattr(group_response, "group_name", None) or getattr(group_response, "name", None) or expected_name
+
+            def was_group_created(group_response) -> bool:
+                if isinstance(group_response, dict):
+                    return bool(group_response.get("created", False))
+                return bool(getattr(group_response, "created", False))
+
             from .bot.bot import Bot
             doc_group_name = Bot.bot_group_name(name, "DOCUMENT")
             question_group_name = Bot.bot_group_name(name, "QUESTION")
-            
-            created_groups.append(extract_group_name(document_group, doc_group_name))
-            created_groups.append(extract_group_name(question_group, question_group_name))
+
+            if was_group_created(document_group):
+                created_groups.append(extract_group_name(document_group, doc_group_name))
+            if was_group_created(question_group):
+                created_groups.append(extract_group_name(question_group, question_group_name))
 
             # Step 3: persist bot and parameters in MySQL
             bot_id = await self._mysql_api.bots.insert(
@@ -1010,7 +1015,10 @@ class Criabot:
                 group_name=group_name,
                 group_config=group_config
             )
-            # Optionally: check response for success or error
+            if isinstance(result, dict) and "group_name" not in result:
+                result["group_name"] = result.get("name", group_name)
+            if isinstance(result, dict):
+                result["created"] = True
             return result
         except Exception as e:
             # Normalize HTTP status extraction for different exception types
@@ -1029,10 +1037,12 @@ class Criabot:
                     about = await self._criadex.manage.about(group_name=group_name)
                     if isinstance(about, dict) and 'group_name' not in about:
                         about['group_name'] = group_name
+                    if isinstance(about, dict):
+                        about["created"] = False
                     return about
                 except Exception:
                     # Fall back to a minimal response indicating existence
-                    return {"group_name": group_name}
+                    return {"group_name": group_name, "created": False}
 
             # Re-raise for other errors
             raise

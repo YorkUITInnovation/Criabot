@@ -109,7 +109,15 @@ class Chat:
 
         # Generate the response history
         if isinstance(response.context, TextContext):
-            reply_history, reply_tokens, message_text = await self._text_context_reply(response.context)
+            if self._should_use_direct_text_reply(response.context):
+                reply_history, reply_tokens = self._direct_text_context_reply(response.context)
+            elif self._should_use_direct_text_summary_reply(response.context):
+                reply_history, reply_tokens = self._direct_text_summary_reply(response.context)
+            else:
+                reply_history, reply_tokens, message_text = await self._text_context_reply(
+                    context=response.context,
+                    prompt=prompt
+                )
         elif isinstance(response.context, QuestionContext):
             reply_history, reply_tokens = self._question_context_reply(response.context)
         elif response.context is None:
@@ -222,12 +230,19 @@ class Chat:
         # Reverse it, if llm_reply=False, direct question is True
         return not top_response.node.metadata.get("llm_reply")
 
-    async def _text_context_reply(self, context):
+    async def _text_context_reply(self, context, prompt: str):
         # Add the ephemeral context
         buffered_history = self._buffer.buffer(
             system_ephemeral=ChatMessage(
                 role="system",
-                blocks=[{"type": "text", "text": build_context_prompt(context, best_guess=self._bot_parameters.no_context_llm_guess)}],
+                blocks=[{
+                    "type": "text",
+                    "text": build_context_prompt(
+                        context,
+                        prompt=prompt,
+                        best_guess=self._bot_parameters.no_context_llm_guess
+                    )
+                }],
                 additional_kwargs={},
                 metadata=self.chat_reply_metadata
             )
@@ -380,3 +395,74 @@ class Chat:
             )
         )
         return self._buffer.history, None
+
+    def _should_use_direct_text_reply(self, context: TextContext) -> bool:
+        if len(context.nodes) != 1:
+            return False
+
+        node_text = (context.nodes[0].node.text or "").strip()
+        if not node_text:
+            return False
+
+        return len(node_text) <= 300
+
+    def _direct_text_context_reply(self, context: TextContext):
+        node = context.nodes[0]
+        self._buffer.add_message(
+            message=ChatMessage(
+                role="assistant",
+                blocks=[{"type": "text", "text": node.node.text}],
+                additional_kwargs={},
+                metadata={
+                    "direct_context_reply": {
+                        "file_name": node.node.metadata.get(ContextRetriever.FILE_NAME_METADATA_KEY),
+                        "group_name": node.node.metadata.get(ContextRetriever.GROUP_NAME_METADATA_KEY),
+                    },
+                    **self.chat_reply_metadata,
+                }
+            )
+        )
+        return self._buffer.history, None
+
+    def _should_use_direct_text_summary_reply(self, context: TextContext) -> bool:
+        fact_texts = self._extract_fact_texts(context)
+        if len(fact_texts) < 2 or len(fact_texts) > 5:
+            return False
+
+        total_length = sum(len(text) for text in fact_texts)
+        return total_length <= 1200
+
+    def _direct_text_summary_reply(self, context: TextContext):
+        fact_texts = self._extract_fact_texts(context)
+        summary_text = "Summary:\n" + "\n".join(f"- {text}" for text in fact_texts)
+
+        self._buffer.add_message(
+            message=ChatMessage(
+                role="assistant",
+                blocks=[{"type": "text", "text": summary_text}],
+                additional_kwargs={},
+                metadata={
+                    "direct_context_summary_reply": {
+                        "groups": [
+                            node.node.metadata.get(ContextRetriever.GROUP_NAME_METADATA_KEY)
+                            for node in context.nodes[:len(fact_texts)]
+                        ],
+                    },
+                    **self.chat_reply_metadata,
+                }
+            )
+        )
+        return self._buffer.history, None
+
+    def _extract_fact_texts(self, context: TextContext) -> List[str]:
+        fact_texts: list[str] = []
+        seen: set[str] = set()
+
+        for node in context.nodes:
+            text = (node.node.text or "").strip()
+            if not text or len(text) > 300 or text in seen:
+                continue
+            seen.add(text)
+            fact_texts.append(text)
+
+        return fact_texts
