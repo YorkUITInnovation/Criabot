@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import Security, APIRouter, Depends, Header
+from fastapi import Security, APIRouter, Depends, Header, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from starlette.responses import RedirectResponse, HTMLResponse, Response
 
@@ -38,13 +38,17 @@ async def swagger_ui_custom() -> HTMLResponse:
 
 
 @router.get("/docs", include_in_schema=False)
-async def docs_redirect() -> RedirectResponse:
+async def docs_redirect(request: Request) -> RedirectResponse:
     """
-    Redirect "/docs" to "/" endpoint.
+    Redirect "/docs" to "/" endpoint, preserving API key if provided.
 
     """
-
-    return RedirectResponse(url="/")
+    # Preserve API key in redirect if provided
+    api_key = request.query_params.get("x-api-key") or request.headers.get("x-api-key")
+    redirect_url = "/"
+    if api_key:
+        redirect_url = f"/?x-api-key={api_key}"
+    return RedirectResponse(url=redirect_url)
 
 
 class HealthCheckFilter(logging.Filter):

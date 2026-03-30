@@ -3,7 +3,7 @@ import asyncio
 import uuid
 import logging
 import json
-from typing import Dict, Awaitable, Callable
+from typing import Dict, Awaitable, Callable, Any
 
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
 from CriadexSDK.ragflow_schemas import GroupSearchResponse
@@ -76,7 +76,8 @@ class Bot:
         try:
             import httpx
             import os
-            criadex_url = os.getenv("CRIADEX_URL", "http://criadex:25574")
+            criadex_url = os.getenv("CRIADEX_API_BASE") or os.getenv("CRIADEX_URL", "http://criadex:25574")
+            criadex_url = criadex_url.rstrip("/")
             ragflow_tenant_id = os.getenv("RAGFLOW_TENANT_ID")
             
             if ragflow_tenant_id:
@@ -195,7 +196,7 @@ class Bot:
             response_obj = getattr(verified, 'response', verified)
         return {"group_name": group_name, "response": response_obj}
 
-    async def retrieve_group_info(self):
+    async def retrieve_group_info(self) -> Dict[str, Any]:
         """
         Retrieve the LLM model ID from the database
 
@@ -203,10 +204,19 @@ class Bot:
 
         """
 
-        response = await self._criadex.manage.about(
-            group_name=self.group_name("DOCUMENT")
-        )
-        return response
+        document_group_name = self.group_name("DOCUMENT")
+        question_group_name = self.group_name("QUESTION")
+
+        # Prefer DOCUMENT metadata, but fall back to QUESTION when DOCUMENT index
+        # is temporarily unavailable (e.g., cold start retries / ES instability).
+        try:
+            return await self._criadex.manage.about(group_name=document_group_name)
+        except Exception as e:
+            message = str(e)
+            if "GROUP_NOT_FOUND" not in message and "Group not found" not in message:
+                raise
+
+        return await self._criadex.manage.about(group_name=question_group_name)
 
     async def update_group_content(
         self,

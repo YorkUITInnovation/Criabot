@@ -42,11 +42,29 @@ class ManageAboutRoute(CriaRoute):
             request: Request,
             bot_name: str
     ) -> ResponseModel:
+        # Input validation
+        if not bot_name or not bot_name.strip():
+            return self.ResponseModel(
+                code="INVALID_INPUT",
+                status=400,
+                message="Bot name cannot be empty."
+            )
 
-        # Try to create the bot
+        # Retrieve bot information
         about_model: AboutBot = await request.app.criabot.about(
             name=bot_name
         )
+
+        # Only expose the bot API key if the caller is authenticated as the master/admin
+        caller_key = request.headers.get("x-api-key")
+        try:
+            master_key = request.app.criabot._criadex_credentials.master_api_key
+        except Exception:
+            master_key = None
+
+        if caller_key != master_key:
+            # Ensure we don't leak the key to non-admin callers
+            about_model.bot_api_key = None
 
         # Success!
         return self.ResponseModel(

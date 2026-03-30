@@ -52,7 +52,7 @@ class ChatHistoryRoute(CriaRoute):
         return self.ResponseModel(
             code=SUCCESS_CODE,
             status=200,
-            messsage="Successfully send the chat",
+            message="Successfully retrieved the chat history",
             history=chat_model.history
         )
 

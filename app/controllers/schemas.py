@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import traceback
 from functools import wraps
@@ -9,11 +10,13 @@ from typing import Optional, Type, List, TypeVar, Callable, Awaitable
 import httpx
 from CriadexSDK.ragflow_schemas import Filter
 from fastapi import Form
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from starlette import status
 from starlette.exceptions import HTTPException
 
 from criabot.bot.chat.schemas import RelatedPrompt
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 SUCCESS_CODE: str = "SUCCESS"
 RATE_LIMIT_CODE: str = "RATE_LIMIT"
@@ -23,18 +26,56 @@ DUPLICATE_CODE: str = "DUPLICATE"
 NOT_FOUND_CODE: str = "NOT_FOUND"
 CRIADEX_ERROR: str = "CRIADEX_ERROR"
 
+# Rate limiters - key by bot name for bot-specific endpoints, IP for general endpoints
+bot_management_limiter: Limiter = Limiter(key_func=lambda request: request.path_params.get('bot_name', get_remote_address(request)))
+chat_limiter: Limiter = Limiter(key_func=lambda request: request.path_params.get('chat_id', get_remote_address(request)))
+general_limiter: Limiter = Limiter(key_func=get_remote_address)
+
+
+def _sanitize_log_message(message: str) -> str:
+    """
+    Remove obvious API keys and authorization headers from log messages.
+    This is a best-effort sanitizer to avoid leaking secrets into logs.
+    """
+    # X-Api-Key style headers
+    message = re.sub(
+        r"(X-Api-Key[\"']?\s*[:=]\s*[\"']?)([a-zA-Z0-9_\-]+)",
+        r"\1[REDACTED]",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    # api_key query/body fields
+    message = re.sub(
+        r"(api_key[\"']?\s*[:=]\s*[\"']?)([a-zA-Z0-9_\-]+)",
+        r"\1[REDACTED]",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    # Authorization: Bearer <token>
+    message = re.sub(
+        r"(Authorization[\"']?\s*[:=]\s*[\"']?Bearer\s+)([a-zA-Z0-9_\-]+)",
+        r"\1[REDACTED]",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    return message
+
 
 class APIResponse(BaseModel):
     """
     Global API Response format that ALL responses must follow
 
     """
+    model_config = ConfigDict()
 
     status: int = 200
     message: Optional[str] = None
     timestamp: int = round(time.time())
     code: str = "SUCCESS"
-    error: Optional[str] = Field(default=None, exclude=True)
+    error: Optional[str] = Field(default=None)
 
     def dict(self, *args, **kwargs):
 
@@ -46,10 +87,10 @@ class APIResponse(BaseModel):
             404: 'Womp womp. Not found!'
         }.get(self.status)
 
-        data: dict = super().model_dump(*args, **kwargs)
+        data: dict = super().model_dump(*args, exclude={'error'}, **kwargs)
 
-        if data["error"] is None:
-            del data["error"]
+        if data.get("error") is None:
+            data.pop("error", None)
 
         return data
 
@@ -75,27 +116,25 @@ def catch_exceptions(
                 return await func(*args, **kwargs)
             except httpx.HTTPStatusError as ex:
 
-                log_message: str = (
-                        traceback.format_exc() +
-                        ex.response.text
-                )
+                raw_log_message: str = traceback.format_exc() + ex.response.text
+                safe_log_message = _sanitize_log_message(raw_log_message)
 
-                logging.error(log_message)
+                logging.error(safe_log_message)
 
                 return output_shape(
                     code=CRIADEX_ERROR,
                     status=ex.response.status_code,
                     message=f"[Criadex]: {ex.response.reason_phrase}",
-                    error=log_message
+                    error=safe_log_message
                 )
 
             except Exception:
-                logging.error(traceback.format_exc())
+                logging.error(_sanitize_log_message(traceback.format_exc()))
                 return output_shape(
                     code="ERROR",
                     status=500,
                     message=f"An internal error occurred!",
-                    error=traceback.format_exc()
+                    error=_sanitize_log_message(traceback.format_exc())
                 )
 
         return wrapper

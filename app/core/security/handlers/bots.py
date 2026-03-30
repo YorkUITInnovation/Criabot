@@ -6,6 +6,7 @@ from starlette.requests import Request
 
 from app.controllers.schemas import APIResponse
 from app.core.security.get_api_key import GetApiKey, BadAPIKeyException
+from criabot.bot.bot import Bot
 
 BotNameFuncType: Type = Awaitable[str]
 
@@ -59,14 +60,14 @@ class GetApiKeyBots(GetApiKey):
                 detail="Bot name not included in params!"
             )
 
-        from criabot.bot.bot import Bot
+        # Check authorization against the bot's own DOCUMENT group
         test_group_name: str = Bot.bot_group_name(bot_name, "DOCUMENT")
         group_response: GroupAuthCheckResponse = await self.get_group_auth(test_group_name)
 
-        if not group_response['authorized']:
+        if not group_response["authorized"]:
             raise BadAPIKeyException(
                 status_code=401,
-                detail="Your key is not authorized for accessing this bot."
+                detail="Your key is not authorized for accessing this bot.",
             )
 
         return self.api_key

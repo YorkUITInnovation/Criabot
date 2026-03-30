@@ -30,8 +30,8 @@ FROM        with_packages AS final
 
 #           PROJECT SOURCE CODE
 
-COPY        ./app ./app
-COPY        ./criabot ./criabot
+COPY        --chown=cria:cria ./app ./app
+COPY        --chown=cria:cria ./criabot ./criabot
 
 #           START SERVER
 

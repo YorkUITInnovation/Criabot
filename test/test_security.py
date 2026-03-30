@@ -146,3 +146,35 @@ async def test_get_api_key_bots_non_master_key_no_bot_name():
         await get_api_key_bots.execute()
     assert excinfo.value.status_code == 400
     assert "Bot name not included in params!" in excinfo.value.detail
+
+@pytest.mark.asyncio
+async def test_get_api_key_bots_child_bot_authorized():
+    """Test that a child bot's API key is authorized on its own groups."""
+    get_api_key_bots = GetApiKeyBots()
+    get_api_key_bots.api_key = "child_bot_key"
+    get_api_key_bots.get_auth = AsyncMock(return_value={"api_key": "child_bot_key", "master": False, "authorized": True})
+    get_api_key_bots.read_bot_name = AsyncMock(return_value="child_bot")
+    get_api_key_bots.get_group_auth = AsyncMock(return_value={"master": False, "authorized": True})
+    get_api_key_bots.criadex = MagicMock()
+    get_api_key_bots.criadex._error_stacktrace = False
+
+    result = await get_api_key_bots.execute()
+
+    assert result == "child_bot_key"
+    get_api_key_bots.get_group_auth.assert_called_once_with("child_bot-document-index")
+
+@pytest.mark.asyncio
+async def test_get_api_key_bots_parent_bot_authorized_on_child():
+    """Test that a parent bot's API key is authorized on child groups."""
+    get_api_key_bots = GetApiKeyBots()
+    get_api_key_bots.api_key = "parent_bot_key"
+    get_api_key_bots.get_auth = AsyncMock(return_value={"api_key": "parent_bot_key", "master": False, "authorized": True})
+    get_api_key_bots.read_bot_name = AsyncMock(return_value="child_bot")
+    get_api_key_bots.get_group_auth = AsyncMock(return_value={"master": False, "authorized": True})
+    get_api_key_bots.criadex = MagicMock()
+    get_api_key_bots.criadex._error_stacktrace = False
+
+    result = await get_api_key_bots.execute()
+
+    assert result == "parent_bot_key"
+    get_api_key_bots.get_group_auth.assert_called_once_with("child_bot-document-index")

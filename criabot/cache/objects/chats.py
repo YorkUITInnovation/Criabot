@@ -1,4 +1,6 @@
 import json
+import os
+import re
 from typing import List, Optional, Any
 
 from redis import asyncio as aioredis
@@ -7,7 +9,30 @@ from pydantic import BaseModel
 
 from criabot.bot.chat.buffer import ChatBuffer
 from criabot.cache.core import CacheObject
-from app.core.constants import CHAT_EXPIRE_TIME
+
+
+def _parse_time_to_seconds(time_str: str) -> int:
+    if not time_str:
+        return 3600
+    match = re.match(r'^(\d+)([hdwmy])$', time_str.lower())
+    if not match:
+        return 3600
+    value, unit = match.groups()
+    value = int(value)
+    if unit == 'h':
+        return value * 60 * 60
+    elif unit == 'd':
+        return value * 24 * 60 * 60
+    elif unit == 'w':
+        return value * 7 * 24 * 60 * 60
+    elif unit == 'm':
+        return value * 30 * 24 * 60 * 60
+    elif unit == 'y':
+        return value * 365 * 24 * 60 * 60
+    return 3600
+
+
+CHAT_EXPIRE_TIME: int = _parse_time_to_seconds(os.environ.get("CHAT_EXPIRE_TIME", "1h"))
 
 
 class ChatModel(BaseModel):

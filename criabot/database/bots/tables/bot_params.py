@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 
 from pydantic import BaseModel
 from sqlalchemy import Integer, Numeric, Boolean, Text, ForeignKey, insert, delete, select, update, \
@@ -55,7 +55,7 @@ class BotParametersBaseConfig(BaseModel):
     no_context_message: str = "Sorry, I'm not sure about that."  # No context reply message
     no_context_use_message: bool = False
     no_context_llm_guess: bool = False
-    system_message: Optional[str] = None  # System message to embed
+    system_message: Optional[str] = ""  # System message to embed (default empty string)
 
 
 class BotParametersConfig(BotParametersBaseConfig):
@@ -106,3 +106,17 @@ class BotParametersAPI(TableAPI):
 
     async def exists(self, bot_id: int) -> bool:
         return bool(await self.retrieve(bot_id=bot_id))
+
+    async def retrieve_by_bot_ids(self, bot_ids: List[int]) -> List[BotParametersModel]:
+        """Batch retrieve bot parameters by bot IDs to avoid N+1 queries"""
+        if not bot_ids:
+            return []
+        
+        async with self.get_async_session() as session:
+            result: Optional[ChunkedIteratorResult] = await session.execute(
+                select(self.Schema)
+                .where(self.Schema.bot_id.in_(bot_ids))
+            )
+            entries: List[BotParametersTable] = result.scalars().all()
+        
+        return [self.to_model(entry, BotParametersModel) for entry in entries]

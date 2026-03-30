@@ -8,6 +8,7 @@ def criadex_api():
     mock = AsyncMock()
     mock.agents.cohere.rerank = AsyncMock(return_value={"reranked_documents": [], "search_units": 1})
     mock.agents.azure.transform = AsyncMock(return_value={"agent_response": TransformAgentResponse(new_prompt="hello", usage=[])})
+    mock.content.search = AsyncMock()
     return mock
 
 @pytest.fixture
@@ -21,7 +22,9 @@ def bot_params():
 
 @pytest.fixture
 def bot_mock():
-    return AsyncMock()
+    mock = MagicMock()
+    mock.group_name.side_effect = lambda index_type: f"child-{index_type.lower()}-index"
+    return mock
 
 @pytest.fixture
 def retriever(criadex_api, bot_mock, bot_params):
@@ -43,10 +46,10 @@ def create_text_node(text, metadata=None, score=0.8):
 
 @pytest.mark.asyncio
 async def test_retrieve_no_nodes(retriever, bot_mock):
-    bot_mock.search_group.return_value = {
-        "group_name": "test_group",
-        "response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[])
-    }
+    retriever._criadex.content.search.side_effect = [
+        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
+        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
+    ]
     response = await retriever.retrieve(prompt="hello", metadata_filter=None, extra_bots=[])
     assert isinstance(response, ContextRetrieverResponse)
     assert response.context is None
@@ -56,10 +59,10 @@ async def test_retrieve_no_nodes(retriever, bot_mock):
 @pytest.mark.asyncio
 async def test_retrieve_with_text_context(retriever, bot_mock):
     nodes = [create_text_node("text 1")]
-    bot_mock.search_group.return_value = {
-        "group_name": "test_group",
-        "response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[])
-    }
+    retriever._criadex.content.search.side_effect = [
+        {"response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[]).model_dump()},
+        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
+    ]
 
     # Mock hybrid_rerank to return what retrieve expects
     retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
@@ -76,10 +79,10 @@ async def test_retrieve_with_question_context_no_llm_reply(retriever, bot_mock):
         score=0.9
     )
     nodes = [question_node, create_text_node("other text")]
-    bot_mock.search_group.return_value = {
-        "group_name": "test_group",
-        "response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[])
-    }
+    retriever._criadex.content.search.side_effect = [
+        {"response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[]).model_dump()},
+        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
+    ]
 
     retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
 
@@ -95,10 +98,10 @@ async def test_retrieve_with_question_context_with_llm_reply(retriever, bot_mock
         score=0.9
     )
     nodes = [question_node, create_text_node("other text")]
-    bot_mock.search_group.return_value = {
-        "group_name": "test_group",
-        "response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[])
-    }
+    retriever._criadex.content.search.side_effect = [
+        {"response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[]).model_dump()},
+        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
+    ]
 
     retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
 
@@ -109,14 +112,50 @@ async def test_retrieve_with_question_context_with_llm_reply(retriever, bot_mock
 
 @pytest.mark.asyncio
 async def test_search_groups(retriever, bot_mock):
+    retriever._criadex.content.search.return_value = {
+        "response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()
+    }
     await retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=["extra_bot"])
-    assert bot_mock.search_group.call_count == len(retriever.INDEX_TYPES)
-    bot_mock.search_group.assert_any_call(
-        index_type="DOCUMENT",
+    assert retriever._criadex.content.search.call_count == len(retriever.INDEX_TYPES) * 2
+    retriever._criadex.content.search.assert_any_call(
+        group_name="child-document-index",
         search_config=retriever.build_search_group_config(
             prompt="hello",
             metadata_filter=None,
-            extra_groups=["extra_bot-document-index"]
+            extra_groups=[]
+        )
+    )
+    retriever._criadex.content.search.assert_any_call(
+        group_name="extra_bot-document-index",
+        search_config=retriever.build_search_group_config(
+            prompt="hello",
+            metadata_filter=None,
+            extra_groups=[]
+        )
+    )
+
+@pytest.mark.asyncio
+async def test_search_groups_with_parent_bots(retriever, bot_mock):
+    parent_bots = ["parent1", "parent2"]
+    retriever._criadex.content.search.return_value = {
+        "response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()
+    }
+    await retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=parent_bots)
+    assert retriever._criadex.content.search.call_count == len(retriever.INDEX_TYPES) * 3
+    retriever._criadex.content.search.assert_any_call(
+        group_name="parent1-document-index",
+        search_config=retriever.build_search_group_config(
+            prompt="hello",
+            metadata_filter=None,
+            extra_groups=[]
+        )
+    )
+    retriever._criadex.content.search.assert_any_call(
+        group_name="parent2-document-index",
+        search_config=retriever.build_search_group_config(
+            prompt="hello",
+            metadata_filter=None,
+            extra_groups=[]
         )
     )
 
@@ -153,3 +192,15 @@ def test_merge_responses():
     assert len(merged["group1"].nodes) == 2
     assert merged["group1"].search_units == 2
     assert "group2" in merged
+
+
+def test_build_retrieval_prompts_for_summary_query():
+    prompts = ContextRetriever.build_retrieval_prompts(
+        "Give me a summary including the IT Department support motto, the HR handbook release date, and the robotics lab location."
+    )
+    assert prompts == [
+        "Give me a summary including the IT Department support motto, the HR handbook release date, and the robotics lab location.",
+        "the IT Department support motto",
+        "the HR handbook release date",
+        "the robotics lab location",
+    ]

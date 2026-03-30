@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 from app.core.objects import AppMode, check_env_path
 
-from criabot.schemas import CriadexCredentials, RedisCredentials, MySQLCredentials, CriadexCredentials
+from criabot.schemas import CriadexCredentials, RedisCredentials, MySQLCredentials
 
 ENV_PATH: str = os.environ.get('ENV_PATH', "./.env")
 

@@ -34,7 +34,8 @@ curl -X POST "${HOST}:${PORT}/bots/my-new-bot/manage/create" \
   -d '{
     "llm_model_id": 1,
     "embedding_model_id": 2,
-    "rerank_model_id": 3
+    "rerank_model_id": 3,
+    "parent_bot_names": ["optional-parent-name"]
 }'
 ```
 
@@ -60,7 +61,8 @@ curl -X PATCH "${HOST}:${PORT}/bots/my-new-bot/manage/update" \
   -d '{
     "llm_model_id": 4,
     "embedding_model_id": 5,
-    "rerank_model_id": 6
+    "rerank_model_id": 6,
+    "parent_bot_names": ["optional-parent-name-1", "optional-parent-name-2"]
 }'
 ```
 
@@ -68,7 +70,7 @@ Response (200 OK):
 ```json
 {
   "status": 200,
-  "message": "Successfully updated the bot.",
+  "message": "Successfully updated the bot info.",
   "timestamp": "<timestamp>",
   "code": "SUCCESS"
 }
@@ -136,6 +138,46 @@ Response (200 OK):
 }
 ```
 
+### 1.5 List Parent Bots
+GET /bots/{bot_name}/manage/parents
+
+Request:
+```bash
+curl "${HOST}:${PORT}/bots/my-new-bot/manage/parents" \
+  -H "X-API-Key: ${API_KEY}"
+```
+
+Sample Response (200 OK):
+```json
+{
+  "status": 200,
+  "message": "Successfully retrieved parent bots.",
+  "timestamp": "<timestamp>",
+  "code": "SUCCESS",
+  "parents": ["parent-bot-a", "parent-bot-b"]
+}
+```
+
+### 1.6 List Child Bots
+GET /bots/{bot_name}/manage/children
+
+Request:
+```bash
+curl "${HOST}:${PORT}/bots/my-new-bot/manage/children" \
+  -H "X-API-Key: ${API_KEY}"
+```
+
+Sample Response (200 OK):
+```json
+{
+  "status": 200,
+  "message": "Successfully retrieved child bots.",
+  "timestamp": "<timestamp>",
+  "code": "SUCCESS",
+  "children": ["child-bot-a", "child-bot-b"]
+}
+```
+
 ---
 
 ## 2. Chat Endpoints
@@ -171,7 +213,7 @@ curl -X POST "${HOST}:${PORT}/bots/chats/your-chat-id/query" \
   -d '{
     "prompt": "What is the capital of France?",
     "bot_name": "my-new-bot-name",
-    "extra_bots": []
+    "extra_bots": ["another-bot-name"]
 }'
 ```
 
@@ -550,21 +592,16 @@ curl "${HOST}:${PORT}/openapi.json"
 ```
 
 ### Health Check
-GET /health
+GET /health_check
 
 Request:
 ```bash
-curl "${HOST}:${PORT}/health" \
-  -H "X-API-Key: ${API_KEY}"
+curl "${HOST}:${PORT}/health_check"
 ```
 
 Response (200 OK):
-```json
-{
-  "status": "ok",
-  "uptime": "...",
-  "version": "1.0.0"
-}
+```text
+Pong!
 ```
 
 ---

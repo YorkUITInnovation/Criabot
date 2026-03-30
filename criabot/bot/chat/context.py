@@ -51,6 +51,11 @@ class ContextRetriever:
     GROUP_NAME_METADATA_KEY: str = "group_name"
     ANSWER_METADATA_KEY: str = "answer"
     RELATED_PROMPTS_METADATA_KEY: str = "related_prompts"
+    _PROMPT_SPLIT_RE = re.compile(r",|\band\b", re.IGNORECASE)
+    _PROMPT_PREFIX_RE = re.compile(
+        r"^(give me|provide|create|write)\s+(a\s+)?(summary|response|answer)\s+(including|with)\s+",
+        re.IGNORECASE,
+    )
 
     def __init__(
             self,
@@ -72,20 +77,65 @@ class ContextRetriever:
             metadata_filter,
             extra_bots
     ):
-        index_queries = []
+        async def search_named_group(group_name: str, search_config: dict):
+            search_result = await self._criadex.content.search(
+                group_name=group_name,
+                search_config=search_config
+            )
+            if isinstance(search_result, dict):
+                candidate = None
+                for key in ("response", "result", "data"):
+                    value = search_result.get(key)
+                    if isinstance(value, dict) and (
+                        "nodes" in value or "assets" in value or "search_units" in value
+                    ):
+                        candidate = value
+                        break
+                if candidate is None:
+                    if any(k in search_result for k in ("nodes", "assets", "search_units")):
+                        candidate = search_result
+                    else:
+                        candidate = search_result.get("response", search_result)
+                response_obj = (
+                    candidate
+                    if isinstance(candidate, GroupSearchResponse)
+                    else GroupSearchResponse(**candidate)
+                )
+            else:
+                verified = getattr(search_result, "verify", lambda: search_result)()
+                response_obj = getattr(verified, "response", verified)
+            return {"group_name": group_name, "response": response_obj}
 
+        async def safe_search(group_name: str, search_config: dict):
+            try:
+                return await search_named_group(group_name=group_name, search_config=search_config)
+            except Exception as e:
+                # Missing index groups should not crash chat. Treat as "no context".
+                message = str(e)
+                if "GROUP_NOT_FOUND" in message or "Group not found" in message:
+                    return None
+                raise
+
+        tasks = []
         for index_type in self.INDEX_TYPES:
             search_config = self.build_search_group_config(
                 prompt=prompt,
                 metadata_filter=metadata_filter,
-                extra_groups=[Bot.bot_group_name(extra_bot, index_type) for extra_bot in extra_bots]
+                extra_groups=[]
             )
-            index_queries.append(
-                self._bot.search_group(index_type=index_type, search_config=search_config)
-            )
+            group_names = [
+                self._bot.group_name(index_type),
+                *[Bot.bot_group_name(extra_bot, index_type) for extra_bot in extra_bots],
+            ]
+            for group_name in dict.fromkeys(group_names):
+                tasks.append(safe_search(group_name=group_name, search_config=search_config))
 
-        results = await asyncio.gather(*index_queries)
-        return {r["group_name"] if isinstance(r, dict) else r.group_name: r["response"] if isinstance(r, dict) else r.response for r in results}
+        results = await asyncio.gather(*tasks)
+        results = [r for r in results if r is not None]
+        return {
+            (r["group_name"] if isinstance(r, dict) else r.group_name): (r["response"] if isinstance(r, dict) else r.response)
+            for r in results
+        }
 
     async def hybrid_rerank(
             self,
@@ -166,31 +216,76 @@ class ContextRetriever:
         retriever_response = ContextRetrieverResponse(
             group_responses={}
         )
-        # Retrieve using original prompt
-        group_responses = await self.search_groups(
-            prompt=prompt,
-            metadata_filter=metadata_filter,
-            extra_bots=extra_bots
-        )
+        search_prompts = self.build_retrieval_prompts(prompt)
+        response_sets = []
+        for search_prompt in search_prompts:
+            response_sets.append(
+                await self.search_groups(
+                    prompt=search_prompt,
+                    metadata_filter=metadata_filter,
+                    extra_bots=extra_bots
+                )
+            )
+
+        group_responses = self.merge_responses(*response_sets) if response_sets else {}
         retriever_response.search_units = ContextRetrieverResponse.get_search_units(group_responses)
         retriever_response.group_responses = group_responses
         nodes = retriever_response.nodes
         # If there are no nodes
         if len(nodes) < 1:
             return retriever_response
-        # Execute hybrid re-rank
-        rerank_response = await self.hybrid_rerank(
-            prompt=prompt,
-            nodes=nodes
-        )
-        retriever_response.search_units += rerank_response["search_units"]
-        # Make sure we have something
-        if len(rerank_response["ranked_nodes"]) > 0:
-            retriever_response.context = self.build_context(
-                ranked_nodes=rerank_response["ranked_nodes"],
-            )
+        ranked_nodes = self.normalize_ranked_nodes(nodes)
+        if len(ranked_nodes) > 0:
+            retriever_response.context = self.build_context(ranked_nodes=ranked_nodes)
         # Give 'er
         return retriever_response
+
+    @classmethod
+    def build_retrieval_prompts(cls, prompt: str) -> List[str]:
+        prompts = [prompt.strip()]
+        stripped_prompt = cls._PROMPT_PREFIX_RE.sub("", prompt.strip()).strip(" .")
+        segments = [
+            segment.strip(" .")
+            for segment in cls._PROMPT_SPLIT_RE.split(stripped_prompt)
+            if segment.strip(" .")
+        ]
+
+        for segment in segments:
+            if len(segment) < 6:
+                continue
+            prompts.append(segment)
+
+        return list(dict.fromkeys(prompts))
+
+    def normalize_ranked_nodes(self, ranked_nodes: List[TextNodeWithScore]) -> List[TextNodeWithScore]:
+        unique_nodes: list[TextNodeWithScore] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        for node in ranked_nodes:
+            metadata = node.node.metadata or {}
+            dedupe_key = (
+                metadata.get(self.GROUP_NAME_METADATA_KEY, ""),
+                metadata.get(self.FILE_NAME_METADATA_KEY, ""),
+                node.node.text,
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            unique_nodes.append(node)
+
+        def sort_key(node: TextNodeWithScore) -> tuple[float, int, float]:
+            metadata = node.node.metadata or {}
+            group_name = metadata.get(self.GROUP_NAME_METADATA_KEY, "")
+            own_groups = {
+                self._bot.group_name(index_type)
+                for index_type in self.INDEX_TYPES
+            }
+            source_priority = 0 if group_name in own_groups else 1
+            score = float(node.score or 0.0)
+            # Prefer the child's own groups when scores are effectively tied.
+            return (-round(score, 2), source_priority, -score)
+
+        return sorted(unique_nodes, key=sort_key)
 
     @classmethod
     def build_context(cls, ranked_nodes: List[TextNodeWithScore]) -> Union[QuestionContext, TextContext]:
@@ -280,7 +375,7 @@ def clean_text(text: str) -> str:
     return _RE_COMBINE_MULTISPACE.sub(" ", textwrap.dedent(text)).strip()
 
 
-def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
+def build_context_prompt(context: TextContext, prompt: str = "", best_guess: bool = False) -> str:
     """
     Build a context-enabled prompt given the components
 
@@ -299,6 +394,11 @@ def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
     return clean_text(
         f"""
         [INSTRUCTIONS]
+        Answer the user's latest question using the information below.
+        If the information contains the answer, state that answer directly.
+        Do not replace retrieved facts with outside knowledge, generic examples, or guesses.
+        Quote or restate the retrieved facts when possible.
+
         The documents below are the top results returned from a search engine.
         They may be relevant or completely irrelevant to the question.
        
@@ -308,6 +408,9 @@ def build_context_prompt(context: TextContext, best_guess: bool = False) -> str:
         A description tag looks like this: [IMAGE <image_id> DESCRIPTION START].
                 
         {extra_text}
+
+        [QUESTION]
+        {prompt}
 
         [INFORMATION]
         {context.text}

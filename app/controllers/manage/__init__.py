@@ -4,7 +4,7 @@ import app.core.config as config
 from app.core.objects import AppMode
 from app.core.security.handlers.bots import GetApiKeyBots
 from app.core.security.handlers.master import GetApiKeyMaster
-from . import create, delete, about, update
+from . import create, delete, about, update, children, parents
 from ...core.route import CriaRouter
 
 MASTER_DEPS: list = [Security(GetApiKeyMaster())] if config.APP_MODE == AppMode.PRODUCTION else []
@@ -24,7 +24,9 @@ router.include_views(
     create.view,
     update.view,
     delete.view,
-    about.view
+    about.view,
+    children.view,
+    parents.view,
 )
 
 __all__ = ["router"]

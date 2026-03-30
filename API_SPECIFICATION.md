@@ -24,7 +24,8 @@ POST /bots/{bot_name}/manage/create
   {
     "llm_model_id": 1,
     "embedding_model_id": 2,
-    "rerank_model_id": 3
+    "rerank_model_id": 3,
+    "parent_bot_names": ["optional-parent-name"]
   }
   ```
 - Response 200 OK:
@@ -48,7 +49,8 @@ PATCH /bots/{bot_name}/manage/update
   {
     "llm_model_id": 4,
     "embedding_model_id": 5,
-    "rerank_model_id": 6
+    "rerank_model_id": 6,
+    "parent_bot_names": ["optional-parent-name-1", "optional-parent-name-2"]
   }
   ```
 - Response 200 OK:
@@ -58,6 +60,38 @@ PATCH /bots/{bot_name}/manage/update
     "message": "Successfully updated the bot.",
     "timestamp": "<timestamp>",
     "code": "SUCCESS"
+  }
+  ```
+
+### 1.5 List Parent Bots
+GET /bots/{bot_name}/manage/parents
+- Description: List direct parent bots for a given child.
+- Path Parameters:
+  - `bot_name` (string, required): The child bot name.
+- Response 200 OK:
+  ```json
+  {
+    "status": 200,
+    "message": "Successfully retrieved parent bots.",
+    "timestamp": "<timestamp>",
+    "code": "SUCCESS",
+    "parents": ["parent-bot-a", "parent-bot-b"]
+  }
+  ```
+
+### 1.6 List Child Bots
+GET /bots/{bot_name}/manage/children
+- Description: List direct child bots for a given parent.
+- Path Parameters:
+  - `bot_name` (string, required): The parent bot name.
+- Response 200 OK:
+  ```json
+  {
+    "status": 200,
+    "message": "Successfully retrieved child bots.",
+    "timestamp": "<timestamp>",
+    "code": "SUCCESS",
+    "children": ["child-bot-a", "child-bot-b"]
   }
   ```
 
@@ -145,7 +179,7 @@ POST /bots/chats/{chat_id}/query
   {
     "prompt": "What is the capital of France?",
     "bot_name": "my-new-bot-name",
-    "extra_bots": []
+    "extra_bots": ["another-bot-name"]
   }
   ```
 - Response 200 OK:
@@ -166,6 +200,7 @@ POST /bots/chats/{chat_id}/query
     }
   }
   ```
+  Note: If a highly relevant and concise fact is found (Direct Context Reply), the `message` might be returned directly from the document without LLM generation to ensure speed and accuracy.
 
 ### 2.3 Send a chat to a bot
 POST /bots/chats/{chat_id}/send
@@ -198,6 +233,7 @@ POST /bots/chats/{chat_id}/send
     }
   }
   ```
+  Note: Similar to queries, direct context replies or summaries may be returned directly if relevant facts are identified.
 
 ### 2.4 End a chat with a bot
 DELETE /bots/chats/{chat_id}/end
@@ -485,9 +521,9 @@ GET /openapi.json
 - Returns raw OpenAPI specification.
 
 ### Health Check
-GET /health
-- Returns service health and version.
+GET /health_check
+- Returns service health status.
 - Response 200 OK:
-  ```json
-  {"status":"ok","uptime":"...","version":"1.0.0"}
+  ```
+  Pong!
   ```
