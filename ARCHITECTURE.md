@@ -35,6 +35,7 @@ Key features:
 ## 3. Deployment & Runtime
 
 - **Docker & Docker-Compose**: Containerized via `Dockerfile` and orchestrated with `docker-compose.yml`. Environment configured in `docker.env`.
+- **Health Checks**: `docker-compose.yml` includes health checks for critical services like Elasticsearch and MySQL to ensure startup stability.
 - **Entry Point**: `entrypoint.sh` initializes environment, applies migrations, and starts the FastAPI server.
 - **Build Script**: `build.sh` automates dependency installation, linting, and image building.
 
@@ -58,6 +59,8 @@ Key features:
 - **Orchestration**: `criabot/criabot.py` manages sessions, parameters, retry logic, and error handling.
 - **Schemas**: Pydantic schemas in `criabot/schemas.py` and `criabot/bot/schemas.py` for validation.
 - **Chat Logic**: `criabot/bot/chat.py` and `criabot/bot/context.py` for conversation history and prompt building.
+- **Direct Context Replies**: Optimization in `chat.py` that bypasses LLM generation if a single highly relevant document node is found (under 300 chars) or if multiple facts (2-5 nodes) can be returned as a direct bulleted summary.
+- **Prompt Splitting**: `context.py` implements multi-query retrieval by splitting complex user prompts (e.g., "Give me a summary of A, B, and C") into individual search sub-queries to improve document coverage.
 - **Buffering**: `criabot/bot/buffer.py` for streaming and batched messages.
 
 ## 7. Caching Layer
@@ -67,7 +70,7 @@ Key features:
 
 ## 8. Persistence Layer
 
-- **Tables**: Defined in `database/bots/tables`; schemas for bots and parameters.
+- **Tables**: Defined in `database/bots/tables`; schemas for bots, parameters, and bot_models.
 - **Data Access**: `database/bots/bots.py` provides high-level CRUD functions.
 
 ## 9. Documentation & OpenAPI

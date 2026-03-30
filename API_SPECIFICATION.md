@@ -200,6 +200,7 @@ POST /bots/chats/{chat_id}/query
     }
   }
   ```
+  Note: If a highly relevant and concise fact is found (Direct Context Reply), the `message` might be returned directly from the document without LLM generation to ensure speed and accuracy.
 
 ### 2.3 Send a chat to a bot
 POST /bots/chats/{chat_id}/send
@@ -232,6 +233,7 @@ POST /bots/chats/{chat_id}/send
     }
   }
   ```
+  Note: Similar to queries, direct context replies or summaries may be returned directly if relevant facts are identified.
 
 ### 2.4 End a chat with a bot
 DELETE /bots/chats/{chat_id}/end
