@@ -20,6 +20,19 @@ async def test_start_chat(bot_cache_api):
     assert isinstance(chat_id, str)
     bot_cache_api.chats.set.assert_called_once()
 
+
+@pytest.mark.asyncio
+async def test_start_chat_uses_sdk_for_ensure(bot_cache_api):
+    criadex = MagicMock()
+    criadex.agents = MagicMock()
+    criadex.agents.azure = MagicMock()
+    criadex.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+
+    chat_id = await Bot.start_chat(bot_cache_api, criadex=criadex)
+
+    assert isinstance(chat_id, str)
+    criadex.agents.azure.ensure_dialog.assert_called_once()
+
 def test_group_name(bot):
     assert bot.group_name("QUESTION") == "test_bot-question-index"
     assert bot.group_name("DOCUMENT") == "test_bot-document-index"
@@ -49,3 +62,25 @@ async def test_set_chat_model(bot):
     chat_model = MagicMock()
     await bot.set_chat_model(chat_id="test_chat", chat_model=chat_model)
     bot.cache_api.chats.set.assert_called_once_with(chat_id="test_chat", chat_model=chat_model)
+
+
+@pytest.mark.asyncio
+async def test_search_group_graph_uses_manage_graph_search(bot, criadex_api):
+    criadex_api.manage = MagicMock()
+    criadex_api.manage.graph_search = AsyncMock(return_value={"response": {"nodes": [], "assets": [], "search_units": 1}})
+
+    result = await bot.search_group_graph("DOCUMENT", {"query": "hello"}, max_hops=2, max_expansion_terms=4)
+
+    criadex_api.manage.graph_search.assert_called_once()
+    assert result["group_name"] == "test_bot-document-index"
+
+
+@pytest.mark.asyncio
+async def test_search_group_graph_falls_back_to_standard_search(bot, criadex_api):
+    criadex_api.manage = MagicMock()
+    criadex_api.manage.graph_search = AsyncMock(side_effect=RuntimeError("graph unavailable"))
+    criadex_api.content.search = AsyncMock(return_value={"response": {"nodes": [], "assets": [], "search_units": 1}})
+
+    await bot.search_group_graph("DOCUMENT", {"query": "fallback"})
+
+    criadex_api.content.search.assert_called_once()

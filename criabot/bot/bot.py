@@ -3,6 +3,7 @@ import asyncio
 import uuid
 import logging
 import json
+import os
 from typing import Dict, Awaitable, Callable, Any
 
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
@@ -49,7 +50,11 @@ class Bot:
         return self._name
 
     @classmethod
-    async def start_chat(cls, cache_api: BotCacheAPI) -> str:
+    async def start_chat(
+        cls,
+        cache_api: BotCacheAPI,
+        criadex: RAGFlowSDK | None = None
+    ) -> str:
         """
         Add a new chat to the cache and return the ID. Users should insert the system message
         as the FIRST message in history. Also ensures the dialog exists in Ragflow.
@@ -74,20 +79,15 @@ class Bot:
 
         # Ensure the dialog exists in Ragflow (attempt to create if not exists)
         try:
-            import httpx
-            import os
-            criadex_url = os.getenv("CRIADEX_API_BASE") or os.getenv("CRIADEX_URL", "http://criadex:25574")
-            criadex_url = criadex_url.rstrip("/")
             ragflow_tenant_id = os.getenv("RAGFLOW_TENANT_ID")
-            
-            if ragflow_tenant_id:
-                ensure_dialog_url = f"{criadex_url}/ragflow/chats/{chat_id}/ensure"
-                async with httpx.AsyncClient() as client:
-                    await client.post(
-                        ensure_dialog_url,
-                        json={"tenant_id": ragflow_tenant_id},
-                        timeout=5
-                    )
+            ragflow_model_id = os.getenv("RAGFLOW_CHAT_LLM_ID", "gpt-3.5-turbo")
+
+            if criadex is not None:
+                await criadex.agents.azure.ensure_dialog(
+                    chat_id=chat_id,
+                    model_id=ragflow_model_id,
+                    tenant_id=ragflow_tenant_id
+                )
         except Exception as e:
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to pre-create Ragflow dialog for chat {chat_id}: {e}")
@@ -195,6 +195,37 @@ class Bot:
             verified = getattr(search_result, 'verify', lambda: search_result)()
             response_obj = getattr(verified, 'response', verified)
         return {"group_name": group_name, "response": response_obj}
+
+    async def search_group_graph(
+        self,
+        index_type,
+        search_config,
+        max_hops: int = 1,
+        max_expansion_terms: int = 8,
+        auto_build: bool = False
+    ):
+        """
+        Query a bot group using Criadex graph-aware search.
+
+        Falls back to regular search when graph search is unavailable.
+        """
+        group_name = self.group_name(index_type)
+        payload = search_config.model_dump() if hasattr(search_config, "model_dump") else dict(search_config)
+        payload.update({
+            "max_hops": max_hops,
+            "max_expansion_terms": max_expansion_terms,
+            "auto_build": auto_build,
+        })
+
+        try:
+            result = await self._criadex.manage.graph_search(
+                group_name=group_name,
+                search_config=payload
+            )
+            response_obj = result.get("response", result) if isinstance(result, dict) else result
+            return {"group_name": group_name, "response": response_obj}
+        except Exception:
+            return await self.search_group(index_type=index_type, search_config=search_config)
 
     async def retrieve_group_info(self) -> Dict[str, Any]:
         """
