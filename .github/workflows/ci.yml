@@ -6,6 +6,7 @@ on:
       - main
       - ragflow-integration
       - feature/child_bot
+      - graphrag
 
 jobs:
   test:
