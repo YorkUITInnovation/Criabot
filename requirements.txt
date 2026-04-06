@@ -26,4 +26,4 @@ pytest-dotenv
 # Due for renewal: November 20th, 2024
 # v1.2.idk4
 # criadexsdk @ git+https://github.com/YorkUITInnovation/CriadexSDK
-criadexsdk @ git+https://github.com/YorkUITInnovation/CriadexSDK@feature/child_bot
+criadexsdk @ git+https://github.com/YorkUITInnovation/CriadexSDK@graphrag

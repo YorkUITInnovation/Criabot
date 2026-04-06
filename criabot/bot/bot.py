@@ -21,6 +21,7 @@ class Bot:
         "DOCUMENT": "-document-index",
         # "CACHE": "-cache-index"
     }
+    _GRAPH_BUILD_TRIGGERED_AT: Dict[str, float] = {}
 
     def __init__(
             self,
@@ -218,6 +219,22 @@ class Bot:
         })
 
         try:
+            graph_status_resp = await self._criadex.manage.graph_status(group_name=group_name)
+            status_obj = graph_status_resp.get("graph", {}) if isinstance(graph_status_resp, dict) else {}
+            job_obj = graph_status_resp.get("job", {}) if isinstance(graph_status_resp, dict) else {}
+            graph_status = (status_obj.get("status") or "NOT_BUILT").upper()
+            job_state = (job_obj.get("state") or "").upper()
+
+            should_trigger_build = graph_status in {"NOT_BUILT", "STALE", "FAILED"} and job_state not in {"QUEUED", "RUNNING"}
+            if should_trigger_build:
+                now = time.time()
+                last_triggered = self._GRAPH_BUILD_TRIGGERED_AT.get(group_name, 0.0)
+                # Debounce graph build triggers to avoid per-request storms.
+                if (now - last_triggered) > 60:
+                    await self._criadex.manage.build_graph(group_name=group_name)
+                    self._GRAPH_BUILD_TRIGGERED_AT[group_name] = now
+                    payload["auto_build"] = True
+
             result = await self._criadex.manage.graph_search(
                 group_name=group_name,
                 search_config=payload

@@ -1,5 +1,7 @@
 import asyncio
+import inspect
 import itertools
+import os
 import re
 import textwrap
 from typing import List, Optional, Dict, Awaitable, Union, Type
@@ -70,6 +72,22 @@ class ContextRetriever:
         self._llm_model_id = llm_model_id
         self._bot = bot
         self._bot_params = bot_params
+        self._graph_enabled = os.getenv("GRAPH_RAG_CHAT_ENABLED", "true").lower() == "true"
+        self._graph_auto_build = os.getenv("GRAPH_RAG_CHAT_AUTO_BUILD", "true").lower() == "true"
+
+    @staticmethod
+    def _looks_like_group_search_result(payload: object) -> bool:
+        if isinstance(payload, GroupSearchResponse):
+            return True
+        if isinstance(payload, dict):
+            if any(key in payload for key in ("nodes", "assets", "search_units")):
+                return True
+            for key in ("response", "result", "data"):
+                nested = payload.get(key)
+                if isinstance(nested, dict) and any(k in nested for k in ("nodes", "assets", "search_units")):
+                    return True
+            return False
+        return False
 
     async def search_groups(
             self,
@@ -78,10 +96,37 @@ class ContextRetriever:
             extra_bots
     ):
         async def search_named_group(group_name: str, search_config: dict):
-            search_result = await self._criadex.content.search(
-                group_name=group_name,
-                search_config=search_config
-            )
+            search_result = None
+            graph_meta = None
+            if self._graph_enabled:
+                try:
+                    manage_api = getattr(self._criadex, "manage", None)
+                    graph_search = getattr(manage_api, "graph_search", None) if manage_api is not None else None
+                    if callable(graph_search):
+                        graph_payload = {
+                            **search_config,
+                            "max_hops": 1,
+                            "max_expansion_terms": 8,
+                            "auto_build": self._graph_auto_build,
+                        }
+                        search_result = await graph_search(
+                            group_name=group_name,
+                            search_config=graph_payload
+                        )
+                        if inspect.isawaitable(search_result):
+                            search_result = await search_result
+                        if not self._looks_like_group_search_result(search_result):
+                            search_result = None
+                except Exception:
+                    search_result = None
+
+            if search_result is None:
+                search_result = await self._criadex.content.search(
+                    group_name=group_name,
+                    search_config=search_config
+                )
+                if inspect.isawaitable(search_result):
+                    search_result = await search_result
             if isinstance(search_result, dict):
                 candidate = None
                 for key in ("response", "result", "data"):
@@ -101,9 +146,22 @@ class ContextRetriever:
                     if isinstance(candidate, GroupSearchResponse)
                     else GroupSearchResponse(**candidate)
                 )
+                if isinstance(candidate, dict):
+                    graph_meta = candidate.get("graph_metadata") or search_result.get("graph_metadata")
             else:
-                verified = getattr(search_result, "verify", lambda: search_result)()
-                response_obj = getattr(verified, "response", verified)
+                if isinstance(search_result, GroupSearchResponse):
+                    response_obj = search_result
+                elif callable(getattr(search_result, "verify", None)):
+                    verified = search_result.verify()
+                    if inspect.isawaitable(verified):
+                        verified = await verified
+                    response_obj = getattr(verified, "response", verified)
+                    if inspect.isawaitable(response_obj):
+                        response_obj = await response_obj
+                else:
+                    raise TypeError("Unsupported search response payload type")
+            if graph_meta:
+                response_obj.metadata = {**(response_obj.metadata or {}), "graph_rag": graph_meta}
             return {"group_name": group_name, "response": response_obj}
 
         async def safe_search(group_name: str, search_config: dict):

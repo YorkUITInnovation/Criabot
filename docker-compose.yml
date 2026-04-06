@@ -21,10 +21,10 @@ services:
         MYSQL_DATABASE: rag_flow
       healthcheck:
         test: mysqladmin ping -h 127.0.0.1 -uroot --password=$$MYSQL_ROOT_PASSWORD
-        start_period: 1s
+        start_period: 45s
         interval: 5s
         timeout: 5s
-        retries: 5
+        retries: 12
       ports:
         - '127.0.0.1:3306:3306'
       volumes:
@@ -73,11 +73,11 @@ services:
         test:
           [
             "CMD-SHELL",
-            "curl -fsS -u elastic:$$ELASTIC_PASSWORD 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s' >/dev/null || exit 1",
+            "curl -fsS -u elastic:$$ELASTIC_PASSWORD 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=30s' >/dev/null || exit 1",
           ]
-        start_period: 10s
-        interval: 5s
-        timeout: 5s
+        start_period: 60s
+        interval: 10s
+        timeout: 35s
         retries: 20
       # For production deployments, you may also want to enable these limits
       # to avoid OS-level constraints under higher load:
@@ -181,10 +181,10 @@ services:
         - mysql
       healthcheck:
         test: [ "CMD", "curl", "-f", "http://ragflow:9380/v1/system/healthz" ]
-        start_period: 1s
+        start_period: 90s
         interval: 5s
         timeout: 5s
-        retries: 15
+        retries: 30
     # Cria-Back CriaParse
     criaparse:
       image: uitadmin/criaparse:latest
