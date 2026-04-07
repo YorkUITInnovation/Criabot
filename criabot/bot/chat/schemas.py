@@ -78,3 +78,5 @@ class ChatReply(BaseModel):
     context: Optional[Context]
     group_responses: Dict[str, GroupSearchResponse]
     verified_response: bool
+    faq_fallback_used: bool = False
+    faq_sources: List[dict] = Field(default_factory=list)

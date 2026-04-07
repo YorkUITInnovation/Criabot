@@ -53,6 +53,9 @@ async def test_create_bot(criabot_instance):
     assert criabot_instance._criadex.group_auth.create.call_count == 2
     criabot_instance._mysql_api.bots.insert.assert_called_once()
     criabot_instance._mysql_api.bot_params.insert.assert_called_once()
+    for call in criabot_instance._criadex.manage.create.await_args_list:
+        payload = call.kwargs["group_config"]
+        assert payload["use_knowledge_graph"] is True
 
 @pytest.mark.asyncio
 async def test_create_bot_with_parents(criabot_instance):
@@ -232,3 +235,77 @@ async def test_table_creation_on_initialize(criabot_instance):
 
         assert mock_create_async_engine.call_count == 2
         mock_mysql_api.initialize.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_faq_site_uses_crawler_and_indexes(criabot_instance):
+    criabot_instance.sync_faq_group = AsyncMock(
+        return_value={
+            "group_name": "eclass-faq-bot-document-index",
+            "uploaded_files": ["faq-page-1", "faq-page-2"],
+            "graph_build_job": {"job_id": "job-1"},
+        }
+    )
+    fake_pages = [
+        {"url": "https://lthelp.yorku.ca/eclass", "title": "/", "text": "FAQ root"},
+        {"url": "https://lthelp.yorku.ca/page-1", "title": "/page-1", "text": "FAQ one"},
+    ]
+
+    with patch("criabot.criabot.FAQCrawler") as mock_crawler:
+        mock_crawler.return_value.crawl = AsyncMock(return_value=fake_pages)
+        result = await criabot_instance.sync_faq_site(max_pages=2)
+
+    assert result["pages_crawled"] == 2
+    criabot_instance.sync_faq_group.assert_awaited_once()
+    status = criabot_instance.get_faq_sync_status()
+    assert status["state"] == "READY"
+    assert status["indexed_files"] == 2
+
+
+def test_update_faq_sync_config(criabot_instance):
+    updated = criabot_instance.update_faq_sync_config(
+        source_url="https://lthelp.yorku.ca/eclass",
+        group_name="custom-faq-group",
+        max_pages=10,
+        timeout_seconds=15,
+    )
+    assert updated["source_url"] == "https://lthelp.yorku.ca/eclass"
+    assert updated["group_name"] == "custom-faq-group"
+    assert updated["max_pages"] == 10
+    assert updated["timeout_seconds"] == 15.0
+
+
+def test_gradebook_session_flow(criabot_instance):
+    start = criabot_instance.start_gradebook_session(
+        course_id="EECS-1234-F2026",
+        professor_id="prof_jsmith",
+        bot_name="eecs-1234-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+    )
+    assert start["session_id"].startswith("gb-")
+    assert start["phase"] == "ANALYSIS"
+
+    session_id = start["session_id"]
+    chat = criabot_instance.gradebook_chat(session_id=session_id, prompt="Please generate proposal")
+    assert chat["phase"] in {"PROPOSAL", "ANALYSIS", "REFINEMENT"}
+    proposal = criabot_instance.gradebook_proposal(session_id=session_id)
+    assert proposal["proposal"] is not None
+
+    accepted = criabot_instance.gradebook_accept(session_id=session_id)
+    assert accepted["phase"] == "ACCEPTED"
+    assert accepted["content_mapping"] is not None
+
+
+def test_gradebook_status_missing_session_raises(criabot_instance):
+    with pytest.raises(KeyError):
+        criabot_instance.gradebook_status(session_id="missing-session")
+
+
+@pytest.mark.asyncio
+async def test_sync_faq_site_invalid_url_marks_error_status(criabot_instance):
+    with pytest.raises(ValueError):
+        await criabot_instance.sync_faq_site(source_url="not-a-valid-url")
+    status = criabot_instance.get_faq_sync_status()
+    assert status["state"] == "ERROR"
+    assert status["error"] is not None

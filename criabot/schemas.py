@@ -33,6 +33,7 @@ class BotCreateConfig(BotParametersBaseConfig):
     llm_model_id: int
     embedding_model_id: int
     rerank_model_id: int
+    use_knowledge_graph: bool = True
     parent_bot_names: List[str] = Field(default_factory=list)
     parent_priorities: Optional[Dict[str, int]] = Field(default=None)
 

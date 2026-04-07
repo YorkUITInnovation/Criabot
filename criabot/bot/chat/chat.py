@@ -96,6 +96,9 @@ class Chat:
             metadata_filter=metadata_filter,
             extra_bots=extra_bots
         )
+        if response.faq_fallback_used:
+            self.chat_reply_metadata["faq_fallback_used"] = True
+            self.chat_reply_metadata["faq_sources"] = response.faq_sources
 
         # Add the user's prompt to the buffer
         self._buffer.add_message(
@@ -176,6 +179,8 @@ class Chat:
             token_usage=token_usage,
             search_units=response.search_units,
             verified_response=response.context.context_type == "QUESTION" if response.context else False,
+            faq_fallback_used=response.faq_fallback_used,
+            faq_sources=response.faq_sources,
             total_usage={
                 "completion_tokens": sum(usage.completion_tokens for usage in token_usage),
                 "prompt_tokens": sum(usage.prompt_tokens for usage in token_usage),

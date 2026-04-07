@@ -1,5 +1,7 @@
 import asyncio
+import os
 import secrets
+import time
 from typing import Optional, Dict, List
 
 from redis import asyncio as aioredis
@@ -30,6 +32,12 @@ from .bot.schemas import ChatNotFoundError
 from .database.bots.bots import BotDatabaseAPI
 from .database.bots.tables.bot_params import BotParametersModel, BotParametersConfig, BotParametersBaseConfig
 from .database.bots.tables.bots import BotsModel, BotsConfig
+from .faq.crawler import FAQCrawler
+from .faq.indexer import FAQDocument, FAQIndexer
+from .gradebook.analyzer import SyllabusAnalyzer
+from .gradebook.conversation import ConversationManager
+from .gradebook.schemas import CourseActivity, MoodleResource
+from .gradebook.session import GradebookSessionEngine
 from .schemas import InitializedAlreadyError
 
 import logging
@@ -68,7 +76,25 @@ class Criabot:
         self._redis_pool = None
         self._redis_api = None
 
+        # FAQ website sync runtime config/state
+        self._faq_sync_config: dict = {
+            "source_url": os.environ.get("FAQ_SOURCE_URL", "https://lthelp.yorku.ca/eclass"),
+            "group_name": os.environ.get("FAQ_GROUP_NAME", "eclass-faq-bot-document-index"),
+            "max_pages": int(os.environ.get("FAQ_SYNC_MAX_PAGES", "25")),
+            "timeout_seconds": float(os.environ.get("FAQ_SYNC_TIMEOUT_SECONDS", "20")),
+        }
+        self._faq_sync_status: dict = {
+            "last_run_at": None,
+            "last_success_at": None,
+            "state": "NOT_RUN",
+            "pages_crawled": 0,
+            "indexed_files": 0,
+            "error": None,
+        }
+
         self._already_initialized = False
+        self._gradebook = GradebookSessionEngine()
+        self._gradebook_conversation = ConversationManager()
 
     async def initialize(self) -> None:
         """
@@ -971,7 +997,8 @@ class Criabot:
                     "type": index_type,
                     "llm_model_id": bot_config.llm_model_id,
                     "embedding_model_id": bot_config.embedding_model_id,
-                    "rerank_model_id": bot_config.rerank_model_id
+                    "rerank_model_id": bot_config.rerank_model_id,
+                    "use_knowledge_graph": bot_config.use_knowledge_graph,
                 }
             )
             try:
@@ -1113,3 +1140,183 @@ class Criabot:
     @property
     def criadex(self) -> RAGFlowSDK:
         return self._criadex
+
+    async def analyze_syllabus_group(
+        self,
+        group_name: str,
+        prompt: str,
+        top_k: int = 8,
+        max_hops: int = 1,
+        max_expansion_terms: int = 8,
+    ) -> dict:
+        analyzer = SyllabusAnalyzer(criadex=self._criadex)
+        return await analyzer.analyze_group(
+            group_name=group_name,
+            prompt=prompt,
+            top_k=top_k,
+            max_hops=max_hops,
+            max_expansion_terms=max_expansion_terms,
+        )
+
+    async def sync_faq_group(
+        self,
+        group_name: str,
+        documents: List[FAQDocument],
+        trigger_graph_build: bool = True,
+    ) -> dict:
+        indexer = FAQIndexer(criadex=self._criadex)
+        return await indexer.sync_group(
+            group_name=group_name,
+            documents=documents,
+            trigger_graph_build=trigger_graph_build,
+        )
+
+    async def sync_faq_site(
+        self,
+        source_url: Optional[str] = None,
+        group_name: Optional[str] = None,
+        max_pages: Optional[int] = None,
+        trigger_graph_build: bool = True,
+    ) -> dict:
+        effective_source = source_url or self._faq_sync_config["source_url"]
+        effective_group = group_name or self._faq_sync_config["group_name"]
+        effective_max_pages = int(max_pages or self._faq_sync_config["max_pages"])
+        timeout_seconds = float(self._faq_sync_config["timeout_seconds"])
+
+        self._faq_sync_status.update(
+            {
+                "last_run_at": int(time.time()),
+                "state": "RUNNING",
+                "error": None,
+            }
+        )
+
+        try:
+            crawler = FAQCrawler(timeout_seconds=timeout_seconds)
+            pages = await crawler.crawl(source_url=effective_source, max_pages=effective_max_pages)
+            documents: List[FAQDocument] = [
+                FAQDocument(
+                    file_name=f"faq-page-{idx + 1}",
+                    file_contents={"nodes": [{"text": page["text"]}]},
+                    file_metadata={
+                        "source": "eclass_website",
+                        "url": page["url"],
+                        "title": page.get("title"),
+                    },
+                )
+                for idx, page in enumerate(pages)
+            ]
+
+            sync_result = await self.sync_faq_group(
+                group_name=effective_group,
+                documents=documents,
+                trigger_graph_build=trigger_graph_build,
+            )
+            self._faq_sync_status.update(
+                {
+                    "state": "READY",
+                    "pages_crawled": len(pages),
+                    "indexed_files": len(sync_result.get("uploaded_files", [])),
+                    "last_success_at": int(time.time()),
+                    "error": None,
+                }
+            )
+            return {
+                **sync_result,
+                "source_url": effective_source,
+                "pages_crawled": len(pages),
+            }
+        except Exception as ex:
+            self._faq_sync_status.update(
+                {
+                    "state": "ERROR",
+                    "error": str(ex),
+                }
+            )
+            raise
+
+    def get_faq_sync_status(self) -> dict:
+        return {
+            **self._faq_sync_status,
+            "config": self._faq_sync_config.copy(),
+        }
+
+    def update_faq_sync_config(
+        self,
+        source_url: Optional[str] = None,
+        group_name: Optional[str] = None,
+        max_pages: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> dict:
+        if source_url is not None:
+            self._faq_sync_config["source_url"] = source_url
+        if group_name is not None:
+            self._faq_sync_config["group_name"] = group_name
+        if max_pages is not None:
+            self._faq_sync_config["max_pages"] = int(max_pages)
+        if timeout_seconds is not None:
+            self._faq_sync_config["timeout_seconds"] = float(timeout_seconds)
+        return self._faq_sync_config.copy()
+
+    def start_gradebook_session(
+        self,
+        course_id: str,
+        professor_id: str,
+        bot_name: str,
+        moodle_resources: List[dict],
+        course_activities: List[dict],
+    ) -> dict:
+        resources = [MoodleResource(**resource) for resource in moodle_resources]
+        activities = [CourseActivity(**activity) for activity in course_activities]
+        session = self._gradebook.start(
+            course_id=course_id,
+            professor_id=professor_id,
+            bot_name=bot_name,
+            moodle_resources=resources,
+            course_activities=activities,
+        )
+        initial_message = (
+            "I've found syllabus-like content and started analysis."
+            if session.phase == "ANALYSIS"
+            else "I couldn't find a syllabus yet. Please provide syllabus details to continue."
+        )
+        return {
+            "session_id": session.session_id,
+            "phase": session.phase,
+            "initial_message": initial_message,
+        }
+
+    def gradebook_status(self, session_id: str) -> dict:
+        session = self._gradebook.get(session_id)
+        if session is None:
+            raise KeyError("gradebook session not found")
+        return session.model_dump()
+
+    def gradebook_chat(self, session_id: str, prompt: str) -> dict:
+        session = self._gradebook.chat(session_id=session_id, prompt=prompt)
+        reply_message = self._gradebook_conversation.make_reply(session=session, proposal=session.proposal)
+        return {
+            "session_id": session.session_id,
+            "phase": session.phase,
+            "reply": reply_message,
+            "proposal": session.proposal.model_dump() if session.proposal else None,
+        }
+
+    def gradebook_proposal(self, session_id: str) -> dict:
+        session = self._gradebook.get(session_id)
+        if session is None:
+            raise KeyError("gradebook session not found")
+        return {
+            "session_id": session.session_id,
+            "phase": session.phase,
+            "proposal": session.proposal.model_dump() if session.proposal else None,
+        }
+
+    def gradebook_accept(self, session_id: str) -> dict:
+        session = self._gradebook.accept(session_id=session_id)
+        return {
+            "session_id": session.session_id,
+            "phase": session.phase,
+            "proposal": session.proposal.model_dump() if session.proposal else None,
+            "content_mapping": session.content_mapping,
+        }

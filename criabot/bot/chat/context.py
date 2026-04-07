@@ -14,6 +14,7 @@ from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import History
 from criabot.bot.chat.schemas import RelatedPrompt, Context, QuestionContext, TextContext
 from criabot.database.bots.tables.bot_params import BotParametersModel
+from criabot.faq.fallback import FAQFallback
 
 GroupSearchResponses: Type = Dict[str, GroupSearchResponse]
 
@@ -23,6 +24,8 @@ class ContextRetrieverResponse(BaseModel):
     group_responses: dict = None
     token_usage: list = []
     search_units: int = 0
+    faq_fallback_used: bool = False
+    faq_sources: List[dict] = []
 
     @classmethod
     def get_search_units(cls, group_responses):
@@ -74,6 +77,8 @@ class ContextRetriever:
         self._bot_params = bot_params
         self._graph_enabled = os.getenv("GRAPH_RAG_CHAT_ENABLED", "true").lower() == "true"
         self._graph_auto_build = os.getenv("GRAPH_RAG_CHAT_AUTO_BUILD", "true").lower() == "true"
+        self._faq_fallback_enabled = os.getenv("FAQ_FALLBACK_ENABLED", "true").lower() == "true"
+        self._faq_fallback_threshold = float(os.getenv("FAQ_FALLBACK_THRESHOLD", "0.5"))
 
     @staticmethod
     def _looks_like_group_search_result(payload: object) -> bool:
@@ -289,7 +294,30 @@ class ContextRetriever:
         retriever_response.search_units = ContextRetrieverResponse.get_search_units(group_responses)
         retriever_response.group_responses = group_responses
         nodes = retriever_response.nodes
-        # If there are no nodes
+        faq_threshold = float(getattr(self._bot_params, "faq_fallback_threshold", self._faq_fallback_threshold))
+        faq_enabled = bool(getattr(self._bot_params, "faq_fallback_enabled", self._faq_fallback_enabled))
+
+        # If there are no nodes, or confidence is too low, try FAQ fallback first.
+        if faq_enabled and (len(nodes) < 1 or max((float(node.score or 0.0) for node in nodes), default=0.0) < faq_threshold):
+            try:
+                fallback = FAQFallback(criadex=self._criadex)
+                fallback_result = await fallback.search(prompt=prompt, top_k=max(3, self._bot_params.top_n))
+                fallback_response = fallback_result.get("response")
+                if isinstance(fallback_response, GroupSearchResponse) and fallback_response.nodes:
+                    retriever_response.group_responses[fallback_result["group_name"]] = fallback_response
+                    retriever_response.search_units = ContextRetrieverResponse.get_search_units(retriever_response.group_responses)
+                    retriever_response.faq_fallback_used = True
+                    retriever_response.faq_sources = fallback_result.get("sources", [])
+                    retriever_response.context = TextContext(
+                        text=build_text_context(nodes=fallback_response.nodes),
+                        nodes=fallback_response.nodes,
+                        related_prompts=[],
+                    )
+                    return retriever_response
+            except Exception:
+                pass
+
+        # If there are no nodes after fallback attempt, return no-context.
         if len(nodes) < 1:
             return retriever_response
         ranked_nodes = self.normalize_ranked_nodes(nodes)

@@ -56,6 +56,12 @@ REDIS_CREDENTIALS: RedisCredentials = RedisCredentials(
 # By default, only enable in test mode, as stacktraces can leak sensitive info
 CRIADEX_STACKTRACE: bool = os.environ.get("CRIADEX_STACKTRACE", APP_MODE == AppMode.TESTING)
 
+# FAQ Sync Config
+FAQ_SOURCE_URL: str = os.environ.get("FAQ_SOURCE_URL", "https://lthelp.yorku.ca/eclass")
+FAQ_GROUP_NAME: str = os.environ.get("FAQ_GROUP_NAME", "eclass-faq-bot-document-index")
+FAQ_SYNC_MAX_PAGES: int = int(os.environ.get("FAQ_SYNC_MAX_PAGES", "25"))
+FAQ_SYNC_TIMEOUT_SECONDS: float = float(os.environ.get("FAQ_SYNC_TIMEOUT_SECONDS", "20"))
+
 # Set the Tiktoken cache directory
 os.environ["TIKTOKEN_CACHE_DIR"] = os.environ.get(
     "TIKTOKEN_CACHE_DIR",

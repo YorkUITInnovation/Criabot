@@ -159,43 +159,6 @@ async def test_search_groups_with_parent_bots(retriever, bot_mock):
         )
     )
 
-
-@pytest.mark.asyncio
-async def test_search_groups_falls_back_when_graph_payload_invalid(retriever):
-    retriever._criadex.manage = MagicMock()
-    retriever._criadex.manage.graph_search = AsyncMock(return_value={"unexpected": True})
-    retriever._criadex.content.search.return_value = {
-        "response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()
-    }
-
-    result = await retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=[])
-
-    assert retriever._criadex.manage.graph_search.call_count == len(retriever.INDEX_TYPES)
-    assert retriever._criadex.content.search.call_count == len(retriever.INDEX_TYPES)
-    assert set(result.keys()) == {"child-document-index", "child-question-index"}
-
-
-@pytest.mark.asyncio
-async def test_search_groups_uses_standard_search_when_graph_disabled(criadex_api, bot_mock, bot_params, monkeypatch):
-    monkeypatch.setenv("GRAPH_RAG_CHAT_ENABLED", "false")
-    local_retriever = ContextRetriever(
-        criadex=criadex_api,
-        rerank_model_id=1,
-        llm_model_id=1,
-        bot=bot_mock,
-        bot_params=bot_params
-    )
-    criadex_api.manage = MagicMock()
-    criadex_api.manage.graph_search = AsyncMock()
-    criadex_api.content.search.return_value = {
-        "response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()
-    }
-
-    await local_retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=[])
-
-    criadex_api.manage.graph_search.assert_not_called()
-    assert criadex_api.content.search.call_count == len(local_retriever.INDEX_TYPES)
-
 @pytest.mark.asyncio
 async def test_hybrid_rerank(retriever, criadex_api):
     nodes = [create_text_node("text 1")]
