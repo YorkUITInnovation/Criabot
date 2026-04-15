@@ -257,6 +257,9 @@ async def test_sync_faq_site_uses_crawler_and_indexes(criabot_instance):
 
     assert result["pages_crawled"] == 2
     criabot_instance.sync_faq_group.assert_awaited_once()
+    sync_args = criabot_instance.sync_faq_group.call_args[1]
+    assert sync_args["documents"][0].file_contents["nodes"][0]["type"] == "UncategorizedText"
+    assert sync_args["documents"][0].file_contents["nodes"][0]["metadata"] == {}
     status = criabot_instance.get_faq_sync_status()
     assert status["state"] == "READY"
     assert status["indexed_files"] == 2
@@ -275,8 +278,9 @@ def test_update_faq_sync_config(criabot_instance):
     assert updated["timeout_seconds"] == 15.0
 
 
-def test_gradebook_session_flow(criabot_instance):
-    start = criabot_instance.start_gradebook_session(
+@pytest.mark.asyncio
+async def test_gradebook_session_flow(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
         course_id="EECS-1234-F2026",
         professor_id="prof_jsmith",
         bot_name="eecs-1234-bot",
@@ -287,19 +291,20 @@ def test_gradebook_session_flow(criabot_instance):
     assert start["phase"] == "ANALYSIS"
 
     session_id = start["session_id"]
-    chat = criabot_instance.gradebook_chat(session_id=session_id, prompt="Please generate proposal")
+    chat = await criabot_instance.gradebook_chat(session_id=session_id, prompt="Please generate proposal")
     assert chat["phase"] in {"PROPOSAL", "ANALYSIS", "REFINEMENT"}
-    proposal = criabot_instance.gradebook_proposal(session_id=session_id)
+    proposal = await criabot_instance.gradebook_proposal(session_id=session_id)
     assert proposal["proposal"] is not None
 
-    accepted = criabot_instance.gradebook_accept(session_id=session_id)
+    accepted = await criabot_instance.gradebook_accept(session_id=session_id)
     assert accepted["phase"] == "ACCEPTED"
     assert accepted["content_mapping"] is not None
 
 
-def test_gradebook_status_missing_session_raises(criabot_instance):
+@pytest.mark.asyncio
+async def test_gradebook_status_missing_session_raises(criabot_instance):
     with pytest.raises(KeyError):
-        criabot_instance.gradebook_status(session_id="missing-session")
+        await criabot_instance.gradebook_status(session_id="missing-session")
 
 
 @pytest.mark.asyncio

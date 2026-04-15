@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from criabot.gradebook.analyzer import SyllabusAnalyzer
+from criabot.gradebook.proposal import ProposalGenerator
 from criabot.gradebook.schemas import CourseActivity, MoodleResource
 from criabot.gradebook.session import GradebookSessionEngine
 
@@ -46,9 +47,10 @@ async def test_syllabus_analyzer_falls_back_to_standard_search():
     sdk.content.search.assert_called_once()
 
 
-def test_gradebook_session_starts_in_intake_without_syllabus():
+@pytest.mark.asyncio
+async def test_gradebook_session_starts_in_intake_without_syllabus():
     engine = GradebookSessionEngine()
-    session = engine.start(
+    session = await engine.start(
         course_id="EECS-1000",
         professor_id="prof_a",
         bot_name="eecs-bot",
@@ -59,22 +61,69 @@ def test_gradebook_session_starts_in_intake_without_syllabus():
     assert session.proposal is None
 
 
-def test_gradebook_accept_adds_content_mapping():
+@pytest.mark.asyncio
+async def test_gradebook_accept_adds_content_mapping():
     engine = GradebookSessionEngine()
-    session = engine.start(
+    session = await engine.start(
         course_id="EECS-1000",
         professor_id="prof_a",
         bot_name="eecs-bot",
         moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
         course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
     )
-    accepted = engine.accept(session.session_id)
+    accepted = await engine.accept(session.session_id)
     assert accepted.phase == "ACCEPTED"
     assert accepted.content_mapping is not None
     assert accepted.content_mapping["graded_activities"][0]["moodle_cmid"] == 10
 
 
-def test_gradebook_chat_unknown_session_raises_key_error():
+@pytest.mark.asyncio
+async def test_gradebook_proposal_updates_weights_and_splits():
+    generator = ProposalGenerator()
+    base_proposal = generator.generate_initial([
+        CourseActivity(name="Homework 1", module="assign"),
+        CourseActivity(name="Lab 1", module="lab"),
+    ])
+
+    updated = generator.update_from_prompt(
+        base_proposal,
+        "Set Assignments to 40%, Labs to 10%, split assignments into Homework, Projects",
+    )
+
+    normalized = {cat.name: cat for cat in updated.categories}
+    assert "Assignments" not in normalized
+    assert normalized["Labs"].weight == 10.0
+    assert normalized["Homework"].weight == 20.0
+    assert normalized["Projects"].weight == 20.0
+    assert normalized["Homework"].items or normalized["Projects"].items
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_updates_proposal_from_prompt():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_b",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%")],
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign"),
+            CourseActivity(name="Lab 1", module="lab"),
+        ],
+    )
+    assert session.phase == "ANALYSIS"
+    assert session.proposal is not None
+
+    chat = await engine.chat(session.session_id, "Please make Assignments 40% and split assignments into Homework, Projects")
+    assert chat.proposal is not None
+    names = [cat.name for cat in chat.proposal.categories]
+    assert "Homework" in names
+    assert "Projects" in names
+    assert any(cat.weight == 40.0 for cat in chat.proposal.categories)
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_unknown_session_raises_key_error():
     engine = GradebookSessionEngine()
     with pytest.raises(KeyError):
-        engine.chat("missing-session", "hello")
+        await engine.chat("missing-session", "hello")

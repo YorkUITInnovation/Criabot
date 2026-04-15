@@ -202,7 +202,7 @@ async def test_faq_indexer_sync_triggers_graph_build():
     sdk.manage.build_graph = AsyncMock(return_value={"job_id": "job-1", "state": "QUEUED"})
 
     indexer = FAQIndexer(criadex=sdk)
-    docs = [FAQDocument(file_name="faq-1", file_contents={"nodes": [{"text": "FAQ answer"}]}, file_metadata={"source": "faq"})]
+    docs = [FAQDocument(file_name="faq-1", file_contents={"nodes": [{"text": "FAQ answer", "type": "UncategorizedText", "metadata": {}}]}, file_metadata={"source": "faq"})]
     result = await indexer.sync_group(group_name="eclass-faq-bot-document-index", documents=docs)
 
     assert result["uploaded_files"] == ["faq-1"]
@@ -220,11 +220,34 @@ async def test_faq_indexer_sync_can_skip_graph_build():
     sdk.manage.build_graph = AsyncMock()
 
     indexer = FAQIndexer(criadex=sdk)
-    docs = [FAQDocument(file_name="faq-1", file_contents={"nodes": [{"text": "FAQ answer"}]}, file_metadata={"source": "faq"})]
+    docs = [FAQDocument(file_name="faq-1", file_contents={"nodes": [{"text": "FAQ answer", "type": "UncategorizedText", "metadata": {}}]}, file_metadata={"source": "faq"})]
     result = await indexer.sync_group(group_name="eclass-faq-bot-document-index", documents=docs, trigger_graph_build=False)
 
     assert result["graph_build_job"] is None
     sdk.manage.build_graph.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_faq_indexer_sync_treats_duplicate_upload_as_non_fatal():
+    class DuplicateUploadError(Exception):
+        def __init__(self):
+            self.status_code = 409
+            self.message = '{"code":"DUPLICATE","message":"Requested content already exists in the database."}'
+            super().__init__(self.message)
+
+    sdk = MagicMock()
+    sdk.content = MagicMock()
+    sdk.manage = MagicMock()
+    sdk.content.upload = AsyncMock(side_effect=DuplicateUploadError())
+    sdk.manage.build_graph = AsyncMock(return_value={"job_id": "job-dup", "state": "QUEUED"})
+
+    indexer = FAQIndexer(criadex=sdk)
+    docs = [FAQDocument(file_name="faq-dup", file_contents={"nodes": [{"text": "FAQ duplicate", "type": "UncategorizedText", "metadata": {}}]}, file_metadata={"source": "faq"})]
+    result = await indexer.sync_group(group_name="eclass-faq-bot-document-index", documents=docs, trigger_graph_build=True)
+
+    assert result["uploaded_files"] == []
+    assert result["duplicate_files"] == ["faq-dup"]
+    assert result["graph_build_job"]["job_id"] == "job-dup"
 
 
 @pytest.mark.asyncio

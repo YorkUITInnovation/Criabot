@@ -30,6 +30,7 @@ from criabot.schemas import (
 from criabot.bot.inheritance import check_circular_dependency, merge_configurations
 from .bot.schemas import ChatNotFoundError
 from .database.bots.bots import BotDatabaseAPI
+from .database.gradebook.gradebook_db import GradebookDatabaseAPI
 from .database.bots.tables.bot_params import BotParametersModel, BotParametersConfig, BotParametersBaseConfig
 from .database.bots.tables.bots import BotsModel, BotsConfig
 from .faq.crawler import FAQCrawler
@@ -67,14 +68,19 @@ class Criabot:
             api_base=self._criadex_credentials.api_base,
             error_stacktrace=criadex_stacktrace
         )
+        self._gradebook_analyzer: SyllabusAnalyzer = SyllabusAnalyzer(self._criadex)
 
         # Database
         self._mysql_engine = None
         self._mysql_api = None
+        self._gradebook_api = None
 
         # Cache
         self._redis_pool = None
         self._redis_api = None
+
+        # Gradebook runtime objects
+        self._gradebook = None
 
         # FAQ website sync runtime config/state
         self._faq_sync_config: dict = {
@@ -83,6 +89,7 @@ class Criabot:
             "max_pages": int(os.environ.get("FAQ_SYNC_MAX_PAGES", "25")),
             "timeout_seconds": float(os.environ.get("FAQ_SYNC_TIMEOUT_SECONDS", "20")),
         }
+        self._gradebook_syllabus_group_name: Optional[str] = os.environ.get("GRADEBOOK_SYLLABUS_GROUP_NAME")
         self._faq_sync_status: dict = {
             "last_run_at": None,
             "last_success_at": None,
@@ -126,9 +133,19 @@ class Criabot:
         self._mysql_api: BotDatabaseAPI = BotDatabaseAPI(engine=self._mysql_engine)
         await self._mysql_api.initialize()
 
+        # Gradebook DB API Startup
+        self._gradebook_api: GradebookDatabaseAPI = GradebookDatabaseAPI(engine=self._mysql_engine)
+        await self._gradebook_api.initialize()
+
         # Redis API Startup
         from .cache.api import BotCacheAPI
         self._redis_api = BotCacheAPI(pool=self._redis_pool)
+
+        # Initialize gradebook engine with database + cache
+        self._gradebook = GradebookSessionEngine(
+            gradebook_db=self._gradebook_api,
+            gradebook_cache=self._redis_api.gradebooks,
+        )
 
     async def _create_mysql_engine(self) -> AsyncEngine:
         """
@@ -1134,6 +1151,10 @@ class Criabot:
         return self._mysql_api
 
     @property
+    def gradebook_api(self) -> GradebookDatabaseAPI:
+        return self._gradebook_api
+
+    @property
     def redis_api(self) -> "BotCacheAPI":
         return self._redis_api
 
@@ -1197,7 +1218,15 @@ class Criabot:
             documents: List[FAQDocument] = [
                 FAQDocument(
                     file_name=f"faq-page-{idx + 1}",
-                    file_contents={"nodes": [{"text": page["text"]}]},
+                    file_contents={
+                        "nodes": [
+                            {
+                                "text": page["text"],
+                                "type": "UncategorizedText",
+                                "metadata": {},
+                            }
+                        ]
+                    },
                     file_metadata={
                         "source": "eclass_website",
                         "url": page["url"],
@@ -1258,7 +1287,7 @@ class Criabot:
             self._faq_sync_config["timeout_seconds"] = float(timeout_seconds)
         return self._faq_sync_config.copy()
 
-    def start_gradebook_session(
+    async def start_gradebook_session(
         self,
         course_id: str,
         professor_id: str,
@@ -1268,32 +1297,47 @@ class Criabot:
     ) -> dict:
         resources = [MoodleResource(**resource) for resource in moodle_resources]
         activities = [CourseActivity(**activity) for activity in course_activities]
-        session = self._gradebook.start(
+        session = await self._gradebook.start(
             course_id=course_id,
             professor_id=professor_id,
             bot_name=bot_name,
             moodle_resources=resources,
             course_activities=activities,
         )
+
         initial_message = (
             "I've found syllabus-like content and started analysis."
             if session.phase == "ANALYSIS"
             else "I couldn't find a syllabus yet. Please provide syllabus details to continue."
         )
+
+        if session.phase == "ANALYSIS" and self._gradebook_syllabus_group_name:
+            try:
+                extraction = await self._gradebook_analyzer.extract_assessment_structure(
+                    group_name=self._gradebook_syllabus_group_name
+                )
+                session.extraction = extraction
+                await self._gradebook_api.sessions.update_session(
+                    session_id=session.session_id,
+                    updates={"extraction_json": extraction}
+                )
+            except Exception:
+                logger.warning("Gradebook syllabus extraction failed; continuing without structured analysis.")
+
         return {
             "session_id": session.session_id,
             "phase": session.phase,
             "initial_message": initial_message,
         }
 
-    def gradebook_status(self, session_id: str) -> dict:
-        session = self._gradebook.get(session_id)
+    async def gradebook_status(self, session_id: str) -> dict:
+        session = await self._gradebook.get(session_id)
         if session is None:
             raise KeyError("gradebook session not found")
         return session.model_dump()
 
-    def gradebook_chat(self, session_id: str, prompt: str) -> dict:
-        session = self._gradebook.chat(session_id=session_id, prompt=prompt)
+    async def gradebook_chat(self, session_id: str, prompt: str) -> dict:
+        session = await self._gradebook.chat(session_id=session_id, prompt=prompt)
         reply_message = self._gradebook_conversation.make_reply(session=session, proposal=session.proposal)
         return {
             "session_id": session.session_id,
@@ -1302,8 +1346,8 @@ class Criabot:
             "proposal": session.proposal.model_dump() if session.proposal else None,
         }
 
-    def gradebook_proposal(self, session_id: str) -> dict:
-        session = self._gradebook.get(session_id)
+    async def gradebook_proposal(self, session_id: str) -> dict:
+        session = await self._gradebook.get(session_id)
         if session is None:
             raise KeyError("gradebook session not found")
         return {
@@ -1312,8 +1356,8 @@ class Criabot:
             "proposal": session.proposal.model_dump() if session.proposal else None,
         }
 
-    def gradebook_accept(self, session_id: str) -> dict:
-        session = self._gradebook.accept(session_id=session_id)
+    async def gradebook_accept(self, session_id: str) -> dict:
+        session = await self._gradebook.accept(session_id=session_id)
         return {
             "session_id": session.session_id,
             "phase": session.phase,

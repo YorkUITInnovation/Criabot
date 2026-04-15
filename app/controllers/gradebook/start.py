@@ -37,7 +37,7 @@ class StartGradebookRoute(CriaRoute):
     )
     @catch_exceptions(ResponseModel)
     async def execute(self, request: Request, config: StartGradebookConfig) -> StartGradebookResponse:
-        result = request.app.criabot.start_gradebook_session(
+        result = await request.app.criabot.start_gradebook_session(
             course_id=config.course_id,
             professor_id=config.professor_id,
             bot_name=config.bot_name,
