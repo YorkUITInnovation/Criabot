@@ -42,3 +42,4 @@ class GradebookSessionRecord(BaseModel):
     extraction: Optional[dict] = None
     proposal: Optional[GradebookProposal] = None
     content_mapping: Optional[dict] = None
+    last_touched_at: Optional[int] = None

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import os
+import time
 import uuid
 from typing import Dict, List, TYPE_CHECKING
 
 from .conversation import ConversationManager
+from .content_mapper import ContentMapper
 from .proposal import ProposalGenerator
 from .schemas import CourseActivity, GradebookSessionRecord, MoodleResource
+from criabot.cache.objects.gradebooks import _parse_time_to_seconds
 
 if TYPE_CHECKING:
     from criabot.database.gradebook.gradebook_db import GradebookDatabaseAPI
@@ -16,7 +20,11 @@ class GradebookSessionEngine:
         self._gradebook_db = gradebook_db
         self._gradebook_cache = gradebook_cache
         self._proposal_generator = ProposalGenerator()
+        self._content_mapper = ContentMapper()
         self._conversation = ConversationManager()
+        self._session_expire_seconds = _parse_time_to_seconds(
+            os.environ.get("GRADEBOOK_SESSION_EXPIRE_TIME", "4h")
+        )
         # Keep in-memory cache for active sessions
         self._active_sessions: Dict[str, GradebookSessionRecord] = {}
 
@@ -30,6 +38,7 @@ class GradebookSessionEngine:
         return False
 
     async def _save_session(self, session: GradebookSessionRecord) -> None:
+        session.last_touched_at = int(time.time())
         if self._gradebook_db:
             from criabot.database.gradebook.tables.gradebook_sessions import GradebookSessionsConfig
 
@@ -69,6 +78,7 @@ class GradebookSessionEngine:
                     proposal=session.proposal.model_dump() if session.proposal else None,
                     extraction=session.extraction,
                     content_mapping=session.content_mapping,
+                    last_touched_at=session.last_touched_at,
                 )
             )
 
@@ -100,6 +110,7 @@ class GradebookSessionEngine:
             extraction=session_model.extraction_json,
             proposal=proposal,
             content_mapping=session_model.metadata_json,
+            last_touched_at=int(session_model.updated_at.timestamp()),
         )
         self._active_sessions[session_id] = record
         if self._gradebook_cache:
@@ -135,9 +146,17 @@ class GradebookSessionEngine:
             extraction=session_model.extraction,
             proposal=proposal,
             content_mapping=session_model.content_mapping,
+            last_touched_at=session_model.last_touched_at,
         )
         self._active_sessions[session_id] = record
         return record
+
+    def _is_expired(self, session: GradebookSessionRecord | None) -> bool:
+        if session is None or session.phase == "COMPLETED":
+            return False
+        if session.last_touched_at is None:
+            return False
+        return int(time.time()) - int(session.last_touched_at) > self._session_expire_seconds
 
     async def start(
         self,
@@ -159,6 +178,7 @@ class GradebookSessionEngine:
             moodle_resources=moodle_resources,
             course_activities=course_activities,
             proposal=proposal,
+            last_touched_at=int(time.time()),
         )
         self._active_sessions[session_id] = record
         await self._save_session(record)
@@ -166,11 +186,28 @@ class GradebookSessionEngine:
 
     async def get(self, session_id: str) -> GradebookSessionRecord | None:
         if session_id in self._active_sessions:
-            return self._active_sessions[session_id]
+            session = self._active_sessions[session_id]
+            if self._is_expired(session):
+                self._active_sessions.pop(session_id, None)
+                if self._gradebook_cache:
+                    await self._gradebook_cache.delete(session_id)
+                return None
+            return session
         session = await self._load_session_from_cache(session_id)
         if session:
+            if self._is_expired(session):
+                self._active_sessions.pop(session_id, None)
+                if self._gradebook_cache:
+                    await self._gradebook_cache.delete(session_id)
+                return None
             return session
-        return await self._load_session_from_db(session_id)
+        session = await self._load_session_from_db(session_id)
+        if self._is_expired(session):
+            self._active_sessions.pop(session_id, None)
+            if self._gradebook_cache:
+                await self._gradebook_cache.delete(session_id)
+            return None
+        return session
 
     async def chat(self, session_id: str, prompt: str) -> GradebookSessionRecord:
         session = self._active_sessions.get(session_id) or await self.get(session_id)
@@ -192,22 +229,14 @@ class GradebookSessionEngine:
         if session is None:
             raise KeyError("gradebook session not found")
 
+        if session.phase in {"ACCEPTED", "COMPLETED"} and session.content_mapping is not None:
+            return session
+
         session.phase = "ACCEPTED"
-        session.content_mapping = {
-            "graded_activities": [
-                {
-                    "moodle_cmid": activity.cmid,
-                    "module_type": activity.module,
-                    "activity_name": activity.name,
-                    "suggested_category": "Assignments",
-                    "confidence": 0.7,
-                    "reasoning": "Baseline mapping; refine during plugin-side review.",
-                }
-                for activity in session.course_activities
-            ],
-            "unmatched_activities": [],
-            "resource_suggestions": [],
-        }
+        session.content_mapping = self._content_mapper.build_mapping(
+            course_activities=session.course_activities,
+            proposal=session.proposal,
+        )
 
         await self._save_session(session)
 
@@ -215,13 +244,81 @@ class GradebookSessionEngine:
             from criabot.database.gradebook.tables.gradebook_results import GradebookResultsConfig
             session_db = await self._gradebook_db.sessions.retrieve(session.session_id)
             if session_db:
-                result_config = GradebookResultsConfig(
-                    session_id=session_db.id,
-                    course_id=session.course_id,
-                    professor_id=session.professor_id,
-                    gradebook_json=session.proposal.model_dump() if session.proposal else {},
-                    content_mapping_json=session.content_mapping
-                )
-                await self._gradebook_db.results.insert(result_config)
+                existing_result = await self._gradebook_db.results.retrieve_by_session(session_db.id)
+                if existing_result is None:
+                    result_config = GradebookResultsConfig(
+                        session_id=session_db.id,
+                        course_id=session.course_id,
+                        professor_id=session.professor_id,
+                        gradebook_json=session.proposal.model_dump() if session.proposal else {},
+                        content_mapping_json=session.content_mapping
+                    )
+                    await self._gradebook_db.results.insert(result_config)
+                else:
+                    await self._gradebook_db.results.update_by_session(
+                        session_id=session_db.id,
+                        updates={
+                            "gradebook_json": session.proposal.model_dump() if session.proposal else {},
+                            "content_mapping_json": session.content_mapping,
+                        }
+                    )
+
+        return session
+
+    async def finalize(
+        self,
+        session_id: str,
+        confirmed_mapping: List[dict],
+    ) -> GradebookSessionRecord:
+        session = self._active_sessions.get(session_id) or await self.get(session_id)
+        if session is None:
+            raise KeyError("gradebook session not found")
+
+        if session.content_mapping is None:
+            session = await self.accept(session_id)
+
+        graded_activities = list((session.content_mapping or {}).get("graded_activities", []))
+        activity_by_cmid = {
+            item.get("moodle_cmid"): item
+            for item in graded_activities
+            if item.get("moodle_cmid") is not None
+        }
+
+        for confirmed in confirmed_mapping:
+            existing = activity_by_cmid.get(confirmed.get("moodle_cmid"))
+            if existing is None:
+                continue
+            existing["suggested_category"] = confirmed.get("category")
+            existing["confirmed_category"] = confirmed.get("category")
+            existing["finalized"] = True
+
+        session.phase = "COMPLETED"
+        await self._save_session(session)
+
+        if self._gradebook_db:
+            from criabot.database.gradebook.tables.gradebook_results import GradebookResultsConfig
+
+            session_db = await self._gradebook_db.sessions.retrieve(session.session_id)
+            if session_db:
+                existing_result = await self._gradebook_db.results.retrieve_by_session(session_db.id)
+                if existing_result is None:
+                    await self._gradebook_db.results.insert(
+                        GradebookResultsConfig(
+                            session_id=session_db.id,
+                            course_id=session.course_id,
+                            professor_id=session.professor_id,
+                            gradebook_json=session.proposal.model_dump() if session.proposal else {},
+                            content_mapping_json=session.content_mapping,
+                        )
+                    )
+                    existing_result = await self._gradebook_db.results.retrieve_by_session(session_db.id)
+                else:
+                    await self._gradebook_db.results.update_by_session(
+                        session_id=session_db.id,
+                        updates={"content_mapping_json": session.content_mapping},
+                    )
+
+                if existing_result and not existing_result.pushed_to_moodle:
+                    await self._gradebook_db.results.mark_pushed_to_moodle(existing_result.id)
 
         return session

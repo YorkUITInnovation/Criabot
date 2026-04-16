@@ -194,6 +194,22 @@ async def test_faq_fallback_falls_back_to_content_search():
 
 
 @pytest.mark.asyncio
+async def test_faq_fallback_caches_repeated_queries():
+    sdk = MagicMock()
+    sdk.manage = MagicMock()
+    sdk.content = MagicMock()
+    sdk.manage.graph_search = AsyncMock(return_value={"response": {"nodes": [], "assets": [], "search_units": 1, "metadata": {}}})
+
+    fallback = FAQFallback(criadex=sdk)
+    fallback._cache.clear()
+
+    await fallback.search(prompt="cache me")
+    await fallback.search(prompt="cache me")
+
+    sdk.manage.graph_search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_faq_indexer_sync_triggers_graph_build():
     sdk = MagicMock()
     sdk.content = MagicMock()

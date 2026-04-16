@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from typing import Any, Dict, List
 
 
@@ -9,8 +11,12 @@ class SyllabusAnalyzer:
     Graph-aware syllabus retrieval utility for Gradebook generation flows.
     """
 
+    _analysis_cache: Dict[str, tuple[int, Dict[str, Any]]] = {}
+    _extraction_cache: Dict[str, tuple[int, Dict[str, Any]]] = {}
+
     def __init__(self, criadex) -> None:
         self._criadex = criadex
+        self._cache_ttl_seconds = int(os.environ.get("GRADEBOOK_SYLLABUS_CACHE_SECONDS", "900"))
 
     async def analyze_group(
         self,
@@ -20,6 +26,19 @@ class SyllabusAnalyzer:
         max_hops: int = 1,
         max_expansion_terms: int = 8,
     ) -> Dict[str, Any]:
+        cache_key = ":".join(
+            [
+                group_name,
+                prompt.strip().lower(),
+                str(top_k),
+                str(max_hops),
+                str(max_expansion_terms),
+            ]
+        )
+        cached = self._analysis_cache.get(cache_key)
+        if cached and cached[0] > int(time.time()):
+            return cached[1]
+
         search_config: dict = {
             "query": prompt,
             "top_k": top_k,
@@ -42,27 +61,35 @@ class SyllabusAnalyzer:
                 response = result.get("response", result)
             else:
                 response = result
-            return {
+            response_payload = {
                 "response": response,
                 "graph_metadata": metadata or {"source": "ragflow"},
             }
+            self._analysis_cache[cache_key] = (int(time.time()) + self._cache_ttl_seconds, response_payload)
+            return response_payload
         except Exception:
             response = await self._criadex.content.search(
                 group_name=group_name,
                 search_config=search_config,
             )
-            return {
+            response_payload = {
                 "response": response.get("response", response) if isinstance(response, dict) else response,
                 "graph_metadata": {
                     "source": "fallback",
                     "fallback_reason": "graph_search_unavailable",
                 },
             }
+            self._analysis_cache[cache_key] = (int(time.time()) + self._cache_ttl_seconds, response_payload)
+            return response_payload
 
     async def extract_assessment_structure(self, group_name: str) -> Dict[str, Any]:
         """
         Extract structured assessment information from syllabus using multiple queries.
         """
+        cached = self._extraction_cache.get(group_name)
+        if cached and cached[0] > int(time.time()):
+            return cached[1]
+
         queries = {
             "assessment_types": "What assessment types are mentioned? (exams, assignments, quizzes, projects, labs, participation)",
             "weight_distribution": "What are the grade weight percentages for each assessment type?",
@@ -84,10 +111,12 @@ class SyllabusAnalyzer:
             except Exception as e:
                 results[key] = {"error": str(e), "graph_metadata": {"source": "error"}}
 
-        return {
+        response_payload = {
             "extraction_results": results,
             "summary": self._summarize_extraction(results)
         }
+        self._extraction_cache[group_name] = (int(time.time()) + self._cache_ttl_seconds, response_payload)
+        return response_payload
 
     def _summarize_extraction(self, results: Dict[str, Any]) -> Dict[str, Any]:
         """

@@ -2,6 +2,7 @@ import asyncio
 import os
 import secrets
 import time
+from datetime import datetime, timezone
 from typing import Optional, Dict, List
 
 from redis import asyncio as aioredis
@@ -30,9 +31,11 @@ from criabot.schemas import (
 from criabot.bot.inheritance import check_circular_dependency, merge_configurations
 from .bot.schemas import ChatNotFoundError
 from .database.bots.bots import BotDatabaseAPI
+from .database.faq.faq_db import FAQDatabaseAPI
 from .database.gradebook.gradebook_db import GradebookDatabaseAPI
 from .database.bots.tables.bot_params import BotParametersModel, BotParametersConfig, BotParametersBaseConfig
 from .database.bots.tables.bots import BotsModel, BotsConfig
+from .migrations.runner import MigrationRunner
 from .faq.crawler import FAQCrawler
 from .faq.indexer import FAQDocument, FAQIndexer
 from .gradebook.analyzer import SyllabusAnalyzer
@@ -73,6 +76,7 @@ class Criabot:
         # Database
         self._mysql_engine = None
         self._mysql_api = None
+        self._faq_api = None
         self._gradebook_api = None
 
         # Cache
@@ -88,6 +92,10 @@ class Criabot:
             "group_name": os.environ.get("FAQ_GROUP_NAME", "eclass-faq-bot-document-index"),
             "max_pages": int(os.environ.get("FAQ_SYNC_MAX_PAGES", "25")),
             "timeout_seconds": float(os.environ.get("FAQ_SYNC_TIMEOUT_SECONDS", "20")),
+            "enabled": os.environ.get("FAQ_SYNC_ENABLED", "false").lower() == "true",
+            "interval_seconds": int(os.environ.get("FAQ_SYNC_INTERVAL_SECONDS", "21600")),
+            "stale_after_seconds": int(os.environ.get("FAQ_STALE_AFTER_SECONDS", "43200")),
+            "failure_alert_threshold": int(os.environ.get("FAQ_ALERT_FAILURE_THRESHOLD", "3")),
         }
         self._gradebook_syllabus_group_name: Optional[str] = os.environ.get("GRADEBOOK_SYLLABUS_GROUP_NAME")
         self._faq_sync_status: dict = {
@@ -96,8 +104,16 @@ class Criabot:
             "state": "NOT_RUN",
             "pages_crawled": 0,
             "indexed_files": 0,
+            "duplicate_files": 0,
             "error": None,
+            "consecutive_failures": 0,
+            "alert_state": "IDLE",
+            "scheduler_running": False,
+            "last_graph_build_job": None,
+            "recent_runs": [],
         }
+        self._faq_sync_lock = asyncio.Lock()
+        self._faq_sync_task: Optional[asyncio.Task] = None
 
         self._already_initialized = False
         self._gradebook = GradebookSessionEngine()
@@ -120,6 +136,7 @@ class Criabot:
 
         # SQL DB Startup
         self._mysql_engine: AsyncEngine = await self._create_mysql_engine()
+        await MigrationRunner(self._mysql_engine).run_pending()
 
         # Redis DB Startup
         self._redis_pool: ConnectionPool = aioredis.ConnectionPool(
@@ -136,6 +153,11 @@ class Criabot:
         # Gradebook DB API Startup
         self._gradebook_api: GradebookDatabaseAPI = GradebookDatabaseAPI(engine=self._mysql_engine)
         await self._gradebook_api.initialize()
+
+        # FAQ DB API Startup
+        self._faq_api: FAQDatabaseAPI = FAQDatabaseAPI(engine=self._mysql_engine)
+        await self._faq_api.initialize()
+        await self._refresh_faq_sync_status_from_db()
 
         # Redis API Startup
         from .cache.api import BotCacheAPI
@@ -580,6 +602,8 @@ class Criabot:
                 no_context_llm_guess=params_model.no_context_llm_guess,
                 # system_message: child override if present, otherwise inherit from merged parents
                 system_message=params_model.system_message or merged_parents.system_message,
+                faq_fallback_enabled=params_model.faq_fallback_enabled,
+                faq_fallback_threshold=params_model.faq_fallback_threshold,
             )
         else:
             effective_config = params_model
@@ -1155,6 +1179,10 @@ class Criabot:
         return self._gradebook_api
 
     @property
+    def faq_api(self) -> FAQDatabaseAPI:
+        return self._faq_api
+
+    @property
     def redis_api(self) -> "BotCacheAPI":
         return self._redis_api
 
@@ -1203,70 +1231,107 @@ class Criabot:
         effective_group = group_name or self._faq_sync_config["group_name"]
         effective_max_pages = int(max_pages or self._faq_sync_config["max_pages"])
         timeout_seconds = float(self._faq_sync_config["timeout_seconds"])
+        run_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        run_started_ts = int(time.time())
 
-        self._faq_sync_status.update(
-            {
-                "last_run_at": int(time.time()),
-                "state": "RUNNING",
-                "error": None,
-            }
-        )
-
-        try:
-            crawler = FAQCrawler(timeout_seconds=timeout_seconds)
-            pages = await crawler.crawl(source_url=effective_source, max_pages=effective_max_pages)
-            documents: List[FAQDocument] = [
-                FAQDocument(
-                    file_name=f"faq-page-{idx + 1}",
-                    file_contents={
-                        "nodes": [
-                            {
-                                "text": page["text"],
-                                "type": "UncategorizedText",
-                                "metadata": {},
-                            }
-                        ]
-                    },
-                    file_metadata={
-                        "source": "eclass_website",
-                        "url": page["url"],
-                        "title": page.get("title"),
-                    },
-                )
-                for idx, page in enumerate(pages)
-            ]
-
-            sync_result = await self.sync_faq_group(
-                group_name=effective_group,
-                documents=documents,
-                trigger_graph_build=trigger_graph_build,
-            )
+        async with self._faq_sync_lock:
             self._faq_sync_status.update(
                 {
-                    "state": "READY",
-                    "pages_crawled": len(pages),
-                    "indexed_files": len(sync_result.get("uploaded_files", [])),
-                    "last_success_at": int(time.time()),
+                    "last_run_at": run_started_ts,
+                    "state": "RUNNING",
                     "error": None,
                 }
             )
-            return {
-                **sync_result,
-                "source_url": effective_source,
-                "pages_crawled": len(pages),
-            }
-        except Exception as ex:
-            self._faq_sync_status.update(
-                {
-                    "state": "ERROR",
-                    "error": str(ex),
+
+            try:
+                crawler = FAQCrawler(timeout_seconds=timeout_seconds)
+                pages = await crawler.crawl(source_url=effective_source, max_pages=effective_max_pages)
+                documents: List[FAQDocument] = [
+                    FAQDocument(
+                        file_name=f"faq-page-{idx + 1}",
+                        file_contents={
+                            "nodes": [
+                                {
+                                    "text": page["text"],
+                                    "type": "UncategorizedText",
+                                    "metadata": {},
+                                }
+                            ]
+                        },
+                        file_metadata={
+                            "source": "eclass_website",
+                            "url": page["url"],
+                            "title": page.get("title"),
+                        },
+                    )
+                    for idx, page in enumerate(pages)
+                ]
+
+                sync_result = await self.sync_faq_group(
+                    group_name=effective_group,
+                    documents=documents,
+                    trigger_graph_build=trigger_graph_build,
+                )
+                duplicate_files = len(sync_result.get("duplicate_files", []))
+                graph_build_job = sync_result.get("graph_build_job")
+                self._faq_sync_status.update(
+                    {
+                        "state": "READY",
+                        "pages_crawled": len(pages),
+                        "indexed_files": len(sync_result.get("uploaded_files", [])),
+                        "duplicate_files": duplicate_files,
+                        "last_success_at": int(time.time()),
+                        "error": None,
+                        "last_graph_build_job": graph_build_job,
+                    }
+                )
+                await self._record_faq_sync_log(
+                    run_at=run_started_at,
+                    completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                    source_url=effective_source,
+                    group_name=effective_group,
+                    max_pages=effective_max_pages,
+                    timeout_seconds=timeout_seconds,
+                    trigger_graph_build=trigger_graph_build,
+                    state="READY",
+                    pages_crawled=len(pages),
+                    indexed_files=len(sync_result.get("uploaded_files", [])),
+                    duplicate_files=duplicate_files,
+                    graph_build_job=graph_build_job,
+                )
+                await self._refresh_faq_sync_status_from_db()
+                return {
+                    **sync_result,
+                    "source_url": effective_source,
+                    "pages_crawled": len(pages),
                 }
-            )
-            raise
+            except Exception as ex:
+                self._faq_sync_status.update(
+                    {
+                        "state": "ERROR",
+                        "error": str(ex),
+                        "duplicate_files": 0,
+                        "last_graph_build_job": None,
+                    }
+                )
+                await self._record_faq_sync_log(
+                    run_at=run_started_at,
+                    completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                    source_url=effective_source,
+                    group_name=effective_group,
+                    max_pages=effective_max_pages,
+                    timeout_seconds=timeout_seconds,
+                    trigger_graph_build=trigger_graph_build,
+                    state="ERROR",
+                    error=str(ex),
+                )
+                await self._refresh_faq_sync_status_from_db()
+                raise
 
     def get_faq_sync_status(self) -> dict:
         return {
             **self._faq_sync_status,
+            **self._build_faq_health_status(),
             "config": self._faq_sync_config.copy(),
         }
 
@@ -1276,6 +1341,10 @@ class Criabot:
         group_name: Optional[str] = None,
         max_pages: Optional[int] = None,
         timeout_seconds: Optional[float] = None,
+        enabled: Optional[bool] = None,
+        interval_seconds: Optional[int] = None,
+        stale_after_seconds: Optional[int] = None,
+        failure_alert_threshold: Optional[int] = None,
     ) -> dict:
         if source_url is not None:
             self._faq_sync_config["source_url"] = source_url
@@ -1285,7 +1354,167 @@ class Criabot:
             self._faq_sync_config["max_pages"] = int(max_pages)
         if timeout_seconds is not None:
             self._faq_sync_config["timeout_seconds"] = float(timeout_seconds)
+        if enabled is not None:
+            self._faq_sync_config["enabled"] = bool(enabled)
+        if interval_seconds is not None:
+            self._faq_sync_config["interval_seconds"] = int(interval_seconds)
+        if stale_after_seconds is not None:
+            self._faq_sync_config["stale_after_seconds"] = int(stale_after_seconds)
+        if failure_alert_threshold is not None:
+            self._faq_sync_config["failure_alert_threshold"] = int(failure_alert_threshold)
         return self._faq_sync_config.copy()
+
+    async def _record_faq_sync_log(
+        self,
+        run_at: datetime,
+        completed_at: Optional[datetime],
+        source_url: str,
+        group_name: str,
+        max_pages: int,
+        timeout_seconds: float,
+        trigger_graph_build: bool,
+        state: str,
+        pages_crawled: int = 0,
+        indexed_files: int = 0,
+        duplicate_files: int = 0,
+        error: Optional[str] = None,
+        graph_build_job: Optional[dict] = None,
+    ) -> None:
+        if self._faq_api is None:
+            return
+
+        from criabot.database.faq.tables.faq_sync_logs import FAQSyncLogConfig
+
+        await self._faq_api.sync_logs.insert(
+            FAQSyncLogConfig(
+                run_at=run_at,
+                completed_at=completed_at,
+                source_url=source_url,
+                group_name=group_name,
+                max_pages=max_pages,
+                timeout_seconds=timeout_seconds,
+                trigger_graph_build=trigger_graph_build,
+                state=state,
+                pages_crawled=pages_crawled,
+                indexed_files=indexed_files,
+                duplicate_files=duplicate_files,
+                error=error,
+                graph_build_job=graph_build_job,
+            )
+        )
+
+    async def _refresh_faq_sync_status_from_db(self) -> None:
+        if self._faq_api is None:
+            return
+
+        recent_runs = await self._faq_api.sync_logs.retrieve_latest(limit=5)
+        recent_run_data = [
+            {
+                "run_at": int(run.run_at.timestamp()),
+                "completed_at": int(run.completed_at.timestamp()) if run.completed_at else None,
+                "state": run.state,
+                "pages_crawled": run.pages_crawled,
+                "indexed_files": run.indexed_files,
+                "duplicate_files": run.duplicate_files,
+                "error": run.error,
+            }
+            for run in recent_runs
+        ]
+        consecutive_failures = 0
+        for run in recent_runs:
+            if run.state == "ERROR":
+                consecutive_failures += 1
+                continue
+            break
+
+        latest_run = recent_runs[0] if recent_runs else None
+        latest_success = next((run for run in recent_runs if run.state == "READY"), None)
+        if latest_run is not None:
+            self._faq_sync_status.update(
+                {
+                    "last_run_at": int(latest_run.run_at.timestamp()),
+                    "state": latest_run.state,
+                    "pages_crawled": latest_run.pages_crawled,
+                    "indexed_files": latest_run.indexed_files,
+                    "duplicate_files": latest_run.duplicate_files,
+                    "error": latest_run.error,
+                    "last_graph_build_job": latest_run.graph_build_job,
+                }
+            )
+        if latest_success is not None:
+            self._faq_sync_status["last_success_at"] = int(latest_success.completed_at.timestamp()) if latest_success.completed_at else int(latest_success.run_at.timestamp())
+
+        self._faq_sync_status["consecutive_failures"] = consecutive_failures
+        self._faq_sync_status["recent_runs"] = recent_run_data
+        self._faq_sync_status["alert_state"] = self._build_faq_health_status()["alert_state"]
+
+    def _build_faq_health_status(self) -> dict:
+        now = int(time.time())
+        last_success_at = self._faq_sync_status.get("last_success_at")
+        stale_after_seconds = int(self._faq_sync_config.get("stale_after_seconds", 43200))
+        failure_alert_threshold = int(self._faq_sync_config.get("failure_alert_threshold", 3))
+        stale = bool(last_success_at and now - int(last_success_at) > stale_after_seconds)
+        consecutive_failures = int(self._faq_sync_status.get("consecutive_failures", 0) or 0)
+
+        if consecutive_failures >= failure_alert_threshold:
+            alert_state = "FAILURE_THRESHOLD_EXCEEDED"
+        elif stale:
+            alert_state = "STALE_DATA"
+        elif self._faq_sync_status.get("state") == "RUNNING":
+            alert_state = "SYNC_RUNNING"
+        elif last_success_at:
+            alert_state = "HEALTHY"
+        else:
+            alert_state = "IDLE"
+
+        if alert_state == "FAILURE_THRESHOLD_EXCEEDED":
+            logger.error(
+                "FAQ sync failure threshold exceeded (%s consecutive failures).",
+                consecutive_failures,
+            )
+        elif alert_state == "STALE_DATA":
+            logger.warning("FAQ data is stale; last successful sync was at %s.", last_success_at)
+
+        return {
+            "stale": stale,
+            "consecutive_failures": consecutive_failures,
+            "alert_state": alert_state,
+        }
+
+    async def start_faq_sync_scheduler(self) -> None:
+        if self._faq_sync_task is not None and not self._faq_sync_task.done():
+            return
+        if not self._faq_sync_config.get("enabled", False):
+            return
+
+        self._faq_sync_status["scheduler_running"] = True
+        self._faq_sync_task = asyncio.create_task(self._faq_sync_scheduler_loop())
+
+    async def stop_faq_sync_scheduler(self) -> None:
+        self._faq_sync_status["scheduler_running"] = False
+        if self._faq_sync_task is None:
+            return
+        self._faq_sync_task.cancel()
+        try:
+            await self._faq_sync_task
+        except asyncio.CancelledError:
+            pass
+        self._faq_sync_task = None
+
+    async def _faq_sync_scheduler_loop(self) -> None:
+        interval_seconds = max(int(self._faq_sync_config.get("interval_seconds", 21600)), 60)
+        while True:
+            try:
+                status = self.get_faq_sync_status()
+                should_run = status["last_success_at"] is None or status["stale"]
+                if should_run and status["state"] != "RUNNING":
+                    await self.sync_faq_site(trigger_graph_build=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Scheduled FAQ sync failed.")
+
+            await asyncio.sleep(interval_seconds)
 
     async def start_gradebook_session(
         self,
@@ -1362,5 +1591,29 @@ class Criabot:
             "session_id": session.session_id,
             "phase": session.phase,
             "proposal": session.proposal.model_dump() if session.proposal else None,
+            "content_mapping": session.content_mapping,
+        }
+
+    async def gradebook_finalize(
+        self,
+        session_id: str,
+        confirmed_mapping: List[dict],
+        create_categories: bool = True,
+        reorganize_resources: bool = False,
+    ) -> dict:
+        session = await self._gradebook.finalize(
+            session_id=session_id,
+            confirmed_mapping=confirmed_mapping,
+        )
+        summary = {
+            "categories_to_create": len({item.get("category") for item in confirmed_mapping if item.get("category")}),
+            "activities_mapped": len(confirmed_mapping),
+            "create_categories": create_categories,
+            "reorganize_resources": reorganize_resources,
+        }
+        return {
+            "session_id": session.session_id,
+            "phase": session.phase,
+            "summary": summary,
             "content_mapping": session.content_mapping,
         }

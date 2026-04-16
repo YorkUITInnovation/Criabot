@@ -4,7 +4,7 @@ from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
-from app.controllers.schemas import APIResponse, SUCCESS_CODE, NOT_FOUND_CODE, catch_exceptions, exception_response
+from app.controllers.schemas import APIResponse, SUCCESS_CODE, NOT_FOUND_CODE, catch_exceptions, exception_response, general_limiter
 from app.core.route import CriaRoute
 
 view = APIRouter()
@@ -26,6 +26,7 @@ class GradebookProposalRoute(CriaRoute):
         summary="Read latest gradebook proposal",
         description="Returns the proposal payload for the active gradebook session.",
     )
+    @general_limiter.limit("60/minute")
     @catch_exceptions(ResponseModel)
     @exception_response(
         KeyError,

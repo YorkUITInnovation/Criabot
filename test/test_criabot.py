@@ -216,7 +216,10 @@ async def test_create_bot_rollback_does_not_delete_preexisting_groups(criabot_in
 @pytest.mark.asyncio
 async def test_table_creation_on_initialize(criabot_instance):
     with patch('criabot.criabot.create_async_engine') as mock_create_async_engine, \
-         patch('criabot.criabot.BotDatabaseAPI') as MockBotDatabaseAPI:
+         patch('criabot.criabot.BotDatabaseAPI') as MockBotDatabaseAPI, \
+         patch('criabot.criabot.GradebookDatabaseAPI') as MockGradebookDatabaseAPI, \
+         patch('criabot.criabot.FAQDatabaseAPI') as MockFAQDatabaseAPI, \
+         patch('criabot.criabot.MigrationRunner') as MockMigrationRunner:
 
         # Mocks for the first engine (init_engine)
         mock_init_engine = MagicMock()
@@ -230,11 +233,21 @@ async def test_table_creation_on_initialize(criabot_instance):
 
         mock_mysql_api = AsyncMock()
         MockBotDatabaseAPI.return_value = mock_mysql_api
+        mock_gradebook_api = AsyncMock()
+        MockGradebookDatabaseAPI.return_value = mock_gradebook_api
+        mock_faq_api = AsyncMock()
+        mock_faq_api.sync_logs.retrieve_latest = AsyncMock(return_value=[])
+        MockFAQDatabaseAPI.return_value = mock_faq_api
+        mock_runner = AsyncMock()
+        MockMigrationRunner.return_value = mock_runner
 
         await criabot_instance.initialize()
 
         assert mock_create_async_engine.call_count == 2
+        mock_runner.run_pending.assert_awaited_once()
         mock_mysql_api.initialize.assert_called_once()
+        mock_gradebook_api.initialize.assert_called_once()
+        mock_faq_api.initialize.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -271,11 +284,36 @@ def test_update_faq_sync_config(criabot_instance):
         group_name="custom-faq-group",
         max_pages=10,
         timeout_seconds=15,
+        enabled=True,
+        interval_seconds=7200,
+        stale_after_seconds=14400,
+        failure_alert_threshold=4,
     )
     assert updated["source_url"] == "https://lthelp.yorku.ca/eclass"
     assert updated["group_name"] == "custom-faq-group"
     assert updated["max_pages"] == 10
     assert updated["timeout_seconds"] == 15.0
+    assert updated["enabled"] is True
+    assert updated["interval_seconds"] == 7200
+    assert updated["stale_after_seconds"] == 14400
+    assert updated["failure_alert_threshold"] == 4
+
+
+def test_get_faq_sync_status_reports_stale_failure_alert(criabot_instance):
+    criabot_instance._faq_sync_status.update(
+        {
+            "state": "ERROR",
+            "last_success_at": 1,
+            "consecutive_failures": 3,
+        }
+    )
+    criabot_instance._faq_sync_config["stale_after_seconds"] = 1
+    criabot_instance._faq_sync_config["failure_alert_threshold"] = 3
+
+    status = criabot_instance.get_faq_sync_status()
+
+    assert status["stale"] is True
+    assert status["alert_state"] == "FAILURE_THRESHOLD_EXCEEDED"
 
 
 @pytest.mark.asyncio
@@ -299,6 +337,13 @@ async def test_gradebook_session_flow(criabot_instance):
     accepted = await criabot_instance.gradebook_accept(session_id=session_id)
     assert accepted["phase"] == "ACCEPTED"
     assert accepted["content_mapping"] is not None
+
+    finalized = await criabot_instance.gradebook_finalize(
+        session_id=session_id,
+        confirmed_mapping=[{"moodle_cmid": 1, "category": "Assignments"}],
+    )
+    assert finalized["phase"] == "COMPLETED"
+    assert finalized["summary"]["activities_mapped"] == 1
 
 
 @pytest.mark.asyncio

@@ -2,18 +2,27 @@ from __future__ import annotations
 
 import inspect
 import os
+import time
 from typing import Any, Dict, List
 
 from CriadexSDK.ragflow_schemas import GroupSearchResponse
 
 
 class FAQFallback:
+    _cache: Dict[str, tuple[int, Dict[str, Any]]] = {}
+
     def __init__(self, criadex) -> None:
         self._criadex = criadex
         self._faq_group = os.environ.get("FAQ_GROUP_NAME", "eclass-faq-bot-document-index")
         self._graph_auto_build = os.environ.get("GRAPH_RAG_CHAT_AUTO_BUILD", "true").lower() == "true"
+        self._cache_ttl_seconds = int(os.environ.get("FAQ_FALLBACK_CACHE_SECONDS", "300"))
 
     async def search(self, prompt: str, top_k: int = 5) -> Dict[str, Any]:
+        cache_key = f"{self._faq_group}:{top_k}:{prompt.strip().lower()}"
+        cached = self._cache.get(cache_key)
+        if cached and cached[0] > int(time.time()):
+            return cached[1]
+
         search_config = {"query": prompt, "top_k": top_k}
 
         result = None
@@ -77,9 +86,11 @@ class FAQFallback:
             seen_urls.add(source["url"])
             deduped.append(source)
 
-        return {
+        response_payload = {
             "group_name": self._faq_group,
             "response": response_obj,
             "sources": deduped,
             "graph_metadata": graph_meta,
         }
+        self._cache[cache_key] = (int(time.time()) + self._cache_ttl_seconds, response_payload)
+        return response_payload

@@ -5,7 +5,7 @@ from fastapi_restful.cbv import cbv
 from pydantic import BaseModel
 from starlette.requests import Request
 
-from app.controllers.schemas import APIResponse, SUCCESS_CODE, NOT_FOUND_CODE, catch_exceptions, exception_response
+from app.controllers.schemas import APIResponse, SUCCESS_CODE, NOT_FOUND_CODE, catch_exceptions, exception_response, general_limiter
 from app.core.route import CriaRoute
 
 view = APIRouter()
@@ -32,6 +32,7 @@ class GradebookChatRoute(CriaRoute):
         summary="Advance gradebook workflow by prompt",
         description="Consumes professor feedback and advances the gradebook workflow state machine.",
     )
+    @general_limiter.limit("30/minute")
     @catch_exceptions(ResponseModel)
     @exception_response(
         KeyError,

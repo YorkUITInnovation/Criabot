@@ -1,4 +1,5 @@
 import pytest
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 from criabot.gradebook.analyzer import SyllabusAnalyzer
@@ -48,6 +49,31 @@ async def test_syllabus_analyzer_falls_back_to_standard_search():
 
 
 @pytest.mark.asyncio
+async def test_syllabus_analyzer_caches_repeated_queries():
+    sdk = MagicMock()
+    sdk.manage = MagicMock()
+    sdk.content = MagicMock()
+    sdk.manage.graph_search = AsyncMock(return_value={
+        "response": {"nodes": [], "assets": [], "search_units": 1},
+        "graph_metadata": {"source": "ragflow"},
+    })
+
+    analyzer = SyllabusAnalyzer(criadex=sdk)
+    analyzer._analysis_cache.clear()
+
+    await analyzer.analyze_group(
+        group_name="course-syllabus-index",
+        prompt="What are grade category weights?",
+    )
+    await analyzer.analyze_group(
+        group_name="course-syllabus-index",
+        prompt="What are grade category weights?",
+    )
+
+    sdk.manage.graph_search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_gradebook_session_starts_in_intake_without_syllabus():
     engine = GradebookSessionEngine()
     session = await engine.start(
@@ -75,6 +101,46 @@ async def test_gradebook_accept_adds_content_mapping():
     assert accepted.phase == "ACCEPTED"
     assert accepted.content_mapping is not None
     assert accepted.content_mapping["graded_activities"][0]["moodle_cmid"] == 10
+    assert accepted.content_mapping["graded_activities"][0]["suggested_category"] == "Assignments"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_accept_is_idempotent():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+
+    first = await engine.accept(session.session_id)
+    second = await engine.accept(session.session_id)
+
+    assert first.content_mapping == second.content_mapping
+    assert second.phase == "ACCEPTED"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_finalize_marks_confirmed_mapping_and_completes():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+
+    finalized = await engine.finalize(
+        session.session_id,
+        confirmed_mapping=[{"moodle_cmid": 10, "category": "Homework"}],
+    )
+
+    assert finalized.phase == "COMPLETED"
+    assert finalized.content_mapping["graded_activities"][0]["confirmed_category"] == "Homework"
+    assert finalized.content_mapping["graded_activities"][0]["finalized"] is True
 
 
 @pytest.mark.asyncio
@@ -127,3 +193,19 @@ async def test_gradebook_chat_unknown_session_raises_key_error():
     engine = GradebookSessionEngine()
     with pytest.raises(KeyError):
         await engine.chat("missing-session", "hello")
+
+
+@pytest.mark.asyncio
+async def test_gradebook_get_returns_none_for_expired_active_session():
+    engine = GradebookSessionEngine()
+    engine._session_expire_seconds = 1
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Lecture 1 slides")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    session.last_touched_at = int(time.time()) - 10
+
+    assert await engine.get(session.session_id) is None

@@ -1,5 +1,6 @@
 from .analyzer import SyllabusAnalyzer
 from .conversation import ConversationManager
+from .content_mapper import ContentMapper
 from .proposal import ProposalGenerator
 from .session import GradebookSessionEngine
 from .schemas import (
@@ -12,6 +13,7 @@ from .schemas import (
 
 __all__ = [
     "ConversationManager",
+    "ContentMapper",
     "CourseActivity",
     "GradebookCategory",
     "GradebookProposal",

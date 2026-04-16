@@ -61,6 +61,10 @@ FAQ_SOURCE_URL: str = os.environ.get("FAQ_SOURCE_URL", "https://lthelp.yorku.ca/
 FAQ_GROUP_NAME: str = os.environ.get("FAQ_GROUP_NAME", "eclass-faq-bot-document-index")
 FAQ_SYNC_MAX_PAGES: int = int(os.environ.get("FAQ_SYNC_MAX_PAGES", "25"))
 FAQ_SYNC_TIMEOUT_SECONDS: float = float(os.environ.get("FAQ_SYNC_TIMEOUT_SECONDS", "20"))
+FAQ_SYNC_ENABLED: bool = os.environ.get("FAQ_SYNC_ENABLED", "false").lower() == "true"
+FAQ_SYNC_INTERVAL_SECONDS: int = int(os.environ.get("FAQ_SYNC_INTERVAL_SECONDS", "21600"))
+FAQ_STALE_AFTER_SECONDS: int = int(os.environ.get("FAQ_STALE_AFTER_SECONDS", "43200"))
+FAQ_ALERT_FAILURE_THRESHOLD: int = int(os.environ.get("FAQ_ALERT_FAILURE_THRESHOLD", "3"))
 
 # Set the Tiktoken cache directory
 os.environ["TIKTOKEN_CACHE_DIR"] = os.environ.get(

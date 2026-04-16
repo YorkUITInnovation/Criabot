@@ -5,7 +5,7 @@ from fastapi_restful.cbv import cbv
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 
-from app.controllers.schemas import APIResponse, SUCCESS_CODE, catch_exceptions
+from app.controllers.schemas import APIResponse, SUCCESS_CODE, catch_exceptions, general_limiter
 from app.core.route import CriaRoute
 
 view = APIRouter()
@@ -35,6 +35,7 @@ class StartGradebookRoute(CriaRoute):
         summary="Start gradebook workflow session",
         description="Starts an AI gradebook session based on Moodle resources and activities.",
     )
+    @general_limiter.limit("20/minute")
     @catch_exceptions(ResponseModel)
     async def execute(self, request: Request, config: StartGradebookConfig) -> StartGradebookResponse:
         result = await request.app.criabot.start_gradebook_session(

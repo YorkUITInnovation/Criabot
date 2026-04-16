@@ -46,6 +46,7 @@ class GradebookSessionModel(BaseModel):
     proposal: Optional[dict] = None
     extraction: Optional[dict] = None
     content_mapping: Optional[dict] = None
+    last_touched_at: Optional[int] = None
 
 
 class Gradebooks(CacheObject):
