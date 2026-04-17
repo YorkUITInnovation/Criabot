@@ -30,10 +30,21 @@ class GradebookSessionEngine:
 
     @staticmethod
     def _has_syllabus(resources: List[MoodleResource]) -> bool:
+        if resources:
+            # Treat any loaded course resource as syllabus-like context for initial analysis.
+            resource_like_types = {"resource", "page", "book", "folder", "file", "url"}
+            if any((resource.type or "").lower() in resource_like_types for resource in resources):
+                return True
         for resource in resources:
             name = (resource.name or "").lower()
             preview = (resource.content_preview or "").lower()
-            if "syllabus" in name or "grading" in preview or "%" in preview:
+            if (
+                "syllabus" in name
+                or "outline" in name
+                or "grading" in preview
+                or "assessment" in preview
+                or "%" in preview
+            ):
                 return True
         return False
 
@@ -166,6 +177,17 @@ class GradebookSessionEngine:
         moodle_resources: List[MoodleResource],
         course_activities: List[CourseActivity],
     ) -> GradebookSessionRecord:
+        if not course_activities and moodle_resources:
+            # Fallback: derive activity-like records from visible Moodle resources.
+            course_activities = [
+                CourseActivity(
+                    cmid=resource.cmid,
+                    module=resource.type,
+                    name=resource.name,
+                )
+                for resource in moodle_resources
+                if resource.name
+            ]
         session_id = "gb-" + str(uuid.uuid4())
         phase = "ANALYSIS" if self._has_syllabus(moodle_resources) else "INTAKE"
         proposal = self._proposal_generator.generate_initial(course_activities) if phase == "ANALYSIS" else None
