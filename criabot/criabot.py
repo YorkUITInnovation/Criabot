@@ -1605,15 +1605,30 @@ class Criabot:
             session_id=session_id,
             confirmed_mapping=confirmed_mapping,
         )
+        proposal = session.proposal.model_dump() if session.proposal else None
+        total_weight = 0
+        if proposal and isinstance(proposal.get("categories"), list):
+            for category in proposal["categories"]:
+                try:
+                    total_weight += float(category.get("weight") or 0)
+                except (TypeError, ValueError):
+                    continue
+        graded_count = sum(1 for item in confirmed_mapping if item.get("category"))
+        not_graded_count = len(confirmed_mapping) - graded_count
         summary = {
             "categories_to_create": len({item.get("category") for item in confirmed_mapping if item.get("category")}),
             "activities_mapped": len(confirmed_mapping),
+            "graded_count": graded_count,
+            "not_graded_count": not_graded_count,
+            "total_weight": round(total_weight, 2) if total_weight else None,
             "create_categories": create_categories,
             "reorganize_resources": reorganize_resources,
+            "finalized_at": datetime.now(timezone.utc).isoformat(),
         }
         return {
             "session_id": session.session_id,
             "phase": session.phase,
             "summary": summary,
             "content_mapping": session.content_mapping,
+            "proposal": proposal,
         }

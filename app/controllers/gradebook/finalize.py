@@ -26,6 +26,8 @@ class GradebookFinalizeResponse(APIResponse):
     session_id: Optional[str] = None
     phase: Optional[str] = None
     summary: Optional[dict] = None
+    proposal: Optional[dict] = None
+    content_mapping: Optional[dict] = None
 
 
 @cbv(view)
@@ -68,6 +70,8 @@ class GradebookFinalizeRoute(CriaRoute):
             session_id=session_id,
             phase=result["phase"],
             summary=result["summary"],
+            proposal=result.get("proposal"),
+            content_mapping=result.get("content_mapping"),
         )
 
 

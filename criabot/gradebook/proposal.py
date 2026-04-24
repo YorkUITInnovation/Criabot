@@ -29,9 +29,14 @@ class ProposalGenerator:
         "exam": "Final Exam",
         "final": "Final Exam",
         "final exam": "Final Exam",
+        "quiz": "Quizzes",
+        "quizzes": "Quizzes",
+        "quize": "Quizzes",
+        "quizes": "Quizzes",
     }
     CATEGORY_ALIAS_PATTERNS = (
         (re.compile(r"\b(assign(?:ment)?s?|home\s*work|hw)\b", flags=re.IGNORECASE), "Assignments"),
+        (re.compile(r"\b(quiz(?:zes)?|quize(?:s)?|test(?:s)?)\b", flags=re.IGNORECASE), "Quizzes"),
         (re.compile(r"\b(lab(?:s)?|lap(?:s)?|laboratory)\b", flags=re.IGNORECASE), "Labs"),
         (re.compile(r"\b(mid\s*term|midterm)\b", flags=re.IGNORECASE), "Midterm"),
         (re.compile(r"\b(final(?:\s*exam)?|exam)\b", flags=re.IGNORECASE), "Final Exam"),
@@ -99,6 +104,62 @@ class ProposalGenerator:
 
         return updated
 
+    def _auto_fix_total_to_100(self, proposal: GradebookProposal, explicit_updates: Dict[str, float]) -> None:
+        """
+        Ensure total category weight remains exactly 100 after explicit updates.
+
+        Strategy:
+          - If there are untouched categories, scale ONLY the untouched ones to fill the remaining weight.
+            (Keeps the instructor-specified categories exact.)
+          - If all categories were explicitly set, adjust the last-updated category by the delta.
+        """
+        if not proposal.categories:
+            return
+
+        # Normalize key set to existing category names (case-insensitive).
+        explicit_keys = {name.lower() for name in explicit_updates.keys()}
+        cats = list(proposal.categories)
+        untouched = [c for c in cats if c.name.lower() not in explicit_keys]
+        touched = [c for c in cats if c.name.lower() in explicit_keys]
+
+        total = sum(c.weight for c in cats)
+        if abs(total - 100.0) <= 0.1:
+            return
+
+        target_remaining = 100.0 - sum(c.weight for c in touched)
+
+        if untouched:
+            current_untouched_total = sum(c.weight for c in untouched)
+            if abs(current_untouched_total) < 0.001:
+                # No usable baseline to scale; distribute evenly.
+                even = target_remaining / len(untouched)
+                for c in untouched:
+                    c.weight = round(even, 2)
+            else:
+                scale = target_remaining / current_untouched_total
+                for c in untouched:
+                    c.weight = round(c.weight * scale, 2)
+
+            # Final micro-adjust to eliminate rounding drift (apply to the last untouched).
+            new_total = sum(c.weight for c in cats)
+            delta = 100.0 - new_total
+            if abs(delta) > 0.001:
+                untouched[-1].weight = round(untouched[-1].weight + delta, 2)
+
+            proposal.notes.append("Auto-normalized remaining category weights to keep total exactly 100%.")
+            return
+
+        # If everything was touched, adjust the last explicit category.
+        # Dict preserves insertion order (py3.7+), and our parser overwrites duplicates,
+        # so this is a reasonable proxy for "last mentioned".
+        last_name = next(reversed(explicit_updates.keys()), None)
+        if last_name:
+            last = next((c for c in cats if c.name.lower() == last_name.lower()), None)
+            if last is not None:
+                delta = 100.0 - total
+                last.weight = round(last.weight + delta, 2)
+                proposal.notes.append(f"Auto-normalized '{last.name}' by {delta:+.2f}% to keep total 100%.")
+
     # Collect names of split subcategories so they are excluded from weight-parsing
     # (prevents "Homework 15%" being misread as "Assignments 15%" via alias).
     @staticmethod
@@ -161,6 +222,11 @@ class ProposalGenerator:
             key = name.lower()
             if key in normalized_map:
                 normalized_map[key].weight = weight
+            else:
+                # Allow adding a new category when the user explicitly sets its weight
+                # (e.g., "add quizzes 5%" / "quizzes 5%").
+                proposal.categories.append(GradebookCategory(name=name, weight=weight, items=[]))
+                proposal.notes.append(f"Added category '{name}' with weight {weight:.1f}%.")
 
     def _parse_split_categories(self, prompt: str) -> List[Tuple[str, Optional[float]]]:
         # Match "split <anything> into <parts>" generically.

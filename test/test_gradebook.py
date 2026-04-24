@@ -342,6 +342,18 @@ def test_normalize_trigger_rounds_total_to_100():
     assert abs(total2 - 100.0) < 0.5
 
 
+def test_multi_weight_update_does_not_auto_normalize():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "set Assignments to 20% and Labs to 10%")
+    cat_map = {cat.name: cat for cat in updated.categories}
+    assert cat_map["Assignments"].weight == 20.0
+    assert cat_map["Labs"].weight == 10.0
+    total = sum(cat.weight for cat in updated.categories)
+    assert abs(total - 100.0) > 0.1, "Should allow non-100 totals; UI will block accept/finalize"
+
+
+
 def test_weight_from_x_to_y_uses_destination_value():
     generator = ProposalGenerator()
     base = generator.generate_initial([])
