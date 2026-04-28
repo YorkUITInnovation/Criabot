@@ -4,6 +4,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 from criabot.gradebook.analyzer import SyllabusAnalyzer
+from criabot.gradebook.content_mapper import ContentMapper
 from criabot.gradebook.proposal import ProposalGenerator
 from criabot.gradebook.schemas import CourseActivity, MoodleResource
 from criabot.gradebook.session import GradebookSessionEngine
@@ -86,6 +87,78 @@ async def test_gradebook_session_starts_in_intake_without_syllabus():
     )
     assert session.phase == "INTAKE"
     assert session.proposal is None
+
+
+@pytest.mark.asyncio
+async def test_gradebook_session_with_generic_resource_type_stays_intake():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Week 1 slides", type="resource")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    assert session.phase == "INTAKE"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_affirmation_advances_analysis_to_proposal():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_b",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    assert session.phase == "ANALYSIS"
+
+    updated = await engine.chat(session.session_id, "okay do it")
+    assert updated.phase == "PROPOSAL"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_answers_syllabus_question_without_repeating_proposal():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_b",
+        bot_name="eecs-bot",
+        moodle_resources=[],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    assert session.phase == "INTAKE"
+
+    chat = await engine.chat(session.session_id, "do you have syllabus?")
+    from criabot.gradebook.conversation import ConversationManager
+    reply = ConversationManager().make_reply(chat, chat.proposal, prompt="do you have syllabus?")
+    assert "no" in reply.lower()
+    assert "syllabus" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_intake_with_uploaded_syllabus_flag_moves_to_proposal_on_request():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_c",
+        bot_name="eecs-bot",
+        moodle_resources=[],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    assert session.phase == "INTAKE"
+
+    # Simulate syllabus upload metadata already stored in session extraction.
+    session.extraction = {
+        "has_syllabus": True,
+        "syllabus_sources": ["syllabus_example.docx"],
+    }
+    await engine._save_session(session)
+
+    updated = await engine.chat(session.session_id, "okay use what i give you and give me a proposal")
+    assert updated.phase == "PROPOSAL"
+    assert updated.proposal is not None
 
 
 @pytest.mark.asyncio
@@ -379,6 +452,151 @@ def test_split_does_not_alter_parent_category_weight():
     assert cat_map["Assignments"].weight == 40.0, "Parent category weight must not change during split recording"
     split_notes = [n for n in result.notes if "split" in n.lower()]
     assert split_notes, "Should record split note"
+
+
+def test_weight_without_percent_symbol_is_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(base, "change lap to 15 and final to 25")
+    cat_map = {cat.name: cat for cat in updated.categories}
+
+    assert cat_map["Labs"].weight == 15.0
+    assert cat_map["Final Exam"].weight == 25.0
+
+
+def test_increase_and_decrease_accordingly_adjusts_only_target():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(
+        base,
+        "Increase Labs to 20% and decrease Final Exam accordingly to keep total exactly 100%.",
+    )
+    cat_map = {cat.name: cat for cat in updated.categories}
+
+    assert cat_map["Labs"].weight == 20.0
+    assert cat_map["Assignments"].weight == 25.0
+    assert cat_map["Midterm"].weight == 30.0
+    assert cat_map["Final Exam"].weight == 25.0
+    assert sum(cat.weight for cat in updated.categories) == pytest.approx(100.0)
+
+
+def test_zero_midterm_redistributes_proportionally():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(
+        base,
+        "Set Midterm to 0% and redistribute that weight proportionally across other categories.",
+    )
+    cat_map = {cat.name: cat for cat in updated.categories}
+
+    assert cat_map["Midterm"].weight == 0.0
+    assert cat_map["Assignments"].weight == pytest.approx(35.71, abs=0.02)
+    assert cat_map["Labs"].weight == pytest.approx(21.43, abs=0.02)
+    assert cat_map["Final Exam"].weight == pytest.approx(42.86, abs=0.02)
+    assert sum(cat.weight for cat in updated.categories) == pytest.approx(100.0, abs=0.05)
+
+
+def test_remaining_weight_directive_updates_target_category():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(
+        base,
+        "make assignment 35% final 40% and give remaing weight ot midterm",
+    )
+    cat_map = {cat.name: cat for cat in updated.categories}
+
+    assert cat_map["Assignments"].weight == 35.0
+    assert cat_map["Final Exam"].weight == 40.0
+    assert cat_map["Labs"].weight == 15.0
+    assert cat_map["Midterm"].weight == 10.0
+    assert sum(cat.weight for cat in updated.categories) == pytest.approx(100.0)
+
+
+def test_split_consistency_note_added_after_parent_weight_change():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    split = generator.update_from_prompt(
+        base,
+        "Split Assignments (25%) into Homework 10% and Projects 15%, but keep Assignments as the parent category.",
+    )
+    changed = generator.update_from_prompt(split, "set Assignments to 30%")
+
+    assert any("internal split totals" in note.lower() for note in changed.notes)
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_supports_undo_and_redo():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%")],
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign"),
+            CourseActivity(name="Lab 1", module="lab"),
+        ],
+    )
+
+    updated = await engine.chat(session.session_id, "set labs to 20%")
+    assert updated.proposal is not None
+    assert {cat.name: cat.weight for cat in updated.proposal.categories}["Labs"] == 20.0
+
+    undone = await engine.chat(session.session_id, "undo")
+    assert undone.proposal is not None
+    assert {cat.name: cat.weight for cat in undone.proposal.categories}["Labs"] == 15.0
+
+    redone = await engine.chat(session.session_id, "redo")
+    assert redone.proposal is not None
+    assert {cat.name: cat.weight for cat in redone.proposal.categories}["Labs"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_uses_llm_assignment_when_available():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.chat = AsyncMock(return_value={
+        "agent_response": {
+            "chat_response": {
+                "message": {
+                    "content": '[{"moodle_cmid": 10, "category": "Assignments", "confidence": 0.93, "reasoning": "name match"}]'
+                }
+            }
+        }
+    })
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    proposal = ProposalGenerator().generate_initial([])
+    result = await mapper.build_mapping(
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+        proposal=proposal,
+    )
+
+    assert result["graded_activities"][0]["suggested_category"] == "Assignments"
+    assert result["graded_activities"][0]["confirmed_category"] == "Assignments"
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_falls_back_when_llm_fails():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.chat = AsyncMock(side_effect=RuntimeError("llm down"))
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    proposal = ProposalGenerator().generate_initial([])
+    result = await mapper.build_mapping(
+        course_activities=[CourseActivity(name="Lab 1", module="lab", cmid=11)],
+        proposal=proposal,
+    )
+
+    assert result["graded_activities"][0]["suggested_category"] == "Labs"
 
 
 @pytest.mark.asyncio

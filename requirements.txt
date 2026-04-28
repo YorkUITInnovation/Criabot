@@ -9,6 +9,7 @@ pydantic-settings
 sqlalchemy==2.0.27
 typing-inspect
 tiktoken==0.5.1
+pypdf>=4.2.0
 slowapi==0.1.8
 redis>=4.0.0
 fastapi-restful

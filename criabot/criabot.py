@@ -1,7 +1,11 @@
 import asyncio
+import base64
+import io
 import os
+import re
 import secrets
 import time
+import zipfile
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 
@@ -116,7 +120,10 @@ class Criabot:
         self._faq_sync_task: Optional[asyncio.Task] = None
 
         self._already_initialized = False
-        self._gradebook = GradebookSessionEngine()
+        self._gradebook = GradebookSessionEngine(
+            criadex=self._criadex,
+            mapping_llm_model_id=os.environ.get("GRADEBOOK_MAPPING_LLM_MODEL_ID", "gpt-3.5-turbo"),
+        )
         self._gradebook_conversation = ConversationManager()
 
     async def initialize(self) -> None:
@@ -167,6 +174,8 @@ class Criabot:
         self._gradebook = GradebookSessionEngine(
             gradebook_db=self._gradebook_api,
             gradebook_cache=self._redis_api.gradebooks,
+            criadex=self._criadex,
+            mapping_llm_model_id=os.environ.get("GRADEBOOK_MAPPING_LLM_MODEL_ID", "gpt-3.5-turbo"),
         )
 
     async def _create_mysql_engine(self) -> AsyncEngine:
@@ -1545,10 +1554,14 @@ class Criabot:
                 extraction = await self._gradebook_analyzer.extract_assessment_structure(
                     group_name=self._gradebook_syllabus_group_name
                 )
-                session.extraction = extraction
+                base_extraction = session.extraction or {}
+                if not isinstance(base_extraction, dict):
+                    base_extraction = {}
+                base_extraction["analysis"] = extraction
+                session.extraction = base_extraction
                 await self._gradebook_api.sessions.update_session(
                     session_id=session.session_id,
-                    updates={"extraction_json": extraction}
+                    updates={"extraction_json": session.extraction}
                 )
             except Exception:
                 logger.warning("Gradebook syllabus extraction failed; continuing without structured analysis.")
@@ -1567,7 +1580,126 @@ class Criabot:
 
     async def gradebook_chat(self, session_id: str, prompt: str) -> dict:
         session = await self._gradebook.chat(session_id=session_id, prompt=prompt)
-        reply_message = self._gradebook_conversation.make_reply(session=session, proposal=session.proposal)
+        reply_message = self._gradebook_conversation.make_reply(session=session, proposal=session.proposal, prompt=prompt)
+        return {
+            "session_id": session.session_id,
+            "phase": session.phase,
+            "reply": reply_message,
+            "proposal": session.proposal.model_dump() if session.proposal else None,
+        }
+
+    @staticmethod
+    def _extract_text_from_docx(file_bytes: bytes) -> str:
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+                chunks = []
+                for name in ("word/document.xml", "word/header1.xml", "word/footer1.xml"):
+                    if name in zf.namelist():
+                        chunks.append(zf.read(name).decode("utf-8", errors="ignore"))
+                if not chunks:
+                    return ""
+                xml_text = "\n".join(chunks)
+                text = re.sub(r"<[^>]+>", " ", xml_text)
+                text = re.sub(r"\s+", " ", text).strip()
+                return text
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_text_from_pdf(file_bytes: bytes) -> str:
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(file_bytes))
+            parts = []
+            for page in reader.pages:
+                parts.append(page.extract_text() or "")
+            text = "\n".join(parts)
+            return re.sub(r"\s+", " ", text).strip()
+        except Exception:
+            try:
+                # Fallback for environments where pypdf is unavailable:
+                # decode whatever text-like bytes are present to avoid hard upload failure.
+                fallback = file_bytes.decode("latin-1", errors="ignore")
+                fallback = re.sub(r"\s+", " ", fallback).strip()
+                return fallback[:4000]
+            except Exception:
+                return ""
+
+    async def gradebook_upload(self, session_id: str, filename: str, filetype: str, base64_content: str) -> dict:
+        file_bytes = base64.b64decode(base64_content or "")
+        ext = os.path.splitext(filename or "")[1].lower()
+        mimetype = (filetype or "").lower()
+
+        extracted_text = ""
+        if ext in {".txt", ".md"} or mimetype.startswith("text/"):
+            extracted_text = file_bytes.decode("utf-8", errors="ignore")
+        elif ext == ".docx" or "wordprocessingml" in mimetype:
+            extracted_text = self._extract_text_from_docx(file_bytes)
+        elif ext == ".pdf" or mimetype == "application/pdf":
+            extracted_text = self._extract_text_from_pdf(file_bytes)
+        else:
+            extracted_text = file_bytes.decode("utf-8", errors="ignore")
+
+        extracted_text = (extracted_text or "").strip()
+        if not extracted_text:
+            raise ValueError("Could not extract text from uploaded document.")
+
+        filename_l = (filename or "").lower()
+        looks_like_syllabus = any(token in filename_l for token in (
+            "syllabus", "syllabi", "syllabe", "plan de cours", "plan_du_cours", "outline", "programme"
+        ))
+        text_l = extracted_text.lower()
+        if not looks_like_syllabus:
+            looks_like_syllabus = (
+                "grading" in text_l
+                or "assessment" in text_l
+                or "barème" in text_l
+                or "plan de cours" in text_l
+                or "%" in extracted_text
+            )
+
+        clipped = extracted_text[:8000]
+        if looks_like_syllabus:
+            ingest_prompt = (
+                f"I uploaded a syllabus document named '{filename}'. "
+                f"Please analyze this grading information and update the gradebook proposal accordingly:\n\n{clipped}"
+            )
+        else:
+            ingest_prompt = (
+                f"I uploaded a supporting course document named '{filename}'. "
+                f"Use this context to improve the gradebook proposal and mapping decisions:\n\n{clipped}"
+            )
+
+        session = await self._gradebook.chat(session_id=session_id, prompt=ingest_prompt)
+
+        extraction = session.extraction or {}
+        if not isinstance(extraction, dict):
+            extraction = {}
+        if looks_like_syllabus:
+            extraction["has_syllabus"] = True
+        sources = list(extraction.get("syllabus_sources") or [])
+        if looks_like_syllabus and filename and filename not in sources:
+            sources.append(filename)
+        extraction["syllabus_sources"] = sources
+        if looks_like_syllabus:
+            extraction["uploaded_syllabus_text"] = clipped
+        supporting = list(extraction.get("supporting_documents") or [])
+        if filename and filename not in supporting:
+            supporting.append(filename)
+        extraction["supporting_documents"] = supporting
+        session.extraction = extraction
+        await self._gradebook_api.sessions.update_session(
+            session_id=session.session_id,
+            updates={"extraction_json": extraction},
+        )
+
+        reply_prompt = "uploaded syllabus document" if looks_like_syllabus else "uploaded supporting document"
+        reply_message = self._gradebook_conversation.make_reply(
+            session=session,
+            proposal=session.proposal,
+            prompt=reply_prompt,
+        )
         return {
             "session_id": session.session_id,
             "phase": session.phase,

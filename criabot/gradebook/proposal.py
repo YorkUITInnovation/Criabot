@@ -63,7 +63,7 @@ class ProposalGenerator:
         return GradebookProposal(
             categories=categories,
             notes=[
-                "Initial proposal is generated from syllabus + available Moodle activities.",
+                "Initial proposal is generated from available course context and Moodle activities.",
                 "Professor can refine category names, weights, and mapping before acceptance.",
             ],
         )
@@ -93,8 +93,16 @@ class ProposalGenerator:
         self._apply_removals(updated, prompt)
 
         weights = self._parse_weight_assignments(updated, prompt, skip_split_pieces=is_split_prompt)
+
+        # Support directives like "give remaining weight to midterm".
+        remaining_target = self._parse_remaining_target(updated, prompt)
+        if remaining_target:
+            weights = self._apply_remaining_weight_directive(updated, weights, remaining_target)
+
         if weights:
             self._apply_weight_updates(updated, weights)
+
+        self._apply_directive_normalization(updated, prompt, explicit_updates=weights)
 
         if is_split_prompt:
             split_parts = self._parse_split_categories(prompt)
@@ -103,6 +111,79 @@ class ProposalGenerator:
         self._post_update_checks(updated, prompt)
 
         return updated
+
+    def _parse_remaining_target(self, proposal: GradebookProposal, prompt: str) -> Optional[str]:
+        match = re.search(
+            r"\b(?:give|assign|put|allocate)\s+(?:the\s+)?(?:remaining|remai\w*|left(?:over)?)\s+(?:weight\s+)?(?:to|ot|into)\s+([a-zA-Z][a-zA-Z ]{1,40})",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return self._resolve_category_name(proposal, match.group(1).strip())
+
+    def _apply_remaining_weight_directive(
+        self,
+        proposal: GradebookProposal,
+        weights: Dict[str, float],
+        remaining_target: str,
+    ) -> Dict[str, float]:
+        current = {cat.name: float(cat.weight) for cat in proposal.categories}
+        for name, value in weights.items():
+            current[name] = float(value)
+
+        remainder = 100.0 - sum(
+            weight for name, weight in current.items()
+            if name.lower() != remaining_target.lower()
+        )
+        weights[remaining_target] = round(remainder, 2)
+        return weights
+
+    def _apply_directive_normalization(
+        self,
+        proposal: GradebookProposal,
+        prompt: str,
+        explicit_updates: Dict[str, float],
+    ) -> None:
+        if not explicit_updates:
+            return
+
+        prompt_lower = prompt.lower()
+
+        # "decrease final accordingly" / "increase labs ... decrease final accordingly"
+        if any(token in prompt_lower for token in ("accordingly", "decrease", "increase")):
+            target = self._parse_accordingly_target(proposal, prompt)
+            if target:
+                self._adjust_single_category_to_target_total(proposal, target)
+                return
+
+        # "redistribute proportionally across other categories"
+        if "proportion" in prompt_lower and any(word in prompt_lower for word in ("redistribute", "distribute")):
+            self._auto_fix_total_to_100(proposal, explicit_updates=explicit_updates)
+            return
+
+        # Generic normalization requests.
+        if self._NORMALIZE_PATTERNS.search(prompt):
+            self._auto_fix_total_to_100(proposal, explicit_updates=explicit_updates)
+
+    def _parse_accordingly_target(self, proposal: GradebookProposal, prompt: str) -> Optional[str]:
+        match = re.search(
+            r"\b(?:decrease|increase|adjust|reduce)\s+([a-zA-Z][a-zA-Z ]{1,40})\s+accordingly",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return self._resolve_category_name(proposal, match.group(1).strip())
+
+    def _adjust_single_category_to_target_total(self, proposal: GradebookProposal, category_name: str) -> None:
+        target = next((cat for cat in proposal.categories if cat.name.lower() == category_name.lower()), None)
+        if target is None:
+            return
+
+        other_total = sum(cat.weight for cat in proposal.categories if cat is not target)
+        target.weight = round(100.0 - other_total, 2)
+        proposal.notes.append(f"Adjusted '{target.name}' to keep total exactly 100%.")
 
     def _auto_fix_total_to_100(self, proposal: GradebookProposal, explicit_updates: Dict[str, float]) -> None:
         """
@@ -197,11 +278,11 @@ class ProposalGenerator:
             clean_prompt = re.sub(r"\bsplit\b.+", "", clean_prompt, flags=re.IGNORECASE).strip()
 
         pattern = re.compile(
-            r"(?:set|make|change|adjust|update|keep|use)?\s*([a-zA-Z][a-zA-Z ]{1,40}?)\s*(?:is|are|to|=|:)\s*(\d+(?:\.\d+)?)\s*%",
+            r"(?:set|make|change|adjust|update|keep|use)?\s*([a-zA-Z][a-zA-Z ]{1,40}?)\s*(?:is|are|to|=|:)\s*(\d+(?:\.\d+)?)\s*%?",
             flags=re.IGNORECASE,
         )
         matches = pattern.findall(clean_prompt) + re.findall(
-            r"\b([a-zA-Z][a-zA-Z ]{1,30}?)\s*(\d+(?:\.\d+)?)\s*%",
+            r"\b([a-zA-Z][a-zA-Z ]{1,30}?)\s*(\d+(?:\.\d+)?)\s*%?\b",
             clean_prompt,
             flags=re.IGNORECASE,
         )
@@ -400,6 +481,31 @@ class ProposalGenerator:
         if abs(total - 100.0) > 0.1:
             proposal.notes.append(
                 f"Weight check: total is {total:.1f}% (expected 100%)."
+            )
+
+        self._check_split_consistency(proposal)
+
+    def _check_split_consistency(self, proposal: GradebookProposal) -> None:
+        split_note = next(
+            (note for note in reversed(proposal.notes) if "split requested" in note.lower()),
+            None,
+        )
+        if not split_note:
+            return
+
+        parent = next((cat for cat in proposal.categories if self._normalize_name(cat.name) == "assignments"), None)
+        if parent is None:
+            return
+
+        parts = re.findall(r"\b([A-Za-z][A-Za-z ]+?)\s+(\d+(?:\.\d+)?)%", split_note)
+        if not parts:
+            return
+
+        split_total = sum(float(weight) for _, weight in parts)
+        if abs(split_total - parent.weight) > 0.1:
+            proposal.notes.append(
+                f"Assignments internal split totals {split_total:.1f}% while parent weight is {parent.weight:.1f}%. "
+                "Please update split weights if you want them to match."
             )
 
     @staticmethod

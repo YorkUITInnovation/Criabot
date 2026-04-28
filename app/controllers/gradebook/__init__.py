@@ -4,7 +4,7 @@ import app.core.config as config
 from app.core.objects import AppMode
 from app.core.security.handlers.master import GetApiKeyMaster
 from app.core.route import CriaRouter
-from . import accept, chat, proposal, start, status, finalize
+from . import accept, chat, proposal, start, status, finalize, upload
 
 MASTER_DEPS: list = [Security(GetApiKeyMaster())] if config.APP_MODE == AppMode.PRODUCTION else []
 
@@ -14,6 +14,7 @@ proposal.view.dependencies.extend(MASTER_DEPS)
 accept.view.dependencies.extend(MASTER_DEPS)
 status.view.dependencies.extend(MASTER_DEPS)
 finalize.view.dependencies.extend(MASTER_DEPS)
+upload.view.dependencies.extend(MASTER_DEPS)
 
 router = CriaRouter(tags=["Gradebook"])
 router.include_views(
@@ -23,6 +24,7 @@ router.include_views(
     accept.view,
     status.view,
     finalize.view,
+    upload.view,
 )
 
 __all__ = ["router"]

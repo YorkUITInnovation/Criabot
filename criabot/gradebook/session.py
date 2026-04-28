@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
 from typing import Dict, List, TYPE_CHECKING
@@ -16,37 +17,126 @@ if TYPE_CHECKING:
 
 
 class GradebookSessionEngine:
-    def __init__(self, gradebook_db: 'GradebookDatabaseAPI' = None, gradebook_cache=None) -> None:
+    def __init__(
+        self,
+        gradebook_db: 'GradebookDatabaseAPI' = None,
+        gradebook_cache=None,
+        criadex=None,
+        mapping_llm_model_id: str | None = None,
+    ) -> None:
         self._gradebook_db = gradebook_db
         self._gradebook_cache = gradebook_cache
         self._proposal_generator = ProposalGenerator()
-        self._content_mapper = ContentMapper()
+        self._content_mapper = ContentMapper(criadex=criadex, llm_model_id=mapping_llm_model_id)
         self._conversation = ConversationManager()
         self._session_expire_seconds = _parse_time_to_seconds(
             os.environ.get("GRADEBOOK_SESSION_EXPIRE_TIME", "4h")
         )
         # Keep in-memory cache for active sessions
         self._active_sessions: Dict[str, GradebookSessionRecord] = {}
+        self._proposal_history: Dict[str, List[dict]] = {}
+        self._proposal_history_index: Dict[str, int] = {}
+
+    def _push_proposal_history(self, session: GradebookSessionRecord) -> None:
+        if session.proposal is None:
+            return
+
+        proposal_dict = session.proposal.model_dump()
+        history = self._proposal_history.setdefault(session.session_id, [])
+        current_index = self._proposal_history_index.get(session.session_id, -1)
+
+        if current_index >= 0 and history[current_index] == proposal_dict:
+            return
+
+        if current_index < len(history) - 1:
+            del history[current_index + 1:]
+
+        history.append(proposal_dict)
+        self._proposal_history_index[session.session_id] = len(history) - 1
+
+    def _is_undo_prompt(self, prompt: str) -> bool:
+        lowered = prompt.lower()
+        return bool(re.search(r"\bundo\b", lowered))
+
+    def _is_redo_prompt(self, prompt: str) -> bool:
+        lowered = prompt.lower()
+        return bool(re.search(r"\bredo\b", lowered))
+
+    def _restore_from_history(self, session: GradebookSessionRecord, direction: str) -> bool:
+        history = self._proposal_history.get(session.session_id, [])
+        if not history:
+            return False
+
+        index = self._proposal_history_index.get(session.session_id, len(history) - 1)
+        if direction == "undo":
+            next_index = index - 1
+        else:
+            next_index = index + 1
+
+        if next_index < 0 or next_index >= len(history):
+            return False
+
+        from .schemas import GradebookProposal
+
+        session.proposal = GradebookProposal.parse_obj(history[next_index])
+        self._proposal_history_index[session.session_id] = next_index
+        return True
 
     @staticmethod
     def _has_syllabus(resources: List[MoodleResource]) -> bool:
-        if resources:
-            # Treat any loaded course resource as syllabus-like context for initial analysis.
-            resource_like_types = {"resource", "page", "book", "folder", "file", "url"}
-            if any((resource.type or "").lower() in resource_like_types for resource in resources):
-                return True
         for resource in resources:
             name = (resource.name or "").lower()
+            section = (resource.section or "").lower()
             preview = (resource.content_preview or "").lower()
             if (
                 "syllabus" in name
+                or "syllabi" in name
+                or "syllabe" in name
+                or "plan de cours" in name
+                or "plan du cours" in name
+                or "programme" in name
                 or "outline" in name
                 or "grading" in preview
                 or "assessment" in preview
+                or "syllabus" in preview
+                or "syllabe" in preview
+                or "plan de cours" in preview
+                or "plan du cours" in preview
+                or "bar\u00e8me" in preview
+                or section in {"0", "section 0"}
                 or "%" in preview
             ):
                 return True
         return False
+
+    @staticmethod
+    def _detect_syllabus_sources(resources: List[MoodleResource]) -> List[str]:
+        sources: List[str] = []
+        for resource in resources:
+            name = (resource.name or "").lower()
+            section = (resource.section or "").lower()
+            preview = (resource.content_preview or "").lower()
+            if (
+                "syllabus" in name
+                or "syllabi" in name
+                or "syllabe" in name
+                or "plan de cours" in name
+                or "plan du cours" in name
+                or "programme" in name
+                or "outline" in name
+                or "grading" in preview
+                or "assessment" in preview
+                or "syllabus" in preview
+                or "syllabe" in preview
+                or "bar\u00e8me" in preview
+                or "plan de cours" in preview
+                or "plan du cours" in preview
+                or section in {"0", "section 0"}
+                or "%" in preview
+            ):
+                if resource.name:
+                    sources.append(resource.name)
+        return sources
 
     async def _save_session(self, session: GradebookSessionRecord) -> None:
         session.last_touched_at = int(time.time())
@@ -189,7 +279,9 @@ class GradebookSessionEngine:
                 if resource.name
             ]
         session_id = "gb-" + str(uuid.uuid4())
-        phase = "ANALYSIS" if self._has_syllabus(moodle_resources) else "INTAKE"
+        syllabus_sources = self._detect_syllabus_sources(moodle_resources)
+        has_syllabus = len(syllabus_sources) > 0
+        phase = "ANALYSIS" if has_syllabus else "INTAKE"
         proposal = self._proposal_generator.generate_initial(course_activities) if phase == "ANALYSIS" else None
         record = GradebookSessionRecord(
             session_id=session_id,
@@ -199,10 +291,15 @@ class GradebookSessionEngine:
             phase=phase,
             moodle_resources=moodle_resources,
             course_activities=course_activities,
+            extraction={
+                "has_syllabus": has_syllabus,
+                "syllabus_sources": syllabus_sources,
+            },
             proposal=proposal,
             last_touched_at=int(time.time()),
         )
         self._active_sessions[session_id] = record
+        self._push_proposal_history(record)
         await self._save_session(record)
         return record
 
@@ -236,12 +333,33 @@ class GradebookSessionEngine:
         if session is None:
             raise KeyError("gradebook session not found")
 
+        session.extraction = session.extraction or {}
+        session.extraction["latest_prompt"] = prompt
+
+        if self._is_undo_prompt(prompt):
+            restored = self._restore_from_history(session, direction="undo")
+            if not restored and session.proposal:
+                session.proposal.notes.append("Nothing to undo.")
+            session.phase = "REFINEMENT" if session.proposal else session.phase
+            await self._save_session(session)
+            return session
+
+        if self._is_redo_prompt(prompt):
+            restored = self._restore_from_history(session, direction="redo")
+            if not restored and session.proposal:
+                session.proposal.notes.append("Nothing to redo.")
+            session.phase = "REFINEMENT" if session.proposal else session.phase
+            await self._save_session(session)
+            return session
+
         session.phase = self._conversation.next_phase(session, prompt)
         if session.phase in {"ANALYSIS", "REFINEMENT", "PROPOSAL"} and session.proposal is None:
             session.proposal = self._proposal_generator.generate_initial(session.course_activities)
+            self._push_proposal_history(session)
 
         if session.proposal is not None:
             session.proposal = self._proposal_generator.update_from_prompt(session.proposal, prompt)
+            self._push_proposal_history(session)
 
         await self._save_session(session)
         return session
@@ -255,7 +373,7 @@ class GradebookSessionEngine:
             return session
 
         session.phase = "ACCEPTED"
-        session.content_mapping = self._content_mapper.build_mapping(
+        session.content_mapping = await self._content_mapper.build_mapping(
             course_activities=session.course_activities,
             proposal=session.proposal,
         )
