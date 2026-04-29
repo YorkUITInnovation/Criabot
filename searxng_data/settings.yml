@@ -1,0 +1,24 @@
+# SearXNG settings (override defaults safely)
+use_default_settings:
+  engines:
+    keep_only:
+      - google
+      - bing
+      - duckduckgo
+      - wikipedia
+      - youtube
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  # secret_key is used for session encryption and as a seed for hashing algorithms.
+  # For internal Docker-only services, a static key in the repo is acceptable for consistency.
+  secret_key: "6164d11270278783e449a5b672727670783510e140d348a604f32e2c562507e1"
+  image_proxy: true
+  limiter: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+
+# Valkey URL is provided via SEARXNG_VALKEY_URL in docker-compose.

@@ -39,6 +39,7 @@ services:
         - './html/config.php:/var/www/html/config.php:cached'
         - './moodledata:/var/www/moodledata:cached'
         - './log:/var/log/apache2:cached'
+        - '../Cria:/var/www/html/local/cria:cached'
       depends_on:
         - mysql
         - mailhog
@@ -52,7 +53,24 @@ services:
       volumes:
         - "./user_data:/home/user/user_data"
         - "./user_scripts:/home/user/user_scripts"
-    # Elasticsearch
+    # Cria-Back SearXNG
+    searxng:
+      image: docker.io/searxng/searxng:latest
+      ports:
+        - "127.0.0.1:8082:8080"
+      environment:
+        SEARXNG_BASE_URL: "http://searxng:8080/"
+        SEARXNG_VALKEY_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+        SEARXNG_LIMITER: "false"
+      healthcheck:
+        test: [ "CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1" ]
+        start_period: 10s
+        interval: 10s
+        timeout: 5s
+        retries: 10
+      volumes:
+        - ./searxng_data/settings.yml:/etc/searxng/settings.yml:ro
+        - ./searxng_data/limiter.toml:/etc/searxng/limiter.toml:ro
     elasticsearch:
       image: docker.io/elasticsearch:8.13.4
       environment:
@@ -129,6 +147,8 @@ services:
         redis:
           condition: service_started
         criadex:
+          condition: service_healthy
+        searxng:
           condition: service_healthy
       healthcheck:
         test: [ "CMD", "curl", "-f", "http://criabot:25575/health_check" ]

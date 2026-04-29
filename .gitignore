@@ -1,6 +1,12 @@
 # Ignore data and log directories
 *_data/
 *data/
+
+# Keep SearXNG runtime config tracked in git.
+!searxng_data/
+!searxng_data/settings.yml
+!searxng_data/limiter.toml
+
 log/
 html/
 user_*

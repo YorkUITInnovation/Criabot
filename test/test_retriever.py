@@ -18,6 +18,10 @@ def bot_params():
     params.min_k = 1
     params.top_n = 3
     params.min_n = 1
+    params.web_search_enabled = False
+    params.web_search_global_enabled = True
+    params.faq_fallback_enabled = False
+    params.faq_fallback_threshold = 0.5
     return params
 
 @pytest.fixture
@@ -204,3 +208,41 @@ def test_build_retrieval_prompts_for_summary_query():
         "the HR handbook release date",
         "the robotics lab location",
     ]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_uses_web_search_fallback_when_enabled(retriever):
+    retriever._bot_params.web_search_enabled = True
+    retriever._criadex.content.search.side_effect = [
+        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
+        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
+    ]
+    web_nodes = [create_text_node("[WEB RESULT #1] external answer", metadata={"source_type": "web_search"}, score=0.7)]
+    retriever._search_web_nodes = AsyncMock(return_value=web_nodes)
+
+    response = await retriever.retrieve(prompt="hello", metadata_filter=None, extra_bots=[])
+
+    retriever._search_web_nodes.assert_awaited_once_with("hello")
+    assert isinstance(response.context, TextContext)
+    assert "external answer" in response.context.text
+
+
+@pytest.mark.asyncio
+async def test_retrieve_merges_web_search_on_explicit_request(retriever):
+    retriever._bot_params.web_search_enabled = True
+    local_nodes = [create_text_node("local answer", score=0.9)]
+    retriever._criadex.content.search.side_effect = [
+        {"response": GroupSearchResponse(nodes=local_nodes, search_units=1, metadata={}, assets=[]).model_dump()},
+        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
+    ]
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": local_nodes, "search_units": 1})
+    retriever._search_web_nodes = AsyncMock(
+        return_value=[create_text_node("[WEB RESULT #1] web answer", metadata={"source_type": "web_search"}, score=0.6)]
+    )
+
+    response = await retriever.retrieve(prompt="search the web for hello", metadata_filter=None, extra_bots=[])
+
+    retriever._search_web_nodes.assert_awaited_once_with("search the web for hello")
+    assert isinstance(response.context, TextContext)
+    assert "local answer" in response.context.text
+    assert "web answer" in response.context.text

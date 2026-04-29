@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import History
 from criabot.bot.chat.schemas import RelatedPrompt, Context, QuestionContext, TextContext
+from criabot.bot.chat.web_search import WebSearchClient, build_web_search_nodes
 from criabot.database.bots.tables.bot_params import BotParametersModel
 from criabot.faq.fallback import FAQFallback
 
@@ -61,6 +62,10 @@ class ContextRetriever:
         r"^(give me|provide|create|write)\s+(a\s+)?(summary|response|answer)\s+(including|with)\s+",
         re.IGNORECASE,
     )
+    _WEB_SEARCH_HINT_RE = re.compile(
+        r"\b(search\s+the\s+web|search\s+online|web\s+search|look\s+it\s+up\s+online|from\s+the\s+web)\b",
+        re.IGNORECASE,
+    )
 
     def __init__(
             self,
@@ -79,6 +84,29 @@ class ContextRetriever:
         self._graph_auto_build = os.getenv("GRAPH_RAG_CHAT_AUTO_BUILD", "true").lower() == "true"
         self._faq_fallback_enabled = os.getenv("FAQ_FALLBACK_ENABLED", "true").lower() == "true"
         self._faq_fallback_threshold = float(os.getenv("FAQ_FALLBACK_THRESHOLD", "0.5"))
+        self._web_search_global_enabled = os.getenv("WEB_SEARCH_GLOBAL_ENABLED", "true").lower() == "true"
+        self._web_search_url = os.getenv("WEB_SEARCH_URL", "http://searxng:8080")
+        self._web_search_timeout_seconds = float(os.getenv("WEB_SEARCH_TIMEOUT_SECONDS", "8"))
+        self._web_search_max_results = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+        self._web_search_fallback_only = os.getenv("WEB_SEARCH_FALLBACK_ONLY", "true").lower() == "true"
+
+    @classmethod
+    def _explicit_web_search_requested(cls, prompt: str) -> bool:
+        return bool(cls._WEB_SEARCH_HINT_RE.search(prompt or ""))
+
+    def _can_use_web_search(self) -> bool:
+        global_setting = bool(getattr(self._bot_params, "web_search_global_enabled", True))
+        bot_setting = bool(getattr(self._bot_params, "web_search_enabled", False))
+        return self._web_search_global_enabled and global_setting and bot_setting
+
+    async def _search_web_nodes(self, prompt: str) -> List[TextNodeWithScore]:
+        client = WebSearchClient(
+            base_url=self._web_search_url,
+            timeout_seconds=self._web_search_timeout_seconds,
+            max_results=self._web_search_max_results,
+        )
+        results = await client.search(prompt)
+        return build_web_search_nodes(results)
 
     @staticmethod
     def _looks_like_group_search_result(payload: object) -> bool:
@@ -294,6 +322,8 @@ class ContextRetriever:
         retriever_response.search_units = ContextRetrieverResponse.get_search_units(group_responses)
         retriever_response.group_responses = group_responses
         nodes = retriever_response.nodes
+        web_search_requested = self._explicit_web_search_requested(prompt)
+        web_search_enabled = self._can_use_web_search()
         faq_threshold = float(getattr(self._bot_params, "faq_fallback_threshold", self._faq_fallback_threshold))
         faq_enabled = bool(getattr(self._bot_params, "faq_fallback_enabled", self._faq_fallback_enabled))
 
@@ -316,6 +346,39 @@ class ContextRetriever:
                     return retriever_response
             except Exception:
                 pass
+
+        should_run_web_fallback = web_search_enabled and (
+            len(nodes) < 1 or max((float(node.score or 0.0) for node in nodes), default=0.0) < faq_threshold
+        )
+        should_run_web_parallel = web_search_enabled and web_search_requested
+
+        if should_run_web_fallback or should_run_web_parallel:
+            if should_run_web_parallel or not self._web_search_fallback_only:
+                try:
+                    web_nodes = await self._search_web_nodes(prompt)
+                    if web_nodes:
+                        nodes = self.normalize_ranked_nodes([*nodes, *web_nodes])
+                        if nodes:
+                            retriever_response.context = TextContext(
+                                text=build_text_context(nodes=nodes),
+                                nodes=nodes,
+                                related_prompts=[],
+                            )
+                            return retriever_response
+                except Exception:
+                    pass
+            else:
+                try:
+                    web_nodes = await self._search_web_nodes(prompt)
+                    if web_nodes:
+                        retriever_response.context = TextContext(
+                            text=build_text_context(nodes=web_nodes),
+                            nodes=web_nodes,
+                            related_prompts=[],
+                        )
+                        return retriever_response
+                except Exception:
+                    pass
 
         # If there are no nodes after fallback attempt, return no-context.
         if len(nodes) < 1:

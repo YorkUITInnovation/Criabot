@@ -7,6 +7,14 @@ from app.core.objects import AppMode, check_env_path
 
 from criabot.schemas import CriadexCredentials, RedisCredentials, MySQLCredentials
 
+
+def parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
 ENV_PATH: str = os.environ.get('ENV_PATH', "./.env")
 
 # Load .env configuration
@@ -65,6 +73,14 @@ FAQ_SYNC_ENABLED: bool = os.environ.get("FAQ_SYNC_ENABLED", "false").lower() == 
 FAQ_SYNC_INTERVAL_SECONDS: int = int(os.environ.get("FAQ_SYNC_INTERVAL_SECONDS", "21600"))
 FAQ_STALE_AFTER_SECONDS: int = int(os.environ.get("FAQ_STALE_AFTER_SECONDS", "43200"))
 FAQ_ALERT_FAILURE_THRESHOLD: int = int(os.environ.get("FAQ_ALERT_FAILURE_THRESHOLD", "3"))
+
+# Web search fallback config
+WEB_SEARCH_GLOBAL_ENABLED: bool = parse_bool(os.environ.get("WEB_SEARCH_GLOBAL_ENABLED"), True)
+WEB_SEARCH_PROVIDER: str = os.environ.get("WEB_SEARCH_PROVIDER", "searxng")
+WEB_SEARCH_URL: str = os.environ.get("WEB_SEARCH_URL", "http://searxng:8080")
+WEB_SEARCH_TIMEOUT_SECONDS: float = float(os.environ.get("WEB_SEARCH_TIMEOUT_SECONDS", "8"))
+WEB_SEARCH_MAX_RESULTS: int = int(os.environ.get("WEB_SEARCH_MAX_RESULTS", "5"))
+WEB_SEARCH_FALLBACK_ONLY: bool = parse_bool(os.environ.get("WEB_SEARCH_FALLBACK_ONLY"), True)
 
 # Set the Tiktoken cache directory
 os.environ["TIKTOKEN_CACHE_DIR"] = os.environ.get(

@@ -54,7 +54,11 @@ class FAQCrawler:
                     continue
                 visited.add(url)
 
-                response = await client.get(url)
+                # Network hiccups or slow pages should not abort the whole FAQ sync.
+                try:
+                    response = await client.get(url)
+                except httpx.RequestError:
+                    continue
                 if response.status_code != 200:
                     continue
                 content_type = (response.headers.get("content-type") or "").lower()
