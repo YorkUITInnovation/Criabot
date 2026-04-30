@@ -937,9 +937,9 @@ class Criabot:
             for index_type in ("DOCUMENT", "QUESTION"):
                 group_name = Bot.bot_group_name(parent_name, index_type)
                 try:
-                    await self._criadex.group_auth.create(
+                    await self._create_new_bot_auth_group(
                         group_name=group_name,
-                        api_key=child_api_key,
+                        bot_api_key=child_api_key,
                     )
                 except Exception as e:
                     status_code = getattr(e, "status_code", None)

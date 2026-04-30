@@ -81,6 +81,9 @@ WEB_SEARCH_URL: str = os.environ.get("WEB_SEARCH_URL", "http://searxng:8080")
 WEB_SEARCH_TIMEOUT_SECONDS: float = float(os.environ.get("WEB_SEARCH_TIMEOUT_SECONDS", "8"))
 WEB_SEARCH_MAX_RESULTS: int = int(os.environ.get("WEB_SEARCH_MAX_RESULTS", "5"))
 WEB_SEARCH_FALLBACK_ONLY: bool = parse_bool(os.environ.get("WEB_SEARCH_FALLBACK_ONLY"), True)
+WEB_SEARCH_FALLBACK_SCORE_THRESHOLD: float = float(
+    os.environ.get("WEB_SEARCH_FALLBACK_SCORE_THRESHOLD", os.environ.get("FAQ_FALLBACK_THRESHOLD", "0.5"))
+)
 
 # Set the Tiktoken cache directory
 os.environ["TIKTOKEN_CACHE_DIR"] = os.environ.get(

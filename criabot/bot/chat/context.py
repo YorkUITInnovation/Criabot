@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import History
 from criabot.bot.chat.schemas import RelatedPrompt, Context, QuestionContext, TextContext
-from criabot.bot.chat.web_search import WebSearchClient, build_web_search_nodes
+from criabot.bot.chat.web_search import WebSearchClient, build_web_search_nodes, infer_search_language
 from criabot.database.bots.tables.bot_params import BotParametersModel
 from criabot.faq.fallback import FAQFallback
 
@@ -57,13 +57,31 @@ class ContextRetriever:
     GROUP_NAME_METADATA_KEY: str = "group_name"
     ANSWER_METADATA_KEY: str = "answer"
     RELATED_PROMPTS_METADATA_KEY: str = "related_prompts"
+    PROBE_FALLBACK_METADATA_KEY: str = "_probe_fallback"
     _PROMPT_SPLIT_RE = re.compile(r",|\band\b", re.IGNORECASE)
     _PROMPT_PREFIX_RE = re.compile(
         r"^(give me|provide|create|write)\s+(a\s+)?(summary|response|answer)\s+(including|with)\s+",
         re.IGNORECASE,
     )
+    _QUESTION_PREFIX_RE = re.compile(
+        r"^(what|when|where|who|which|why|how)\s+"
+        r"(is|was|are|were|do|does|did|can|could|should|would|will|has|have|had)\s+",
+        re.IGNORECASE,
+    )
     _WEB_SEARCH_HINT_RE = re.compile(
-        r"\b(search\s+the\s+web|search\s+online|web\s+search|look\s+it\s+up\s+online|from\s+the\s+web)\b",
+        r"\b("
+        r"search\s+the\s+web|search\s+online|web\s+search|look\s+it\s+up\s+online|from\s+the\s+web|"
+        r"search\s+internet|on\s+the\s+web|"
+        r"cherche\s+sur\s+le\s+web|recherche\s+sur\s+internet|sur\s+le\s+web|en\s+ligne"
+        r")\b",
+        re.IGNORECASE,
+    )
+    _TIME_SENSITIVE_RE = re.compile(
+        r"\b("
+        r"latest|recent|today|now|current|news|update|updates|this\s+week|this\s+month|"
+        r"breaking|live|status|price|weather|release\s+notes|"
+        r"dernier|derniere|dernieres|actuel|actuelle|aujourd'hui|mise\s+a\s+jour|nouvelles"
+        r")\b",
         re.IGNORECASE,
     )
 
@@ -89,10 +107,76 @@ class ContextRetriever:
         self._web_search_timeout_seconds = float(os.getenv("WEB_SEARCH_TIMEOUT_SECONDS", "8"))
         self._web_search_max_results = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
         self._web_search_fallback_only = os.getenv("WEB_SEARCH_FALLBACK_ONLY", "true").lower() == "true"
+        self._web_search_fallback_threshold = float(
+            os.getenv("WEB_SEARCH_FALLBACK_SCORE_THRESHOLD", str(self._faq_fallback_threshold))
+        )
+        self._known_confidence_threshold = float(os.getenv("RETRIEVAL_KNOWN_THRESHOLD", "0.75"))
+        self._semi_known_confidence_threshold = float(os.getenv("RETRIEVAL_SEMI_THRESHOLD", "0.4"))
 
     @classmethod
     def _explicit_web_search_requested(cls, prompt: str) -> bool:
         return bool(cls._WEB_SEARCH_HINT_RE.search(prompt or ""))
+
+    @classmethod
+    def _is_summary_style_request(cls, prompt: str) -> bool:
+        return bool(cls._PROMPT_PREFIX_RE.match((prompt or "").strip()))
+
+    @classmethod
+    def _is_time_sensitive_request(cls, prompt: str) -> bool:
+        return bool(cls._TIME_SENSITIVE_RE.search(prompt or ""))
+
+    def _classify_retrieval_mode(self, prompt: str, max_node_score: float) -> str:
+        # Lightweight routing classifier for retrieval orchestration.
+        if self._is_time_sensitive_request(prompt):
+            return "external"
+        if max_node_score > self._known_confidence_threshold:
+            return "known"
+        if max_node_score > self._semi_known_confidence_threshold:
+            return "semi_known"
+        return "unknown"
+
+    @classmethod
+    def _extract_focused_question_prompt(cls, prompt: str) -> Optional[str]:
+        stripped_prompt = (prompt or "").strip().strip(" .?")
+        if not stripped_prompt:
+            return None
+
+        focused_prompt = cls._QUESTION_PREFIX_RE.sub("", stripped_prompt).strip(" .?")
+        if len(focused_prompt) < 6 or focused_prompt.lower() == stripped_prompt.lower():
+            return None
+
+        return focused_prompt
+
+    @staticmethod
+    def _strip_leading_article(prompt: str) -> str:
+        return re.sub(r"^(the|a|an)\s+", "", (prompt or "").strip(), flags=re.IGNORECASE)
+
+    @classmethod
+    def _prompt_keywords(cls, prompt: str) -> List[str]:
+        tokens = re.findall(r"[A-Za-z0-9']+", (prompt or "").lower())
+        stopwords = {
+            "the", "is", "was", "are", "were", "a", "an", "and", "or", "to", "of",
+            "in", "on", "for", "with", "me", "give", "provide", "create", "write",
+            "what", "when", "where", "who", "which", "why", "how",
+        }
+        keywords = [token for token in tokens if token not in stopwords and len(token) > 1]
+        return list(dict.fromkeys(keywords))
+
+    @classmethod
+    def prioritize_nodes_for_prompt(cls, prompt: str, nodes: List[TextNodeWithScore]) -> List[TextNodeWithScore]:
+        focused_prompt = cls._extract_focused_question_prompt(prompt) or prompt
+        keywords = cls._prompt_keywords(focused_prompt)
+        if not keywords:
+            return nodes
+
+        def relevance_key(item: tuple[int, TextNodeWithScore]) -> tuple[int, int, float, int]:
+            index, node = item
+            text = (node.node.text or "").lower()
+            matched_keywords = sum(1 for keyword in keywords if keyword in text)
+            total_matches = sum(text.count(keyword) for keyword in keywords)
+            return (-matched_keywords, -total_matches, -float(node.score or 0.0), index)
+
+        return [node for _, node in sorted(enumerate(nodes), key=relevance_key)]
 
     def _can_use_web_search(self) -> bool:
         global_setting = bool(getattr(self._bot_params, "web_search_global_enabled", True))
@@ -105,7 +189,7 @@ class ContextRetriever:
             timeout_seconds=self._web_search_timeout_seconds,
             max_results=self._web_search_max_results,
         )
-        results = await client.search(prompt)
+        results = await client.search(prompt, language=infer_search_language(prompt))
         return build_web_search_nodes(results)
 
     @staticmethod
@@ -122,44 +206,35 @@ class ContextRetriever:
             return False
         return False
 
+    @staticmethod
+    def _result_has_nodes(payload: object) -> bool:
+        if isinstance(payload, GroupSearchResponse):
+            return bool(payload.nodes)
+        if isinstance(payload, dict):
+            if isinstance(payload.get("nodes"), list):
+                return len(payload.get("nodes") or []) > 0
+            for key in ("response", "result", "data"):
+                nested = payload.get(key)
+                if isinstance(nested, dict) and isinstance(nested.get("nodes"), list):
+                    return len(nested.get("nodes") or []) > 0
+        return False
+
+    @classmethod
+    def _mark_probe_fallback_nodes(cls, response_obj: GroupSearchResponse) -> GroupSearchResponse:
+        for node in response_obj.nodes:
+            metadata = dict(node.node.metadata or {})
+            metadata[cls.PROBE_FALLBACK_METADATA_KEY] = True
+            node.node.metadata = metadata
+        return response_obj
+
     async def search_groups(
             self,
             prompt,
             metadata_filter,
             extra_bots
     ):
-        async def search_named_group(group_name: str, search_config: dict):
-            search_result = None
+        def to_group_response(search_result: object) -> tuple[GroupSearchResponse, object]:
             graph_meta = None
-            if self._graph_enabled:
-                try:
-                    manage_api = getattr(self._criadex, "manage", None)
-                    graph_search = getattr(manage_api, "graph_search", None) if manage_api is not None else None
-                    if callable(graph_search):
-                        graph_payload = {
-                            **search_config,
-                            "max_hops": 1,
-                            "max_expansion_terms": 8,
-                            "auto_build": self._graph_auto_build,
-                        }
-                        search_result = await graph_search(
-                            group_name=group_name,
-                            search_config=graph_payload
-                        )
-                        if inspect.isawaitable(search_result):
-                            search_result = await search_result
-                        if not self._looks_like_group_search_result(search_result):
-                            search_result = None
-                except Exception:
-                    search_result = None
-
-            if search_result is None:
-                search_result = await self._criadex.content.search(
-                    group_name=group_name,
-                    search_config=search_config
-                )
-                if inspect.isawaitable(search_result):
-                    search_result = await search_result
             if isinstance(search_result, dict):
                 candidate = None
                 for key in ("response", "result", "data"):
@@ -181,18 +256,138 @@ class ContextRetriever:
                 )
                 if isinstance(candidate, dict):
                     graph_meta = candidate.get("graph_metadata") or search_result.get("graph_metadata")
-            else:
-                if isinstance(search_result, GroupSearchResponse):
-                    response_obj = search_result
-                elif callable(getattr(search_result, "verify", None)):
-                    verified = search_result.verify()
-                    if inspect.isawaitable(verified):
-                        verified = await verified
-                    response_obj = getattr(verified, "response", verified)
-                    if inspect.isawaitable(response_obj):
-                        response_obj = await response_obj
-                else:
-                    raise TypeError("Unsupported search response payload type")
+                return response_obj, graph_meta
+
+            if isinstance(search_result, GroupSearchResponse):
+                return search_result, graph_meta
+
+            if callable(getattr(search_result, "verify", None)):
+                verified = search_result.verify()
+                if inspect.isawaitable(verified):
+                    # Keep sync helper pure; awaitable case handled by caller before conversion.
+                    raise TypeError("Awaitable verify() payload must be resolved before conversion")
+                response_obj = getattr(verified, "response", verified)
+                if inspect.isawaitable(response_obj):
+                    raise TypeError("Awaitable response payload must be resolved before conversion")
+                return response_obj, graph_meta
+
+            raise TypeError("Unsupported search response payload type")
+
+        async def search_named_group(group_name: str, search_config: dict):
+            def build_keyword_query(raw_prompt: str) -> str:
+                tokens = re.findall(r"[A-Za-z0-9']+", raw_prompt or "")
+                keywords = [token for token in tokens if len(token) > 2 or token.isdigit()]
+                # Keep deterministic and compact to avoid noisy expansions.
+                return " ".join(keywords[:12]).strip()
+
+            search_result = None
+            graph_meta = None
+            if self._graph_enabled:
+                try:
+                    manage_api = getattr(self._criadex, "manage", None)
+                    graph_search = getattr(manage_api, "graph_search", None) if manage_api is not None else None
+                    if callable(graph_search):
+                        graph_payload = {
+                            **search_config,
+                            "max_hops": 1,
+                            "max_expansion_terms": 8,
+                            "auto_build": self._graph_auto_build,
+                        }
+                        search_result = await graph_search(
+                            group_name=group_name,
+                            search_config=graph_payload
+                        )
+                        if inspect.isawaitable(search_result):
+                            search_result = await search_result
+                        if not self._looks_like_group_search_result(search_result):
+                            search_result = None
+                        elif not self._result_has_nodes(search_result):
+                            # If graph search yields an empty response, fall back to standard retrieval.
+                            search_result = None
+                except Exception:
+                    search_result = None
+
+            if search_result is None:
+                search_result = await self._criadex.content.search(
+                    group_name=group_name,
+                    search_config=search_config
+                )
+                if inspect.isawaitable(search_result):
+                    search_result = await search_result
+            response_obj, graph_meta_from_result = to_group_response(search_result)
+            if graph_meta_from_result:
+                graph_meta = graph_meta_from_result
+
+            # Intermittent ANN/search behavior can return 0 nodes for one source while
+            # peers return results. Retry once with a broader config for this group.
+            if not response_obj.nodes:
+                broad_search_config = {
+                    **search_config,
+                    "top_k": max(int(search_config.get("top_k", 0) or 0), 50),
+                    "top_n": max(int(search_config.get("top_n", 0) or 0), 20),
+                    "min_k": 0.0,
+                    "min_n": 0.0,
+                }
+                retry_result = await self._criadex.content.search(
+                    group_name=group_name,
+                    search_config=broad_search_config,
+                )
+                if inspect.isawaitable(retry_result):
+                    retry_result = await retry_result
+                retry_response_obj, retry_graph_meta = to_group_response(retry_result)
+                if retry_response_obj.nodes:
+                    response_obj = retry_response_obj
+                    if retry_graph_meta:
+                        graph_meta = retry_graph_meta
+
+            # Final fallback for prompt-specific misses: retry with compact keyword query.
+            if not response_obj.nodes:
+                keyword_query = build_keyword_query(search_config.get("query", ""))
+                if keyword_query:
+                    keyword_search_config = {
+                        **search_config,
+                        "query": keyword_query,
+                        "top_k": max(int(search_config.get("top_k", 0) or 0), 80),
+                        "top_n": max(int(search_config.get("top_n", 0) or 0), 30),
+                        "min_k": 0.0,
+                        "min_n": 0.0,
+                    }
+                    keyword_result = await self._criadex.content.search(
+                        group_name=group_name,
+                        search_config=keyword_search_config,
+                    )
+                    if inspect.isawaitable(keyword_result):
+                        keyword_result = await keyword_result
+                    keyword_response_obj, keyword_graph_meta = to_group_response(keyword_result)
+                    if keyword_response_obj.nodes:
+                        response_obj = keyword_response_obj
+                        if keyword_graph_meta:
+                            graph_meta = keyword_graph_meta
+
+            # Last-resort for document groups: force a lightweight lexical probe to
+            # avoid returning an empty source when a group definitely has content.
+            if not response_obj.nodes and group_name.endswith("-document-index"):
+                probe_search_config = {
+                    **search_config,
+                    "query": "the",
+                    "top_k": 1,
+                    "top_n": 1,
+                    "min_k": 0.0,
+                    "min_n": 0.0,
+                }
+                probe_result = await self._criadex.content.search(
+                    group_name=group_name,
+                    search_config=probe_search_config,
+                )
+                if inspect.isawaitable(probe_result):
+                    probe_result = await probe_result
+                probe_response_obj, probe_graph_meta = to_group_response(probe_result)
+                if probe_response_obj.nodes:
+                    probe_response_obj = self._mark_probe_fallback_nodes(probe_response_obj)
+                    response_obj = probe_response_obj
+                    if probe_graph_meta:
+                        graph_meta = probe_graph_meta
+
             if graph_meta:
                 response_obj.metadata = {**(response_obj.metadata or {}), "graph_rag": graph_meta}
             return {"group_name": group_name, "response": response_obj}
@@ -308,6 +503,7 @@ class ContextRetriever:
             group_responses={}
         )
         search_prompts = self.build_retrieval_prompts(prompt)
+        summary_style_request = self._is_summary_style_request(prompt)
         response_sets = []
         for search_prompt in search_prompts:
             response_sets.append(
@@ -322,13 +518,16 @@ class ContextRetriever:
         retriever_response.search_units = ContextRetrieverResponse.get_search_units(group_responses)
         retriever_response.group_responses = group_responses
         nodes = retriever_response.nodes
+        max_node_score = max((float(node.score or 0.0) for node in nodes), default=0.0)
         web_search_requested = self._explicit_web_search_requested(prompt)
         web_search_enabled = self._can_use_web_search()
+        retrieval_mode = self._classify_retrieval_mode(prompt=prompt, max_node_score=max_node_score)
         faq_threshold = float(getattr(self._bot_params, "faq_fallback_threshold", self._faq_fallback_threshold))
+        web_threshold = float(self._web_search_fallback_threshold)
         faq_enabled = bool(getattr(self._bot_params, "faq_fallback_enabled", self._faq_fallback_enabled))
 
         # If there are no nodes, or confidence is too low, try FAQ fallback first.
-        if faq_enabled and (len(nodes) < 1 or max((float(node.score or 0.0) for node in nodes), default=0.0) < faq_threshold):
+        if faq_enabled and (len(nodes) < 1 or max_node_score < faq_threshold):
             try:
                 fallback = FAQFallback(criadex=self._criadex)
                 fallback_result = await fallback.search(prompt=prompt, top_k=max(3, self._bot_params.top_n))
@@ -347,10 +546,12 @@ class ContextRetriever:
             except Exception:
                 pass
 
-        should_run_web_fallback = web_search_enabled and (
-            len(nodes) < 1 or max((float(node.score or 0.0) for node in nodes), default=0.0) < faq_threshold
+        should_run_web_parallel = web_search_enabled and (
+            web_search_requested or retrieval_mode == "external"
         )
-        should_run_web_parallel = web_search_enabled and web_search_requested
+        should_run_web_fallback = web_search_enabled and (
+            retrieval_mode == "unknown" or len(nodes) < 1 or max_node_score < web_threshold
+        )
 
         if should_run_web_fallback or should_run_web_parallel:
             if should_run_web_parallel or not self._web_search_fallback_only:
@@ -383,7 +584,21 @@ class ContextRetriever:
         # If there are no nodes after fallback attempt, return no-context.
         if len(nodes) < 1:
             return retriever_response
-        ranked_nodes = self.normalize_ranked_nodes(nodes)
+        ranked_nodes: List[TextNodeWithScore] = []
+        try:
+            rerank_result = await self.hybrid_rerank(prompt=prompt, nodes=nodes)
+            ranked_nodes = rerank_result.get("ranked_nodes") or []
+        except Exception:
+            ranked_nodes = []
+
+        ranked_nodes = self.normalize_ranked_nodes(
+            ranked_nodes or nodes,
+            blend_sources=summary_style_request,
+            preserve_order=bool(ranked_nodes),
+        )
+        if not summary_style_request:
+            ranked_nodes = self.prioritize_nodes_for_prompt(prompt, ranked_nodes)
+            ranked_nodes = ranked_nodes[:3]
         if len(ranked_nodes) > 0:
             retriever_response.context = self.build_context(ranked_nodes=ranked_nodes)
         # Give 'er
@@ -392,21 +607,36 @@ class ContextRetriever:
     @classmethod
     def build_retrieval_prompts(cls, prompt: str) -> List[str]:
         prompts = [prompt.strip()]
-        stripped_prompt = cls._PROMPT_PREFIX_RE.sub("", prompt.strip()).strip(" .")
-        segments = [
-            segment.strip(" .")
-            for segment in cls._PROMPT_SPLIT_RE.split(stripped_prompt)
-            if segment.strip(" .")
-        ]
+        stripped_prompt = prompt.strip()
 
-        for segment in segments:
-            if len(segment) < 6:
-                continue
-            prompts.append(segment)
+        if cls._is_summary_style_request(prompt):
+            summary_prompt = cls._PROMPT_PREFIX_RE.sub("", stripped_prompt).strip(" .")
+            segments = [
+                segment.strip(" .")
+                for segment in cls._PROMPT_SPLIT_RE.split(summary_prompt)
+                if segment.strip(" .")
+            ]
+
+            for segment in segments:
+                if len(segment) < 6:
+                    continue
+                prompts.append(segment)
+        else:
+            focused_prompt = cls._extract_focused_question_prompt(stripped_prompt)
+            if focused_prompt:
+                prompts.append(focused_prompt)
+                article_free_prompt = cls._strip_leading_article(focused_prompt)
+                if article_free_prompt and article_free_prompt.lower() != focused_prompt.lower():
+                    prompts.append(article_free_prompt)
 
         return list(dict.fromkeys(prompts))
 
-    def normalize_ranked_nodes(self, ranked_nodes: List[TextNodeWithScore]) -> List[TextNodeWithScore]:
+    def normalize_ranked_nodes(
+        self,
+        ranked_nodes: List[TextNodeWithScore],
+        blend_sources: bool = False,
+        preserve_order: bool = False,
+    ) -> List[TextNodeWithScore]:
         unique_nodes: list[TextNodeWithScore] = []
         seen: set[tuple[str, str, str]] = set()
 
@@ -422,28 +652,70 @@ class ContextRetriever:
             seen.add(dedupe_key)
             unique_nodes.append(node)
 
-        def sort_key(node: TextNodeWithScore) -> tuple[float, int, float]:
+        def sort_key(node: TextNodeWithScore) -> tuple[float, float]:
             metadata = node.node.metadata or {}
-            group_name = metadata.get(self.GROUP_NAME_METADATA_KEY, "")
-            own_groups = {
-                self._bot.group_name(index_type)
-                for index_type in self.INDEX_TYPES
-            }
-            source_priority = 0 if group_name in own_groups else 1
+            probe_priority = 1 if metadata.get(self.PROBE_FALLBACK_METADATA_KEY) else 0
             score = float(node.score or 0.0)
-            # Prefer the child's own groups when scores are effectively tied.
-            return (-round(score, 2), source_priority, -score)
+            # Prefer real query hits over probe fallbacks and otherwise stay
+            # score-first. Source ownership is not a reliable proxy for relevance.
+            return (probe_priority, -score)
 
-        return sorted(unique_nodes, key=sort_key)
+        if preserve_order:
+            non_probe_nodes = [
+                node for node in unique_nodes
+                if not (node.node.metadata or {}).get(self.PROBE_FALLBACK_METADATA_KEY)
+            ]
+            probe_nodes = [
+                node for node in unique_nodes
+                if (node.node.metadata or {}).get(self.PROBE_FALLBACK_METADATA_KEY)
+            ]
+            sorted_nodes = [*non_probe_nodes, *probe_nodes]
+        else:
+            sorted_nodes = sorted(unique_nodes, key=sort_key)
+        
+        if not blend_sources:
+            return sorted_nodes
+
+        # Multi-source blending is only useful for explicit summary-style prompts.
+        # Single-fact questions should stay relevance-first to avoid distracting context.
+        sources_by_group: Dict[str, list[TextNodeWithScore]] = {}
+        for node in sorted_nodes:
+            metadata = node.node.metadata or {}
+            group_name = metadata.get(self.GROUP_NAME_METADATA_KEY, "unknown")
+            if group_name not in sources_by_group:
+                sources_by_group[group_name] = []
+            sources_by_group[group_name].append(node)
+        
+        # If we have multiple sources, ensure each source is represented in results.
+        # No minimum node count required - we want diversity even with sparse results.
+        if len(sources_by_group) > 1:
+            result = []
+            # First pass: add top node from each source to guarantee representation
+            for group_name in sorted(sources_by_group.keys()):
+                if sources_by_group[group_name]:
+                    result.append(sources_by_group[group_name][0])
+            # Second pass: add remaining nodes in score order, up to reasonable limit
+            for node in sorted_nodes:
+                if len(result) >= 10:  # cap total nodes
+                    break
+                if node not in result:
+                    result.append(node)
+            return result
+        
+        return sorted_nodes
 
     @classmethod
     def build_context(cls, ranked_nodes: List[TextNodeWithScore]) -> Union[QuestionContext, TextContext]:
+        # Prefer document-like nodes when available. Question-index nodes can be noisy
+        # and may override better factual context from parent/child document sources.
+        non_question_nodes = [node for node in ranked_nodes if not cls.is_question_node(node)]
+        candidate_nodes = non_question_nodes or ranked_nodes
 
-        top_node_score: float = ranked_nodes[0].score
-        top_node: TextNodeWithScore = ranked_nodes[0]
+        top_node_score: float = candidate_nodes[0].score
+        top_node: TextNodeWithScore = candidate_nodes[0]
         # If there are multiple nodes with the top score
         # Make sure that a QUESTION
-        for node in ranked_nodes:
+        for node in candidate_nodes:
 
             if node.score > top_node_score:
                 top_node = node
@@ -471,15 +743,15 @@ class ContextRetriever:
             top_node.node.metadata.get(cls.ANSWER_METADATA_KEY)
             return TextContext(
                 text=build_text_context(nodes=[top_node]),
-                nodes=ranked_nodes,
+                nodes=candidate_nodes,
                 related_prompts=related_prompts,
             )
 
         # Case 2) Top node is not a question or direct response is not requested
         # This is the main case, text context gets built here
         return TextContext(
-            text=build_text_context(nodes=ranked_nodes),
-            nodes=ranked_nodes,
+            text=build_text_context(nodes=candidate_nodes),
+            nodes=candidate_nodes,
             related_prompts=related_prompts
         )
 

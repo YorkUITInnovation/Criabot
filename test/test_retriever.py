@@ -1,7 +1,32 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from criabot.bot.chat.context import ContextRetriever, TextContext, QuestionContext, ContextRetrieverResponse
+from criabot.bot.chat.web_search import infer_search_language
 from CriadexSDK.ragflow_schemas import TextNodeWithScore, TextNode, GroupSearchResponse, RerankAgentResponse, TransformAgentResponse, RelatedPrompt, ChatMessage
+
+
+def make_group_search_payload(nodes=None, search_units=1, metadata=None, assets=None):
+    return {
+        "response": GroupSearchResponse(
+            nodes=nodes or [],
+            search_units=search_units,
+            metadata=metadata or {},
+            assets=assets or [],
+        ).model_dump()
+    }
+
+
+def make_group_search_side_effect(group_to_nodes):
+    def _side_effect(*, group_name, search_config):
+        return make_group_search_payload(nodes=group_to_nodes.get(group_name, []))
+
+    return _side_effect
+
+
+def expected_empty_search_calls(group_count: int) -> int:
+    # Empty document groups use: base + broad + keyword + probe = 4 calls
+    # Empty question groups use: base + broad + keyword = 3 calls
+    return (4 * group_count) + (3 * group_count)
 
 @pytest.fixture
 def criadex_api():
@@ -50,10 +75,7 @@ def create_text_node(text, metadata=None, score=0.8):
 
 @pytest.mark.asyncio
 async def test_retrieve_no_nodes(retriever, bot_mock):
-    retriever._criadex.content.search.side_effect = [
-        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
-        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
-    ]
+    retriever._criadex.content.search.return_value = make_group_search_payload(nodes=[])
     response = await retriever.retrieve(prompt="hello", metadata_filter=None, extra_bots=[])
     assert isinstance(response, ContextRetrieverResponse)
     assert response.context is None
@@ -63,10 +85,9 @@ async def test_retrieve_no_nodes(retriever, bot_mock):
 @pytest.mark.asyncio
 async def test_retrieve_with_text_context(retriever, bot_mock):
     nodes = [create_text_node("text 1")]
-    retriever._criadex.content.search.side_effect = [
-        {"response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[]).model_dump()},
-        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
-    ]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
 
     # Mock hybrid_rerank to return what retrieve expects
     retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
@@ -82,11 +103,10 @@ async def test_retrieve_with_question_context_no_llm_reply(retriever, bot_mock):
         metadata={"answer": "the answer", "llm_reply": False, "file_name": "f", "group_name": "g"},
         score=0.9
     )
-    nodes = [question_node, create_text_node("other text")]
-    retriever._criadex.content.search.side_effect = [
-        {"response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[]).model_dump()},
-        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
-    ]
+    nodes = [question_node]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
 
     retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
 
@@ -101,11 +121,10 @@ async def test_retrieve_with_question_context_with_llm_reply(retriever, bot_mock
         metadata={"answer": "the answer", "llm_reply": True},
         score=0.9
     )
-    nodes = [question_node, create_text_node("other text")]
-    retriever._criadex.content.search.side_effect = [
-        {"response": GroupSearchResponse(nodes=nodes, search_units=1, metadata={}, assets=[]).model_dump()},
-        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
-    ]
+    nodes = [question_node]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
 
     retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
 
@@ -116,11 +135,9 @@ async def test_retrieve_with_question_context_with_llm_reply(retriever, bot_mock
 
 @pytest.mark.asyncio
 async def test_search_groups(retriever, bot_mock):
-    retriever._criadex.content.search.return_value = {
-        "response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()
-    }
+    retriever._criadex.content.search.return_value = make_group_search_payload(nodes=[])
     await retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=["extra_bot"])
-    assert retriever._criadex.content.search.call_count == len(retriever.INDEX_TYPES) * 2
+    assert retriever._criadex.content.search.call_count == expected_empty_search_calls(2)
     retriever._criadex.content.search.assert_any_call(
         group_name="child-document-index",
         search_config=retriever.build_search_group_config(
@@ -141,11 +158,9 @@ async def test_search_groups(retriever, bot_mock):
 @pytest.mark.asyncio
 async def test_search_groups_with_parent_bots(retriever, bot_mock):
     parent_bots = ["parent1", "parent2"]
-    retriever._criadex.content.search.return_value = {
-        "response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()
-    }
+    retriever._criadex.content.search.return_value = make_group_search_payload(nodes=[])
     await retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=parent_bots)
-    assert retriever._criadex.content.search.call_count == len(retriever.INDEX_TYPES) * 3
+    assert retriever._criadex.content.search.call_count == expected_empty_search_calls(3)
     retriever._criadex.content.search.assert_any_call(
         group_name="parent1-document-index",
         search_config=retriever.build_search_group_config(
@@ -210,13 +225,226 @@ def test_build_retrieval_prompts_for_summary_query():
     ]
 
 
+def test_build_retrieval_prompts_for_direct_question_adds_focused_variant():
+    prompts = ContextRetriever.build_retrieval_prompts(
+        "Where is the Advanced Robotics Lab located?"
+    )
+
+    assert prompts == [
+        "Where is the Advanced Robotics Lab located?",
+        "the Advanced Robotics Lab located",
+        "Advanced Robotics Lab located",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_limits_direct_question_context_to_top_three_nodes(retriever):
+    nodes = [
+        create_text_node("top result", metadata={"group_name": "child-document-index"}, score=0.95),
+        create_text_node("second result", metadata={"group_name": "parent1-document-index"}, score=0.85),
+        create_text_node("third result", metadata={"group_name": "parent2-document-index"}, score=0.75),
+        create_text_node("fourth result", metadata={"group_name": "parent3-document-index"}, score=0.65),
+    ]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
+
+    response = await retriever.retrieve(
+        prompt="What is the IT Department support motto?",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert isinstance(response.context, TextContext)
+    assert [node.node.text for node in response.context.nodes] == [
+        "top result",
+        "second result",
+        "third result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_keeps_full_context_for_explicit_summary_prompt(retriever):
+    nodes = [
+        create_text_node("top result", metadata={"group_name": "child-document-index"}, score=0.95),
+        create_text_node("second result", metadata={"group_name": "parent1-document-index"}, score=0.85),
+        create_text_node("third result", metadata={"group_name": "parent2-document-index"}, score=0.75),
+        create_text_node("fourth result", metadata={"group_name": "parent3-document-index"}, score=0.65),
+    ]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
+
+    response = await retriever.retrieve(
+        prompt="Give me a summary including the IT Department support motto, the HR handbook release date, and the robotics lab location.",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert isinstance(response.context, TextContext)
+    assert [node.node.text for node in response.context.nodes] == [
+        "top result",
+        "second result",
+        "third result",
+        "fourth result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_prefers_rerank_order_for_direct_question(retriever):
+    child_node = create_text_node(
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+        metadata={"group_name": "child-document-index"},
+        score=0.90,
+    )
+    parent_node = create_text_node(
+        "The IT Department support motto is QuantumGuard2026.",
+        metadata={"group_name": "parent1-document-index"},
+        score=0.70,
+    )
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {
+            "child-document-index": [child_node],
+            "parent1-document-index": [parent_node],
+        }
+    )
+    retriever.hybrid_rerank = AsyncMock(
+        return_value={"ranked_nodes": [parent_node, child_node], "search_units": 1}
+    )
+
+    response = await retriever.retrieve(
+        prompt="What is the IT Department support motto?",
+        metadata_filter=None,
+        extra_bots=["parent1"],
+    )
+
+    assert isinstance(response.context, TextContext)
+    assert [node.node.text for node in response.context.nodes] == [
+        "The IT Department support motto is QuantumGuard2026.",
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_prioritizes_prompt_matching_node_for_direct_question(retriever):
+    child_node = create_text_node(
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+        metadata={"group_name": "child-document-index"},
+        score=0.95,
+    )
+    parent_node = create_text_node(
+        "The IT Department support motto is QuantumGuard2026.",
+        metadata={"group_name": "parent1-document-index"},
+        score=0.70,
+    )
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {
+            "child-document-index": [child_node],
+            "parent1-document-index": [parent_node],
+        }
+    )
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": [], "search_units": 1})
+
+    response = await retriever.retrieve(
+        prompt="What is the IT Department support motto?",
+        metadata_filter=None,
+        extra_bots=["parent1"],
+    )
+
+    assert isinstance(response.context, TextContext)
+    assert [node.node.text for node in response.context.nodes] == [
+        "The IT Department support motto is QuantumGuard2026.",
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_prioritizes_release_date_node_for_when_question(retriever):
+    child_node = create_text_node(
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+        metadata={"group_name": "child-document-index"},
+        score=0.95,
+    )
+    hr_node = create_text_node(
+        "Employee Handbook version 5.4 was released on February 15, 2026.",
+        metadata={"group_name": "parent2-document-index"},
+        score=0.70,
+    )
+    it_node = create_text_node(
+        "The IT Department support motto is QuantumGuard2026.",
+        metadata={"group_name": "parent1-document-index"},
+        score=0.65,
+    )
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {
+            "child-document-index": [child_node],
+            "parent1-document-index": [it_node],
+            "parent2-document-index": [hr_node],
+        }
+    )
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": [], "search_units": 1})
+
+    response = await retriever.retrieve(
+        prompt="When was Employee Handbook version 5.4 released?",
+        metadata_filter=None,
+        extra_bots=["parent1", "parent2"],
+    )
+
+    assert isinstance(response.context, TextContext)
+    assert [node.node.text for node in response.context.nodes] == [
+        "Employee Handbook version 5.4 was released on February 15, 2026.",
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+        "The IT Department support motto is QuantumGuard2026.",
+    ]
+
+
+def test_normalize_ranked_nodes_deprioritizes_probe_fallback_hits(retriever):
+    probe_node = create_text_node(
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+        metadata={
+            "group_name": "child-document-index",
+            "_probe_fallback": True,
+        },
+        score=0.95,
+    )
+    parent_match = create_text_node(
+        "The IT Department support motto is QuantumGuard2026.",
+        metadata={"group_name": "parent1-document-index"},
+        score=0.80,
+    )
+
+    ranked = retriever.normalize_ranked_nodes([probe_node, parent_match])
+
+    assert [node.node.text for node in ranked] == [
+        "The IT Department support motto is QuantumGuard2026.",
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+    ]
+
+
+def test_normalize_ranked_nodes_keeps_higher_scoring_parent_match_first(retriever):
+    child_node = create_text_node(
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+        metadata={"group_name": "child-document-index"},
+        score=0.70,
+    )
+    parent_node = create_text_node(
+        "The IT Department support motto is QuantumGuard2026.",
+        metadata={"group_name": "parent1-document-index"},
+        score=0.85,
+    )
+
+    ranked = retriever.normalize_ranked_nodes([child_node, parent_node])
+
+    assert [node.node.text for node in ranked] == [
+        "The IT Department support motto is QuantumGuard2026.",
+        "The Advanced Robotics Lab is located in the basement of Building 7, Room B12.",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_retrieve_uses_web_search_fallback_when_enabled(retriever):
     retriever._bot_params.web_search_enabled = True
-    retriever._criadex.content.search.side_effect = [
-        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
-        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
-    ]
+    retriever._criadex.content.search.return_value = make_group_search_payload(nodes=[])
     web_nodes = [create_text_node("[WEB RESULT #1] external answer", metadata={"source_type": "web_search"}, score=0.7)]
     retriever._search_web_nodes = AsyncMock(return_value=web_nodes)
 
@@ -231,10 +459,9 @@ async def test_retrieve_uses_web_search_fallback_when_enabled(retriever):
 async def test_retrieve_merges_web_search_on_explicit_request(retriever):
     retriever._bot_params.web_search_enabled = True
     local_nodes = [create_text_node("local answer", score=0.9)]
-    retriever._criadex.content.search.side_effect = [
-        {"response": GroupSearchResponse(nodes=local_nodes, search_units=1, metadata={}, assets=[]).model_dump()},
-        {"response": GroupSearchResponse(nodes=[], search_units=1, metadata={}, assets=[]).model_dump()},
-    ]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": local_nodes}
+    )
     retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": local_nodes, "search_units": 1})
     retriever._search_web_nodes = AsyncMock(
         return_value=[create_text_node("[WEB RESULT #1] web answer", metadata={"source_type": "web_search"}, score=0.6)]
@@ -246,3 +473,94 @@ async def test_retrieve_merges_web_search_on_explicit_request(retriever):
     assert isinstance(response.context, TextContext)
     assert "local answer" in response.context.text
     assert "web answer" in response.context.text
+
+
+@pytest.mark.asyncio
+async def test_retrieve_skips_web_search_when_bot_toggle_disabled(retriever):
+    retriever._bot_params.web_search_enabled = False
+    retriever._criadex.content.search.return_value = make_group_search_payload(nodes=[])
+    retriever._search_web_nodes = AsyncMock(return_value=[create_text_node("web", score=0.7)])
+
+    response = await retriever.retrieve(prompt="search the web for something", metadata_filter=None, extra_bots=[])
+
+    retriever._search_web_nodes.assert_not_awaited()
+    assert response.context is None
+
+
+@pytest.mark.asyncio
+async def test_retrieve_skips_web_search_when_global_toggle_disabled(retriever):
+    retriever._bot_params.web_search_enabled = True
+    retriever._bot_params.web_search_global_enabled = False
+    retriever._criadex.content.search.return_value = make_group_search_payload(nodes=[])
+    retriever._search_web_nodes = AsyncMock(return_value=[create_text_node("web", score=0.7)])
+
+    response = await retriever.retrieve(prompt="search the web for something", metadata_filter=None, extra_bots=[])
+
+    retriever._search_web_nodes.assert_not_awaited()
+    assert response.context is None
+
+
+@pytest.mark.asyncio
+async def test_retrieve_uses_web_threshold_for_low_confidence(monkeypatch, retriever):
+    retriever._bot_params.web_search_enabled = True
+    retriever._bot_params.web_search_global_enabled = True
+    retriever._bot_params.faq_fallback_enabled = False
+    monkeypatch.setenv("WEB_SEARCH_FALLBACK_SCORE_THRESHOLD", "0.85")
+    retriever._web_search_fallback_threshold = 0.85
+
+    low_conf_node = create_text_node("low confidence local", score=0.40)
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": [low_conf_node]}
+    )
+
+    retriever._search_web_nodes = AsyncMock(
+        return_value=[create_text_node("[WEB RESULT #1] web fallback", metadata={"source_type": "web_search"}, score=0.9)]
+    )
+
+    response = await retriever.retrieve(prompt="obscure query", metadata_filter=None, extra_bots=[])
+
+    retriever._search_web_nodes.assert_awaited_once_with("obscure query")
+    assert isinstance(response.context, TextContext)
+    assert "web fallback" in response.context.text
+
+
+def test_explicit_web_search_requested_supports_french():
+    assert ContextRetriever._explicit_web_search_requested("cherche sur le web les dernières nouvelles")
+    assert ContextRetriever._explicit_web_search_requested("fais une recherche sur internet")
+
+
+def test_time_sensitive_request_detection_supports_english_and_french():
+    assert ContextRetriever._is_time_sensitive_request("What are the latest updates on the standard?")
+    assert ContextRetriever._is_time_sensitive_request("Donne-moi les dernières nouvelles de securite")
+
+
+def test_classify_retrieval_mode_thresholds(retriever):
+    assert retriever._classify_retrieval_mode(prompt="internal question", max_node_score=0.9) == "known"
+    assert retriever._classify_retrieval_mode(prompt="normal question", max_node_score=0.6) == "semi_known"
+    assert retriever._classify_retrieval_mode(prompt="What are latest updates?", max_node_score=0.6) == "external"
+    assert retriever._classify_retrieval_mode(prompt="obscure query", max_node_score=0.2) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_retrieve_runs_web_search_for_time_sensitive_query(retriever):
+    retriever._bot_params.web_search_enabled = True
+    local_nodes = [create_text_node("local answer", score=0.9)]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": local_nodes}
+    )
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": local_nodes, "search_units": 1})
+    retriever._search_web_nodes = AsyncMock(
+        return_value=[create_text_node("[WEB RESULT #1] fresh web answer", metadata={"source_type": "web_search"}, score=0.6)]
+    )
+
+    response = await retriever.retrieve(prompt="latest release notes for this standard", metadata_filter=None, extra_bots=[])
+
+    retriever._search_web_nodes.assert_awaited_once_with("latest release notes for this standard")
+    assert isinstance(response.context, TextContext)
+    assert "local answer" in response.context.text
+    assert "fresh web answer" in response.context.text
+
+
+def test_infer_search_language_french_and_english():
+    assert infer_search_language("Quels sont les meilleurs cours en intelligence artificielle?") == "fr"
+    assert infer_search_language("Please search latest Python release notes") == "en-US"

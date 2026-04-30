@@ -6,6 +6,10 @@ from criabot.bot.bot import Bot
 from criabot.bot.chat.context import ContextRetriever
 
 
+def expected_empty_search_calls(group_count: int) -> int:
+    return (4 * group_count) + (3 * group_count)
+
+
 @pytest.fixture
 def bot_cache_api():
     return AsyncMock()
@@ -116,7 +120,7 @@ async def test_search_groups_falls_back_when_graph_payload_invalid(retriever):
     result = await retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=[])
 
     assert retriever._criadex.manage.graph_search.call_count == len(retriever.INDEX_TYPES)
-    assert retriever._criadex.content.search.call_count == len(retriever.INDEX_TYPES)
+    assert retriever._criadex.content.search.call_count == expected_empty_search_calls(1)
     assert set(result.keys()) == {"child-document-index", "child-question-index"}
 
 
@@ -139,4 +143,4 @@ async def test_search_groups_uses_standard_search_when_graph_disabled(criadex_ap
     await local_retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=[])
 
     criadex_api.manage.graph_search.assert_not_called()
-    assert criadex_api.content.search.call_count == len(local_retriever.INDEX_TYPES)
+    assert criadex_api.content.search.call_count == expected_empty_search_calls(1)

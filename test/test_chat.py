@@ -7,6 +7,19 @@ from criabot.database.bots.tables.bot_params import BotParametersModel
 from CriadexSDK.ragflow_schemas import TextNodeWithScore, TextNode, ChatMessage
 import httpx
 
+
+def make_text_node(text: str, score: float = 0.9, metadata: dict | None = None):
+    return TextNodeWithScore(
+        node=TextNode(
+            text=text,
+            metadata=metadata or {"group_name": "test-document-index"},
+            text_template="",
+            metadata_template="",
+            class_name="",
+        ),
+        score=score,
+    )
+
 @pytest.fixture
 def bot_mock():
     bot = AsyncMock()
@@ -147,3 +160,69 @@ async def test_history_management(bot_mock, chat_model, bot_parameters):
         await chat.send(prompt=long_string, metadata_filter=None, extra_bots=[])
 
     assert len(chat.history()) <= 4
+
+
+@pytest.mark.asyncio
+async def test_send_single_question_does_not_force_summary(chat, bot_mock):
+    nodes = [
+        make_text_node("Employee Handbook version 5.4 was released on February 15, 2026."),
+        make_text_node("The Advanced Robotics Lab is located in the basement of Building 7, Room B12."),
+        make_text_node("The IT Department support motto is QuantumGuard2026."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
+    )
+
+    reply = await chat.send(
+        prompt="When was Employee Handbook version 5.4 released?",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert not reply.content.content.startswith("Summary:\n")
+    assert reply.content.content == "Employee Handbook version 5.4 was released on February 15, 2026."
+    bot_mock.criadex.agents.azure.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_simple_factoid_question_uses_direct_top_fact_reply(chat, bot_mock):
+    nodes = [
+        make_text_node("The IT Department support motto is QuantumGuard2026."),
+        make_text_node("Employee Handbook version 5.4 was released on February 15, 2026."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
+    )
+
+    reply = await chat.send(
+        prompt="What is the IT Department support motto?",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert reply.content.content == "The IT Department support motto is QuantumGuard2026."
+    bot_mock.criadex.agents.azure.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_explicit_summary_prompt_uses_summary_fast_path(chat, bot_mock):
+    nodes = [
+        make_text_node("The Advanced Robotics Lab is located in the basement of Building 7, Room B12."),
+        make_text_node("Employee Handbook version 5.4 was released on February 15, 2026."),
+        make_text_node("The IT Department support motto is QuantumGuard2026."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
+    )
+
+    reply = await chat.send(
+        prompt="Give me a summary including the IT Department support motto, the HR handbook release date, and the robotics lab location.",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert reply.content.content.startswith("Summary:\n")
+    bot_mock.criadex.agents.azure.chat.assert_not_called()

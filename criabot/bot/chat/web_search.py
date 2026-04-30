@@ -1,10 +1,43 @@
 from __future__ import annotations
 
+import re
 from typing import List
 
 import httpx
 
 from CriadexSDK.ragflow_schemas import TextNodeWithScore
+
+
+_FRENCH_MARKER_RE = re.compile(
+    r"\b("
+    r"bonjour|salut|merci|s'il\s+vous\s+plait|svp|recherche|chercher|trouver|"
+    r"internet|ligne|fran[cç]ais|france|qu[e']|quoi|comment|pourquoi|"
+    r"est-ce|avec|sans|dans|sur|vous|nous|ils|elles"
+    r")\b",
+    re.IGNORECASE,
+)
+_TOKEN_RE = re.compile(r"[a-zA-ZÀ-ÿ']+")
+_FRENCH_STOPWORDS = {
+    "le", "la", "les", "de", "des", "du", "et", "ou", "en", "sur", "avec", "sans", "pour",
+    "est", "sont", "dans", "que", "qui", "quoi", "comment", "pourquoi", "quel", "quelle", "quels",
+    "quelles", "bonjour", "merci", "recherche", "chercher", "internet", "ligne", "francais", "français",
+}
+
+
+def infer_search_language(query: str, default: str = "en-US") -> str:
+    text = (query or "").strip()
+    if not text:
+        return default
+
+    lowered = text.lower()
+    if any(ch in lowered for ch in ("é", "è", "ê", "ë", "à", "â", "î", "ï", "ô", "ù", "û", "ç")):
+        return "fr"
+    if _FRENCH_MARKER_RE.search(lowered):
+        return "fr"
+    tokens = [token.lower() for token in _TOKEN_RE.findall(text)]
+    if sum(1 for token in tokens if token in _FRENCH_STOPWORDS) >= 2:
+        return "fr"
+    return default
 
 
 class WebSearchClient:
@@ -13,14 +46,20 @@ class WebSearchClient:
         self._timeout_seconds = timeout_seconds
         self._max_results = max_results
 
-    async def search(self, query: str) -> List[dict]:
+    async def search(self, query: str, language: str | None = None) -> List[dict]:
         if not query.strip():
             return []
+
+        effective_language = (language or infer_search_language(query)).strip()
+        if not effective_language:
+            effective_language = "en-US"
+        if effective_language.lower() in {"fr-ca", "fr_fr", "fr-ca", "fr_ca"}:
+            effective_language = "fr"
 
         params = {
             "q": query,
             "format": "json",
-            "language": "en-US",
+            "language": effective_language,
             "safesearch": 1,
             "categories": "general",
         }

@@ -112,9 +112,9 @@ class Chat:
 
         # Generate the response history
         if isinstance(response.context, TextContext):
-            if self._should_use_direct_text_reply(response.context):
+            if self._should_use_direct_text_reply(response.context, prompt):
                 reply_history, reply_tokens = self._direct_text_context_reply(response.context)
-            elif self._should_use_direct_text_summary_reply(response.context):
+            elif self._should_use_direct_text_summary_reply(response.context, prompt):
                 reply_history, reply_tokens = self._direct_text_summary_reply(response.context)
             else:
                 reply_history, reply_tokens, message_text = await self._text_context_reply(
@@ -401,15 +401,21 @@ class Chat:
         )
         return self._buffer.history, None
 
-    def _should_use_direct_text_reply(self, context: TextContext) -> bool:
-        if len(context.nodes) != 1:
+    def _should_use_direct_text_reply(self, context: TextContext, prompt: str) -> bool:
+        fact_texts = self._extract_fact_texts(context)
+        if not fact_texts:
             return False
 
-        node_text = (context.nodes[0].node.text or "").strip()
-        if not node_text:
+        top_fact_text = fact_texts[0]
+        if len(top_fact_text) > 300:
             return False
 
-        return len(node_text) <= 300
+        if len(context.nodes) == 1:
+            return True
+
+        # Simple factoid prompts are more reliable when answered from the top
+        # retrieved fact instead of letting the LLM rewrite or replace it.
+        return ContextRetriever._extract_focused_question_prompt(prompt) is not None and len(context.nodes) <= 3
 
     def _direct_text_context_reply(self, context: TextContext):
         node = context.nodes[0]
@@ -429,7 +435,12 @@ class Chat:
         )
         return self._buffer.history, None
 
-    def _should_use_direct_text_summary_reply(self, context: TextContext) -> bool:
+    def _should_use_direct_text_summary_reply(self, context: TextContext, prompt: str) -> bool:
+        normalized_prompt = (prompt or "").strip()
+        summary_requested = bool(ContextRetriever._PROMPT_PREFIX_RE.search(normalized_prompt))
+        if not summary_requested:
+            return False
+
         fact_texts = self._extract_fact_texts(context)
         if len(fact_texts) < 2 or len(fact_texts) > 5:
             return False
