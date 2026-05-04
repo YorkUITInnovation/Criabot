@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import re
 from typing import List, Dict
 
-from .schemas import GradebookProposal, GradebookSessionRecord
+from .schemas import GradebookProposal, GradebookSessionRecord, GRADE_DISPLAY_TYPE_NAMES
 
 
 class ConversationManager:
@@ -94,6 +95,35 @@ class ConversationManager:
         )
         text_l = text.lower()
         return any(marker in text_l for marker in request_markers)
+
+    @staticmethod
+    def _detect_aggregation_method(text: str) -> int | None:
+        """Detect aggregation method preference from user text."""
+        text_l = text.lower()
+        
+        # Weighted mean variants
+        if any(term in text_l for term in ("weighted mean", "weighted average", "weight", "weighted")):
+            if "simple" in text_l:
+                return 11  # Simple weighted mean
+            return 10  # Weighted mean (default)
+        
+        # Mean variants
+        if any(term in text_l for term in ("mean of grades", "simple mean", "average", "mean")):
+            if "extra credit" in text_l or "extra credits" in text_l:
+                return 12  # Mean with extra credits
+            if "simple" in text_l:
+                return 0  # Mean of grades
+            return 0  # Mean of grades
+        
+        # Extra credits
+        if "extra credit" in text_l or "extra credits" in text_l:
+            return 12  # Mean with extra credits
+        
+        # Natural
+        if any(term in text_l for term in ("natural", "moodle default", "default aggregation")):
+            return 13  # Natural
+        
+        return None
 
     def next_phase(self, session: GradebookSessionRecord, prompt: str) -> str:
         text = prompt.lower().strip()
@@ -196,6 +226,13 @@ class ConversationManager:
             notes_text = self._format_notes(session, proposal)
             findings_text = self._format_findings(session)
             
+            # Check if user has indicated an aggregation method preference
+            detected_method = self._detect_aggregation_method(text) if text else None
+            if detected_method is not None:
+                proposal.aggregation_method = detected_method
+            
+            aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
+            
             if abs(total_weight - 100.0) > 0.1:
                 return (
                     f"Here is the gradebook structure I built based on your materials:\n\n"
@@ -203,10 +240,12 @@ class ConversationManager:
                     "⚠ The total weight is not 100% yet. Please adjust the weights so they add up to 100% before we continue."
                 )
             else:
+                aggregation_msg = f"\n\n**Grade Aggregation Method**: {aggregation_name}\n(I'll use '{aggregation_name}' when creating your gradebook. If you prefer a different method, let me know.)"
                 return (
                     f"Here is the gradebook structure based on what I found:\n\n"
-                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{notes_text}\n\n"
-                    "Does this look right? If you'd like to adjust any weights or categories, let me know and I'll refine it."
+                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{notes_text}"
+                    f"{aggregation_msg}\n\n"
+                    "Does this look right? If you'd like to adjust any weights, categories, or the grade aggregation method, let me know and I'll refine it."
                 )
 
         if session.phase == "REFINEMENT":
@@ -304,20 +343,163 @@ class ConversationManager:
         if "upload" in q or "file" in q:
             return "You can upload your syllabus or grading policy as a PDF or Word document. I'll extract the grading structure and use it to build your gradebook proposal."
 
+        # Questions about aggregation/weighting method
+        if any(term in q for term in ("aggregation", "aggregat", "method", "weight", "weighting system")):
+            if "what" in q or "which" in q or "difference" in q:
+                return (
+                    "**Grade Aggregation Methods** determine how Moodle calculates final grades:\n"
+                    "- **Mean of grades (0)**: Simple average of all grades\n"
+                    "- **Weighted mean (10)**: Sum of (grade × weight) / sum of weights (most common)\n"
+                    "- **Simple weighted mean (11)**: Similar to weighted mean with simplified calculation\n"
+                    "- **Mean with extra credits (12)**: Allows grades above 100% for extra credit\n"
+                    "- **Natural (13)**: Moodle's default behavior (usually weighted mean)\n\n"
+                    "Which would you prefer for your course?"
+                )
+            if "recommend" in q or "suggest" in q or "which.*best" in q:
+                return (
+                    "For most courses, **Weighted mean (10)** is recommended as it's the standard grading method "
+                    "where each category contributes according to its assigned weight. "
+                    "Use **Natural (13)** if you want Moodle's default behavior, or **Mean with extra credits (12)** if your course offers extra credit opportunities."
+                )
+
         # Questions about Moodle mapping
         if "mapp" in q or "activity" in q:
             return "Once we finalize your gradebook structure, I'll automatically map your Moodle course activities (assignments, quizzes, etc.) to the categories. You can review and adjust before finalizing."
+
+        # Questions about drop/keep settings
+        if any(term in q for term in ("drop lowest", "drop the lowest", "keep highest", "keep best", "keep top")):
+            return (
+                "You can configure per-category grade rules:\n"
+                "- **Drop lowest N**: e.g. 'drop the lowest 2 from Assignments' — ignores the N worst grades\n"
+                "- **Keep highest N**: e.g. 'keep the best 3 from Labs' — only counts the top N grades\n"
+                "These are mutually exclusive per category."
+            )
+
+        # Questions about extra credit
+        if "extra credit" in q:
+            return (
+                "To mark a category as extra credit, say something like:\n"
+                "'Assignments count as extra credit' or 'extra credit for Labs'\n"
+                "Extra credit grades can push the final grade above 100%."
+            )
+
+        # Questions about passing grade
+        if any(term in q for term in ("pass", "passing grade", "grade to pass", "minimum to pass")):
+            return (
+                "You can set a passing threshold per category. For example:\n"
+                "- 'Passing grade for Labs is 60'\n"
+                "- 'Pass Midterm at 50'\n"
+                "Students below this threshold will be marked as failing that category in Moodle."
+            )
+
+        # Questions about empty/missing grades
+        if any(term in q for term in ("empty grade", "missing grade", "ungraded", "exclude empty", "include empty")):
+            return (
+                "By default, empty (ungraded) items are **excluded** from the category average. "
+                "To change this: 'include empty grades for Assignments' or 'exclude empty grades for Labs'."
+            )
+
+        # Questions about outcome aggregation
+        if any(term in q for term in ("outcome", "aggregate outcomes")):
+            return (
+                "You can control outcome aggregation per category:\n"
+                "- 'Include outcomes for Labs'\n"
+                "- 'Exclude outcomes for Midterm'"
+            )
+
+        # Questions about grade max / points
+        if any(term in q for term in ("grade max", "maximum grade", "out of", "total points", "max points")):
+            return (
+                "Each category total defaults to 100 points. To change it:\n"
+                "- 'Minimum grade for Assignments is 0'\n"
+                "- 'Max grade for Assignments is 150'\n"
+                "- 'Labs out of 50'\n"
+                "- 'Set maximum for Midterm to 200'"
+            )
+
+        # Questions about hiding categories
+        if any(term in q for term in ("hide", "hidden", "visible", "show category")):
+            return (
+                "You can hide or show categories from students:\n"
+                "- 'Hide the Midterm category' — students won't see it until revealed\n"
+                "- 'Hide Assignments until 2026-09-20' — hidden until that date\n"
+                "- 'Show the Assignments category' — makes it visible again"
+            )
+
+        # Questions about locking
+        if any(term in q for term in ("lock", "locked", "prevent override")):
+            return (
+                "Locking prevents manual grade overrides in a category:\n"
+                "- 'Lock the Final Exam category' — prevents overrides\n"
+                "- 'Lock Labs until 2026-11-15' — schedules lock time\n"
+                "- 'Unlock Assignments' — allows changes again"
+            )
+
+        # Questions about display format / decimals
+        if any(term in q for term in ("display", "show as", "format", "letter grade", "letter grade", "decimal")):
+            return (
+                "You can control how grades are displayed per category:\n"
+                "- **Format**: 'Show Assignments as percentage', 'display Labs as letter', 'show Midterm as real'\n"
+                "- **Decimals**: 'Use 2 decimal places for Assignments', 'show 0 decimals for Labs'\n"
+                "Available formats: Default, Real (numeric), Percentage, Letter, Real+Percentage, Real+Letter"
+            )
 
         # Default: no specific answer
         return ""
 
     def _format_categories(self, proposal: GradebookProposal) -> str:
-        """Format categories for display in conversation"""
+        """Format categories for display in conversation, including all per-category settings."""
         lines = []
         for category in proposal.categories:
             weight = category.weight
             item_count = len(category.items) if category.items else 0
-            lines.append(f"- **{category.name}** ({weight:.1f}%): {item_count} items")
+            extra_label = " ★ extra credit" if getattr(category, 'extra_credit', False) else ""
+            hidden_label = " 🔒 hidden" if getattr(category, 'hidden', False) else ""
+            locked_label = " 🔐 locked" if getattr(category, 'locked', False) else ""
+            lines.append(f"- **{category.name}** ({weight:.1f}%){extra_label}{hidden_label}{locked_label}: {item_count} items")
+
+            # Aggregation rules
+            settings = []
+            drop_lowest = getattr(category, 'drop_lowest', 0)
+            keep_highest = getattr(category, 'keep_highest', 0)
+            aggregate_only_graded = getattr(category, 'aggregate_only_graded', True)
+            aggregate_outcomes = getattr(category, 'aggregate_outcomes', False)
+            if drop_lowest > 0:
+                settings.append(f"drop lowest {drop_lowest}")
+            if keep_highest > 0:
+                settings.append(f"keep top {keep_highest}")
+            if not aggregate_only_graded:
+                settings.append("include empty grades")
+            if aggregate_outcomes:
+                settings.append("include outcomes")
+
+            # Grade total settings
+            grade_min = getattr(category, 'grade_min', None)
+            grade_max = getattr(category, 'grade_max', 100.0)
+            grade_pass = getattr(category, 'grade_pass', None)
+            hidden_until = getattr(category, 'hidden_until', None)
+            lock_time = getattr(category, 'lock_time', None)
+            display_type = getattr(category, 'display_type', 0)
+            decimals = getattr(category, 'decimals', -1)
+            if grade_min is not None:
+                settings.append(f"min {grade_min:.0f} pts")
+            if grade_max != 100.0:
+                settings.append(f"max {grade_max:.0f} pts")
+            if grade_pass is not None:
+                settings.append(f"pass ≥ {grade_pass:.0f}")
+            if hidden_until:
+                hidden_label = datetime.fromtimestamp(int(hidden_until), tz=timezone.utc).strftime("%Y-%m-%d")
+                settings.append(f"hidden until {hidden_label}")
+            if lock_time:
+                lock_label = datetime.fromtimestamp(int(lock_time), tz=timezone.utc).strftime("%Y-%m-%d")
+                settings.append(f"lock at {lock_label}")
+            if display_type != 0:
+                settings.append(f"display: {GRADE_DISPLAY_TYPE_NAMES.get(display_type, str(display_type))}")
+            if decimals >= 0:
+                settings.append(f"{decimals} decimal{'s' if decimals != 1 else ''}")
+
+            if settings:
+                lines.append(f"  ↳ {', '.join(settings)}")
 
             # Show first few items as examples
             if category.items and len(category.items) <= 3:
@@ -425,6 +607,18 @@ class ConversationManager:
             return ""
 
         return "I detected the following from syllabus/materials: " + " | ".join(summary_parts) + "\n\n"
+
+    @staticmethod
+    def _get_aggregation_method_name(method_code: int) -> str:
+        """Convert aggregation method code to readable name."""
+        methods = {
+            0: "Mean of grades",
+            10: "Weighted mean of grades",
+            11: "Simple weighted mean of grades",
+            12: "Mean of grades (with extra credits)",
+            13: "Natural",
+        }
+        return methods.get(method_code, f"Unknown method ({method_code})")
 
     def validate_weights(self, proposal: GradebookProposal) -> List[str]:
         """Validate that proposal weights are reasonable"""

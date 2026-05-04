@@ -1717,6 +1717,18 @@ class Criabot:
             "proposal": session.proposal.model_dump() if session.proposal else None,
         }
 
+    async def gradebook_reset(self, session_id: str, keep_extraction: bool = True) -> dict:
+        session = await self._gradebook.reset(session_id=session_id, keep_extraction=keep_extraction)
+        return {
+            "session_id": session.session_id,
+            "phase": session.phase,
+            "proposal": session.proposal.model_dump() if session.proposal else None,
+            "content_mapping": session.content_mapping,
+        }
+
+    async def gradebook_delete(self, session_id: str) -> bool:
+        return await self._gradebook.delete(session_id=session_id)
+
     async def gradebook_accept(self, session_id: str) -> dict:
         session = await self._gradebook.accept(session_id=session_id)
         return {

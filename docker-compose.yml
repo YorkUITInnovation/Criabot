@@ -11,6 +11,11 @@ services:
       command: redis-server --requirepass ${REDIS_PASSWORD}
       ports:
         - '127.0.0.1:6379:6379'
+      healthcheck:
+        test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+        interval: 5s
+        timeout: 5s
+        retries: 5
     # Cria-Front MySQL
     mysql:
       image: 'docker.io/mysql:8.4'
@@ -82,6 +87,11 @@ services:
         # ES_JAVA_OPTS: "-Xms1g -Xmx1g"
         # ES_JAVA_OPTS: "-Xms2g -Xmx2g"
         ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+        # Disk watermark settings to handle low disk space
+        cluster.routing.allocation.disk.threshold_enabled: "true"
+        cluster.routing.allocation.disk.watermark.low: "5gb"
+        cluster.routing.allocation.disk.watermark.high: "3gb"
+        cluster.routing.allocation.disk.watermark.flood_stage: "2gb"
       ports:
         - "127.0.0.1:9200:9200"
         - "127.0.0.1:9300:9300"
@@ -91,6 +101,7 @@ services:
         test:
           [
             "CMD-SHELL",
+            # for production its better to set health check to green
             "curl -fsS -u elastic:$$ELASTIC_PASSWORD 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=30s' >/dev/null || exit 1",
           ]
         start_period: 60s
@@ -145,7 +156,7 @@ services:
         mysql:
           condition: service_healthy
         redis:
-          condition: service_started
+          condition: service_healthy
         criadex:
           condition: service_healthy
         searxng:
@@ -168,6 +179,11 @@ services:
       environment:
         MINIO_ROOT_USER: ${MINIO_ROOT_USER}
         MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      healthcheck:
+        test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+        interval: 5s
+        timeout: 5s
+        retries: 5
     # Ragflow
     ragflow:
       image: infiniflow/ragflow:v0.22.1
@@ -196,15 +212,20 @@ services:
         - ./nginx/ragflow.conf:/etc/nginx/conf.d/ragflow.conf
         - ./nginx/proxy.conf:/etc/nginx/proxy.conf
       depends_on:
-        - minio
-        - elasticsearch
-        - mysql
+        mysql:
+          condition: service_healthy
+        elasticsearch:
+          condition: service_healthy
+        minio:
+          condition: service_healthy
+        redis:
+          condition: service_healthy
       healthcheck:
         test: [ "CMD", "curl", "-f", "http://ragflow:9380/v1/system/healthz" ]
-        start_period: 90s
-        interval: 5s
-        timeout: 5s
-        retries: 30
+        start_period: 120s
+        interval: 10s
+        timeout: 10s
+        retries: 40
     # Cria-Back CriaParse
     criaparse:
       image: uitadmin/criaparse:latest

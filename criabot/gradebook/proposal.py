@@ -4,9 +4,15 @@ import difflib
 import json
 import os
 import re
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 
-from .schemas import CourseActivity, GradebookCategory, GradebookProposal
+from .schemas import (
+    CourseActivity, GradebookCategory, GradebookProposal,
+    GRADE_DISPLAY_TYPE_DEFAULT, GRADE_DISPLAY_TYPE_REAL, GRADE_DISPLAY_TYPE_PERCENTAGE,
+    GRADE_DISPLAY_TYPE_LETTER, GRADE_DISPLAY_TYPE_REAL_PERCENTAGE, GRADE_DISPLAY_TYPE_REAL_LETTER,
+    GRADE_DISPLAY_TYPE_LETTER_REAL, GRADE_DISPLAY_TYPE_PERCENTAGE_REAL,
+)
 
 
 class ProposalGenerator:
@@ -94,6 +100,12 @@ class ProposalGenerator:
 
         weights = self._parse_weight_assignments(updated, prompt, skip_split_pieces=is_split_prompt)
 
+        # Creation-style prompts that provide a full category set should replace categories,
+        # not mutate previous defaults in-place.
+        if self._should_rebuild_category_set(prompt, weights):
+            updated.categories = self._rebuild_categories_from_weights(updated, weights)
+            weights = {}
+
         # Support directives like "give remaining weight to midterm".
         remaining_target = self._parse_remaining_target(updated, prompt)
         if remaining_target:
@@ -104,6 +116,9 @@ class ProposalGenerator:
 
         self._apply_directive_normalization(updated, prompt, explicit_updates=weights)
 
+        # Apply per-category settings (drop/keep/extra credit/exclude empty)
+        self._apply_category_settings(updated, prompt)
+
         if is_split_prompt:
             split_parts = self._parse_split_categories(prompt)
             self._record_split_request(updated, split_parts)
@@ -111,6 +126,266 @@ class ProposalGenerator:
         self._post_update_checks(updated, prompt)
 
         return updated
+
+    def _apply_category_settings(self, proposal: GradebookProposal, prompt: str) -> None:
+        """Parse and apply drop_lowest, keep_highest, extra_credit, aggregate_only_graded per category."""
+        prompt_lower = prompt.lower()
+
+        # drop lowest N [from category]
+        for m in re.finditer(
+            r"\bdrop\s+(?:the\s+)?(?:lowest\s+)?(\d+)\s+(?:lowest\s+)?(?:grade[s]?\s+)?(?:from\s+)?([a-zA-Z][a-zA-Z ]{1,40})?",
+            prompt_lower,
+        ):
+            n = int(m.group(1))
+            cat_hint = (m.group(2) or "").strip().rstrip(".,")
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.drop_lowest = n
+                cat.keep_highest = 0  # mutually exclusive
+
+        # keep highest / best N [from category]
+        for m in re.finditer(
+            r"\bkeep\s+(?:the\s+)?(?:(?:top|best|highest)\s+)?(\d+)\s+(?:top\s+|best\s+|highest\s+)?(?:grade[s]?\s+)?(?:from\s+)?([a-zA-Z][a-zA-Z ]{1,40})?",
+            prompt_lower,
+        ):
+            n = int(m.group(1))
+            cat_hint = (m.group(2) or "").strip().rstrip(".,")
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.keep_highest = n
+                cat.drop_lowest = 0  # mutually exclusive
+
+        # extra credit: "assignments count as extra credit" / "extra credit for labs"
+        for m in re.finditer(
+            r"\b([a-zA-Z][a-zA-Z ]{1,30})\s+(?:(?:count|counts|is|are)\s+(?:as\s+)?)?extra\s+credit",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.extra_credit = True
+
+        for m in re.finditer(
+            r"\bextra\s+credit\s+(?:for\s+)?([a-zA-Z][a-zA-Z ]{1,30})",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.extra_credit = True
+
+        # include/exclude empty grades: "include empty" / "exclude empty for quizzes"
+        if re.search(r"\binclude\s+empty\b", prompt_lower):
+            cat_m = re.search(r"\binclude\s+empty\s+(?:grades?\s+)?(?:for\s+)?([a-zA-Z][a-zA-Z ]{1,30})?", prompt_lower)
+            cat_hint = (cat_m.group(1) or "").strip() if cat_m else ""
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.aggregate_only_graded = False
+
+        if re.search(r"\bexclude\s+empty\b", prompt_lower):
+            cat_m = re.search(r"\bexclude\s+empty\s+(?:grades?\s+)?(?:for\s+)?([a-zA-Z][a-zA-Z ]{1,30})?", prompt_lower)
+            cat_hint = (cat_m.group(1) or "").strip() if cat_m else ""
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.aggregate_only_graded = True
+
+        # aggregate outcomes: include or exclude outcome items in aggregation
+        if re.search(r"\b(?:include|aggregate)\s+outcomes?\b", prompt_lower):
+            cat_m = re.search(r"\b(?:include|aggregate)\s+outcomes?\s+(?:for\s+)?([a-zA-Z][a-zA-Z ]{1,30})?", prompt_lower)
+            cat_hint = (cat_m.group(1) or "").strip() if cat_m else ""
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.aggregate_outcomes = True
+
+        if re.search(r"\b(?:exclude|ignore|do\s+not\s+aggregate)\s+outcomes?\b", prompt_lower):
+            cat_m = re.search(r"\b(?:exclude|ignore|do\s+not\s+aggregate)\s+outcomes?\s+(?:for\s+)?([a-zA-Z][a-zA-Z ]{1,30})?", prompt_lower)
+            cat_hint = (cat_m.group(1) or "").strip() if cat_m else ""
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.aggregate_outcomes = False
+
+        # grade_max: "max grade for assignments is 150" / "assignments out of 150"
+        for m in re.finditer(
+            r"(?:max(?:imum)?\s+(?:grade|point|mark)s?\s+for\s+([a-zA-Z][a-zA-Z ]{1,30})\s+is\s+(\d+(?:\.\d+)?)"
+            r"|max(?:imum)?\s+(?:grade|point|mark)s?\s+for\s+([a-zA-Z][a-zA-Z ]{1,30})\s+to\s+(\d+(?:\.\d+)?)"
+            r"|([a-zA-Z][a-zA-Z ]{1,30})\s+(?:is\s+)?out\s+of\s+(\d+(?:\.\d+)?)"
+            r"|set\s+(?:max|maximum)\s+(?:grade\s+)?for\s+([a-zA-Z][a-zA-Z ]{1,30})\s+to\s+(\d+(?:\.\d+)?))",
+            prompt_lower,
+        ):
+            if m.group(1) and m.group(2):
+                cat_hint, val = m.group(1).strip(), float(m.group(2))
+            elif m.group(3) and m.group(4):
+                cat_hint, val = m.group(3).strip(), float(m.group(4))
+            elif m.group(5) and m.group(6):
+                cat_hint, val = m.group(5).strip(), float(m.group(6))
+            else:
+                cat_hint, val = m.group(7).strip(), float(m.group(8))
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.grade_max = val
+
+        # grade_pass: "passing grade for labs is 60" / "pass labs at 60%"
+        for m in re.finditer(
+            r"(?:passing\s+(?:grade|mark|score)\s+for\s+([a-zA-Z][a-zA-Z ]{1,30})\s+is\s+(\d+(?:\.\d+)?)"
+            r"|passing\s+(?:grade|mark|score)\s+for\s+([a-zA-Z][a-zA-Z ]{1,30})\s+to\s+(\d+(?:\.\d+)?)"
+            r"|pass\s+([a-zA-Z][a-zA-Z ]{1,30})\s+(?:at|with)\s+(\d+(?:\.\d+)?)"
+            r"|([a-zA-Z][a-zA-Z ]{1,30})\s+pass(?:ing)?\s+(?:is\s+)?(?:at\s+)?(\d+(?:\.\d+)?))",
+            prompt_lower,
+        ):
+            if m.group(1) and m.group(2):
+                cat_hint, val = m.group(1).strip(), float(m.group(2))
+            elif m.group(3) and m.group(4):
+                cat_hint, val = m.group(3).strip(), float(m.group(4))
+            elif m.group(5) and m.group(6):
+                cat_hint, val = m.group(5).strip(), float(m.group(6))
+            else:
+                cat_hint, val = m.group(7).strip(), float(m.group(8))
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.grade_pass = val
+
+        # grade_min: "minimum grade for labs is 0" / "set min for assignments to 10"
+        for m in re.finditer(
+            r"(?:min(?:imum)?\s+(?:grade|point|mark)s?\s+for\s+([a-zA-Z][a-zA-Z ]{1,30})\s+is\s+(-?\d+(?:\.\d+)?)"
+            r"|set\s+min(?:imum)?\s+(?:grade\s+)?for\s+([a-zA-Z][a-zA-Z ]{1,30})\s+to\s+(-?\d+(?:\.\d+)?))",
+            prompt_lower,
+        ):
+            if m.group(1) and m.group(2):
+                cat_hint, val = m.group(1).strip(), float(m.group(2))
+            else:
+                cat_hint, val = m.group(3).strip(), float(m.group(4))
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.grade_min = val
+
+        # hidden: "hide assignments from students" / "show midterm"
+        for m in re.finditer(
+            r"\bhide\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?:\s+(?:category|from\s+students?))?(?:\b|$)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip().rstrip()
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.hidden = True
+
+        # hide until: "hide assignments until 2026-12-20"
+        for m in re.finditer(
+            r"\bhide\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:category\s+)?until\s+(\d{4}-\d{2}-\d{2})(?:\b|$)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            ts = self._parse_iso_date_to_timestamp(m.group(2).strip())
+            if ts is None:
+                continue
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.hidden = True
+                cat.hidden_until = ts
+
+        for m in re.finditer(
+            r"\b(?:show|unhide|reveal)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?:\s+category)?(?:\b|$)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.hidden = False
+                cat.hidden_until = None
+
+        # locked: "lock the final exam" / "unlock assignments"
+        for m in re.finditer(
+            r"\block\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?:\s+(?:category|grades?))?(?:\b|$)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.locked = True
+                cat.lock_time = None
+
+        # schedule lock: "lock labs until 2026-10-01"
+        for m in re.finditer(
+            r"\block\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:category\s+)?(?:until|on|at)\s+(\d{4}-\d{2}-\d{2})(?:\b|$)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            ts = self._parse_iso_date_to_timestamp(m.group(2).strip())
+            if ts is None:
+                continue
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.locked = False
+                cat.lock_time = ts
+
+        for m in re.finditer(
+            r"\bunlock\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?:\s+(?:category|grades?))?(?:\b|$)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.locked = False
+                cat.lock_time = None
+
+        # display_type: "show assignments as percentage" / "display labs as letter"
+        display_map = {
+            r"\bpercentage\b": GRADE_DISPLAY_TYPE_PERCENTAGE,
+            r"\bletter\b": GRADE_DISPLAY_TYPE_LETTER,
+            r"\breal\b|\bnumeric\b|\bnumber\b": GRADE_DISPLAY_TYPE_REAL,
+            r"\breal\s+and\s+percentage\b|\bpercentage\s+and\s+real\b": GRADE_DISPLAY_TYPE_REAL_PERCENTAGE,
+            r"\breal\s+and\s+letter\b|\bletter\s+and\s+real\b": GRADE_DISPLAY_TYPE_REAL_LETTER,
+            r"\bdefault\s+display\b": GRADE_DISPLAY_TYPE_DEFAULT,
+        }
+        for m in re.finditer(
+            r"(?:show|display|format)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:category\s+)?(?:grades?\s+)?as\s+([a-zA-Z][a-zA-Z +]*)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            disp_text = m.group(2).strip()
+            resolved_type = None
+            for pattern, dtype in display_map.items():
+                if re.search(pattern, disp_text):
+                    resolved_type = dtype
+                    break
+            if resolved_type is not None:
+                targets = self._resolve_category_targets(proposal, cat_hint)
+                for cat in targets:
+                    cat.display_type = resolved_type
+
+        # decimals: "use 2 decimal places for assignments" / "show 0 decimals for labs"
+        for m in re.finditer(
+            r"(?:use|show|set)\s+(\d)\s+decimal(?:\s+place)?s?\s+for\s+([a-zA-Z][a-zA-Z ]{1,30})"
+            r"|([a-zA-Z][a-zA-Z ]{1,30})\s+(?:use|show|with)\s+(\d)\s+decimal(?:\s+place)?s?",
+            prompt_lower,
+        ):
+            if m.group(1) and m.group(2):
+                val, cat_hint = int(m.group(1)), m.group(2).strip()
+            else:
+                val, cat_hint = int(m.group(4)), m.group(3).strip()
+            val = max(0, min(5, val))
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.decimals = val
+
+    @staticmethod
+    def _parse_iso_date_to_timestamp(date_text: str) -> Optional[int]:
+        """Parse YYYY-MM-DD into a UTC timestamp at 00:00:00."""
+        try:
+            dt = datetime.strptime(date_text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        return int(dt.timestamp())
+
+    def _resolve_category_targets(self, proposal: GradebookProposal, hint: str) -> List:
+        """Return matching categories for a hint string, or all categories if hint is empty."""
+        if not hint:
+            return list(proposal.categories)
+        resolved = self._resolve_category_name(proposal, hint)
+        if resolved:
+            for cat in proposal.categories:
+                if cat.name == resolved:
+                    return [cat]
+        return []
 
     def _parse_remaining_target(self, proposal: GradebookProposal, prompt: str) -> Optional[str]:
         match = re.search(
@@ -277,25 +552,129 @@ class ProposalGenerator:
             # Also strip everything after "split ... into" to avoid parsing subcategory weights.
             clean_prompt = re.sub(r"\bsplit\b.+", "", clean_prompt, flags=re.IGNORECASE).strip()
 
-        pattern = re.compile(
-            r"(?:set|make|change|adjust|update|keep|use)?\s*([a-zA-Z][a-zA-Z ]{1,40}?)\s*(?:is|are|to|=|:)\s*(\d+(?:\.\d+)?)\s*%?",
-            flags=re.IGNORECASE,
-        )
-        matches = pattern.findall(clean_prompt) + re.findall(
-            r"\b([a-zA-Z][a-zA-Z ]{1,30}?)\s*(\d+(?:\.\d+)?)\s*%?\b",
+        # Guard against parsing non-weight numeric settings (grade min/max/pass, dates, decimals, hide/lock).
+        settings_context = bool(re.search(
+            r"\b("
+            r"minimum|maximum|max|min|passing|grade\s+pass|grade\s+max|grade\s+min"
+            r"|decimal|display|percentage|letter|real"
+            r"|hide|hidden|show|unhide|reveal|lock|unlock|until|on\s+\d{4}-\d{2}-\d{2}"
+            r"|drop\s+lowest|keep\s+(?:top|best|highest)"
+            r"|include\s+empty|exclude\s+empty|outcomes?|extra\s+credit"
+            r")\b",
             clean_prompt,
             flags=re.IGNORECASE,
+        ))
+
+        matches = []
+
+        # Explicit percentage always counts as weight intent.
+        percent_pattern = re.compile(
+            r"(?:set|make|change|adjust|update|keep|use|increase|decrease)?\s*"
+            r"([a-zA-Z][a-zA-Z ]{1,40}?)\s*(?:is|are|to|=|:)\s*(\d+(?:\.\d+)?)\s*%",
+            flags=re.IGNORECASE,
         )
+        matches.extend(percent_pattern.findall(clean_prompt))
+        matches.extend(re.findall(
+            r"\b([a-zA-Z][a-zA-Z ]{1,30}?)\s+(\d+(?:\.\d+)?)\s*%(?=\D|$)",
+            clean_prompt,
+            flags=re.IGNORECASE,
+        ))
+
+        # Explicit "weight" keyword counts even without %.
+        weight_keyword_pattern = re.compile(
+            r"(?:set|make|change|adjust|update|keep|use|increase|decrease)?\s*"
+            r"([a-zA-Z][a-zA-Z ]{1,40}?)\s+weight\s*(?:is|are|to|=|:)\s*(\d+(?:\.\d+)?)\b",
+            flags=re.IGNORECASE,
+        )
+        matches.extend(weight_keyword_pattern.findall(clean_prompt))
+
+        # Generic no-% parsing is only safe when prompt is not about other numeric settings.
+        if not settings_context:
+            generic_pattern = re.compile(
+                r"(?:set|make|change|adjust|update|keep|use|increase|decrease)?\s*"
+                r"([a-zA-Z][a-zA-Z ]{1,40}?)\s*(?:is|are|to|=|:)\s*(\d+(?:\.\d+)?)\b",
+                flags=re.IGNORECASE,
+            )
+            matches.extend(generic_pattern.findall(clean_prompt))
+
+            # Support compact category lists like "Assignments 35, Labs 15".
+            if re.search(r"\b(?:gradebook\s+with|categories|weights?)\b", clean_prompt, flags=re.IGNORECASE):
+                matches.extend(re.findall(
+                    r"\b([a-zA-Z][a-zA-Z ]{1,30}?)\s*(\d+(?:\.\d+)?)\s*%?\b",
+                    clean_prompt,
+                    flags=re.IGNORECASE,
+                ))
+
         weights: Dict[str, float] = {}
+        allow_new_categories = self._allow_new_categories_from_prompt(prompt)
         for raw_name, raw_weight in matches:
             if skip_split_pieces and raw_name.strip().lower() in split_piece_names:
                 continue
             resolved = self._resolve_category_name(proposal, raw_name)
+            if resolved is None and allow_new_categories:
+                candidate = self._clean_new_category_name(raw_name)
+                if candidate:
+                    resolved = candidate
             if resolved is None:
                 continue
             # Last occurrence wins for the same category (handles repeat mentions).
             weights[resolved] = float(raw_weight)
         return weights
+
+    @staticmethod
+    def _allow_new_categories_from_prompt(prompt: str) -> bool:
+        prompt_l = prompt.lower()
+        if re.search(r"\b(do\s+not\s+create|don't\s+create|dont\s+create|dont\s+add|don't\s+add|keep\s+categories\s+unchanged|only\s+rebalance|keep\s+all\s+else)\b", prompt_l):
+            return False
+        return bool(re.search(r"\b(create|build|propose|start\s+with|gradebook\s+with|categories?)\b", prompt_l))
+
+    @staticmethod
+    def _clean_new_category_name(raw_name: str) -> Optional[str]:
+        name = re.sub(r"\s+", " ", (raw_name or "").strip())
+        name = re.sub(r"^[^a-zA-Z]+|[^a-zA-Z]+$", "", name)
+        if not name:
+            return None
+        if len(name.split()) > 3:
+            return None
+        return name.title()
+
+    @staticmethod
+    def _should_rebuild_category_set(prompt: str, weights: Dict[str, float]) -> bool:
+        if len(weights) < 3:
+            return False
+        prompt_l = prompt.lower()
+        if re.search(r"\b(change|adjust|update|increase|decrease|rebalance|remove|split|undo|redo)\b", prompt_l):
+            return False
+        return bool(re.search(r"\b(create|build|propose|start\s+with)\b", prompt_l))
+
+    @staticmethod
+    def _rebuild_categories_from_weights(proposal: GradebookProposal, weights: Dict[str, float]) -> List[GradebookCategory]:
+        existing = {cat.name.lower(): cat for cat in proposal.categories}
+        rebuilt: List[GradebookCategory] = []
+        for name, weight in weights.items():
+            src = existing.get(name.lower())
+            rebuilt.append(
+                GradebookCategory(
+                    name=name,
+                    weight=float(weight),
+                    items=list(src.items) if src else [],
+                    drop_lowest=getattr(src, "drop_lowest", 0) if src else 0,
+                    keep_highest=getattr(src, "keep_highest", 0) if src else 0,
+                    aggregate_only_graded=getattr(src, "aggregate_only_graded", True) if src else True,
+                    aggregate_outcomes=getattr(src, "aggregate_outcomes", False) if src else False,
+                    extra_credit=getattr(src, "extra_credit", False) if src else False,
+                    grade_min=getattr(src, "grade_min", None) if src else None,
+                    grade_max=getattr(src, "grade_max", 100.0) if src else 100.0,
+                    grade_pass=getattr(src, "grade_pass", None) if src else None,
+                    hidden=getattr(src, "hidden", False) if src else False,
+                    hidden_until=getattr(src, "hidden_until", None) if src else None,
+                    locked=getattr(src, "locked", False) if src else False,
+                    lock_time=getattr(src, "lock_time", None) if src else None,
+                    display_type=getattr(src, "display_type", GRADE_DISPLAY_TYPE_DEFAULT) if src else GRADE_DISPLAY_TYPE_DEFAULT,
+                    decimals=getattr(src, "decimals", -1) if src else -1,
+                )
+            )
+        return rebuilt
 
     def _apply_weight_updates(self, proposal: GradebookProposal, weights: Dict[str, float]) -> None:
         normalized_map = {cat.name.lower(): cat for cat in proposal.categories}

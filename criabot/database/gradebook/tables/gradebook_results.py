@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel
-from sqlalchemy import Integer, TIMESTAMP, String, JSON, Boolean, func, insert, update, select, ChunkedIteratorResult, CursorResult
+from sqlalchemy import Integer, TIMESTAMP, String, JSON, Boolean, func, insert, update, select, delete, ChunkedIteratorResult, CursorResult
 from sqlalchemy.orm import Mapped, mapped_column
 
 from criabot.database.table import TableAPI, BaseTable
@@ -116,6 +116,15 @@ class GradebookResultsAPI(TableAPI):
                     pushed_to_moodle=True,
                     moodle_sync_at=func.now()
                 )
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def delete_by_session(self, session_id: int) -> bool:
+        async with self.get_async_session() as session:
+            result: CursorResult = await session.execute(
+                delete(self.Schema)
+                .where(self.Schema.session_id == session_id)
             )
             await session.commit()
             return result.rowcount > 0

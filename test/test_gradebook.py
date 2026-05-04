@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 from criabot.gradebook.analyzer import SyllabusAnalyzer
 from criabot.gradebook.content_mapper import ContentMapper
+from criabot.gradebook.conversation import ConversationManager
 from criabot.gradebook.proposal import ProposalGenerator
-from criabot.gradebook.schemas import CourseActivity, MoodleResource
+from criabot.gradebook.schemas import CourseActivity, GradebookCategory, GradebookProposal, MoodleResource
 from criabot.gradebook.session import GradebookSessionEngine
 
 
@@ -218,6 +219,45 @@ async def test_gradebook_finalize_marks_confirmed_mapping_and_completes():
 
 
 @pytest.mark.asyncio
+async def test_gradebook_reset_clears_mapping_and_restores_proposal_phase():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+
+    accepted = await engine.accept(session.session_id)
+    assert accepted.phase == "ACCEPTED"
+    assert accepted.content_mapping is not None
+
+    reset = await engine.reset(session.session_id)
+    assert reset.phase in {"PROPOSAL", "INTAKE"}
+    assert reset.content_mapping is None
+    assert reset.proposal is not None
+
+
+@pytest.mark.asyncio
+async def test_gradebook_delete_removes_session_from_engine():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+
+    deleted = await engine.delete(session.session_id)
+    assert deleted is True
+
+    loaded = await engine.get(session.session_id)
+    assert loaded is None
+
+
+@pytest.mark.asyncio
 async def test_gradebook_proposal_updates_weights_and_splits():
     generator = ProposalGenerator()
     base_proposal = generator.generate_initial([
@@ -397,6 +437,431 @@ def test_notes_do_not_accumulate_across_turns():
     p2 = generator.update_from_prompt(p1, "set Assignments to 35%")
     weight_notes_p2 = [n for n in p2.notes if n.lower().startswith("weight check:")]
     assert len(weight_notes_p2) == 1, "Second update must not accumulate old weight-check notes"
+
+
+# --- Aggregation Method Tests ---
+
+def test_gradebook_proposal_default_aggregation_is_natural():
+    proposal = GradebookProposal()
+    assert proposal.aggregation_method == 13
+
+
+def test_gradebook_proposal_stores_aggregation_method():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=25.0),
+            GradebookCategory(name="Final Exam", weight=75.0),
+        ],
+        aggregation_method=10,
+    )
+    assert proposal.aggregation_method == 10
+    dumped = proposal.model_dump()
+    assert dumped["aggregation_method"] == 10
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("I prefer weighted mean", 10),
+    ("use weighted average", 10),
+    ("Use simple weighted mean", 11),
+    ("I want natural aggregation", 13),
+    ("Mean of grades with extra credits", 12),
+    ("use extra credits method", 12),
+    ("simple mean", 0),
+    ("just a random sentence", None),
+])
+def test_detect_aggregation_method(text, expected):
+    cm = ConversationManager()
+    assert cm._detect_aggregation_method(text) == expected
+
+
+@pytest.mark.parametrize("code,expected_name", [
+    (0, "Mean of grades"),
+    (10, "Weighted mean of grades"),
+    (11, "Simple weighted mean of grades"),
+    (12, "Mean of grades (with extra credits)"),
+    (13, "Natural"),
+    (99, "Unknown method (99)"),
+])
+def test_get_aggregation_method_name(code, expected_name):
+    cm = ConversationManager()
+    assert cm._get_aggregation_method_name(code) == expected_name
+
+
+@pytest.mark.asyncio
+async def test_proposal_reply_includes_aggregation_method():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_d",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    # Advance to PROPOSAL phase
+    session = await engine.chat(session.session_id, "give me a proposal")
+    assert session.phase == "PROPOSAL"
+    assert session.proposal is not None
+
+    cm = ConversationManager()
+    reply = cm.make_reply(session, session.proposal, prompt="give me a proposal")
+    assert "Aggregation" in reply or "aggregation" in reply
+
+
+@pytest.mark.asyncio
+async def test_chat_with_aggregation_preference_updates_proposal():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_e",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    # Move to PROPOSAL phase
+    session = await engine.chat(session.session_id, "give me a proposal")
+    assert session.phase == "PROPOSAL"
+
+    # User expresses aggregation preference in refinement
+    cm = ConversationManager()
+    detected = cm._detect_aggregation_method("I want weighted mean of grades")
+    assert detected == 10
+
+    if session.proposal:
+        session.proposal.aggregation_method = detected
+    assert session.proposal.aggregation_method == 10
+
+
+# --- Per-category settings tests ---
+
+def test_proposal_drop_lowest_parsed_from_prompt():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([CourseActivity(name="Quiz 1", module="quiz")])
+
+    updated = generator.update_from_prompt(base, "drop the lowest 2 from Assignments")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].drop_lowest == 2
+
+
+def test_proposal_drop_lowest_per_category():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(base, "drop the lowest 1 from Assignments")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].drop_lowest == 1
+    assert by_name["Midterm"].drop_lowest == 0
+
+
+def test_proposal_keep_highest_per_category():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(base, "keep the best 3 from Assignments")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].keep_highest == 3
+    assert by_name["Assignments"].drop_lowest == 0  # mutually exclusive
+
+
+def test_proposal_extra_credit_per_category():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(base, "Assignments count as extra credit")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].extra_credit is True
+    assert by_name["Midterm"].extra_credit is False
+
+
+def test_proposal_exclude_empty_grades():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    # Default is True (exclude empty)
+    assert all(c.aggregate_only_graded for c in base.categories)
+
+    updated = generator.update_from_prompt(base, "include empty grades for Assignments")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].aggregate_only_graded is False
+    assert by_name["Labs"].aggregate_only_graded is True
+
+
+def test_proposal_include_outcomes_per_category():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "include outcomes for Labs")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Labs"].aggregate_outcomes is True
+    assert by_name["Assignments"].aggregate_outcomes is False
+
+
+def test_category_settings_persist_in_schema_dump():
+    cat = GradebookCategory(
+        name="Quizzes",
+        weight=20.0,
+        drop_lowest=1,
+        keep_highest=0,
+        aggregate_only_graded=True,
+        extra_credit=False,
+    )
+    dumped = cat.model_dump()
+    assert dumped["drop_lowest"] == 1
+    assert dumped["aggregate_only_graded"] is True
+    assert dumped["extra_credit"] is False
+
+
+def test_format_categories_shows_per_category_settings():
+    cm = ConversationManager()
+    proposal = GradebookProposal(categories=[
+        GradebookCategory(name="Assignments", weight=40.0, drop_lowest=2),
+        GradebookCategory(name="Final Exam", weight=60.0, extra_credit=True),
+    ])
+    text = cm._format_categories(proposal)
+    assert "drop lowest 2" in text
+    assert "extra credit" in text.lower()
+
+
+# --- Grade max, grade_pass, hidden, locked, display_type, decimals tests ---
+
+def test_proposal_grade_max_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "max grade for Assignments is 150")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].grade_max == 150.0
+    assert by_name["Labs"].grade_max == 100.0  # unchanged
+
+
+def test_proposal_grade_max_to_syntax_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "max grade for Labs to 50")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Labs"].grade_max == 50.0
+
+
+def test_proposal_grade_max_out_of_syntax():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "Labs out of 50")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Labs"].grade_max == 50.0
+
+
+def test_proposal_grade_pass_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "passing grade for Labs is 60")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Labs"].grade_pass == 60.0
+    assert by_name["Assignments"].grade_pass is None
+
+
+def test_proposal_grade_pass_to_syntax_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "passing grade for Labs to 30")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Labs"].grade_pass == 30.0
+
+
+def test_proposal_grade_min_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "minimum grade for Labs is 0")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Labs"].grade_min == 0.0
+
+
+def test_proposal_hidden_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "hide the Midterm category")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Midterm"].hidden is True
+    assert by_name["Assignments"].hidden is False
+
+
+def test_proposal_show_unhides():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    # First hide, then show
+    p1 = generator.update_from_prompt(base, "hide the Midterm category")
+    p2 = generator.update_from_prompt(p1, "show the Midterm category")
+    by_name = {c.name: c for c in p2.categories}
+    assert by_name["Midterm"].hidden is False
+
+
+def test_proposal_hidden_until_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "hide Labs until 2026-12-20")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Labs"].hidden is True
+    assert by_name["Labs"].hidden_until is not None
+
+
+def test_proposal_locked_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "lock the Final Exam")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Final Exam"].locked is True
+    assert by_name["Assignments"].locked is False
+
+
+def test_proposal_lock_time_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "lock Midterm until 2026-11-15")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Midterm"].locked is False
+    assert by_name["Midterm"].lock_time is not None
+
+
+def test_settings_prompt_does_not_change_weights():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(
+        base,
+        "Set minimum grade for Labs to 0, max grade for Labs to 50, passing grade for Labs to 30, show Labs as percentage with 1 decimal.",
+    )
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].weight == 25.0
+    assert by_name["Labs"].weight == 15.0
+    assert by_name["Midterm"].weight == 30.0
+    assert by_name["Final Exam"].weight == 30.0
+
+
+def test_hide_lock_until_prompt_does_not_change_weights():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "Hide Midterm until 2026-09-20 and lock Final Exam until 2026-11-15")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].weight == 25.0
+    assert by_name["Labs"].weight == 15.0
+    assert by_name["Midterm"].weight == 30.0
+    assert by_name["Final Exam"].weight == 30.0
+    assert by_name["Midterm"].hidden is True
+    assert by_name["Final Exam"].lock_time is not None
+
+
+def test_create_prompt_rebuilds_full_category_set_with_new_names():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(
+        base,
+        "Build a balanced gradebook for this course: Quizzes 15%, Assignments 35%, Project 20%, Midterm 10%, Final 20%.",
+    )
+    by_name = {c.name: c for c in updated.categories}
+    assert set(by_name.keys()) == {"Quizzes", "Assignments", "Project", "Midterm", "Final Exam"}
+    assert by_name["Project"].weight == 20.0
+    total = sum(c.weight for c in updated.categories)
+    assert abs(total - 100.0) < 0.1
+
+
+def test_create_prompt_simple_three_categories_replaces_defaults():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(
+        base,
+        "Propose a simple 3-category gradebook: Coursework 50%, Midterm 20%, Final 30%.",
+    )
+    by_name = {c.name: c for c in updated.categories}
+    assert set(by_name.keys()) == {"Coursework", "Midterm", "Final Exam"}
+    assert by_name["Coursework"].weight == 50.0
+    total = sum(c.weight for c in updated.categories)
+    assert abs(total - 100.0) < 0.1
+
+
+def test_proposal_unlock_clears_lock_time():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    p1 = generator.update_from_prompt(base, "lock Midterm until 2026-11-15")
+    p2 = generator.update_from_prompt(p1, "unlock Midterm")
+    by_name = {c.name: c for c in p2.categories}
+    assert by_name["Midterm"].locked is False
+    assert by_name["Midterm"].lock_time is None
+
+
+def test_proposal_decimals_parsed():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "use 2 decimal places for Assignments")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].decimals == 2
+    assert by_name["Labs"].decimals == -1
+
+
+def test_proposal_display_type_percentage():
+    from criabot.gradebook.schemas import GRADE_DISPLAY_TYPE_PERCENTAGE
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "show Assignments as percentage")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Assignments"].display_type == GRADE_DISPLAY_TYPE_PERCENTAGE
+
+
+def test_proposal_display_type_letter():
+    from criabot.gradebook.schemas import GRADE_DISPLAY_TYPE_LETTER
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "display Final Exam as letter")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Final Exam"].display_type == GRADE_DISPLAY_TYPE_LETTER
+
+
+def test_category_all_new_fields_in_schema_dump():
+    from criabot.gradebook.schemas import GRADE_DISPLAY_TYPE_PERCENTAGE
+    cat = GradebookCategory(
+        name="Labs",
+        weight=20.0,
+        aggregate_outcomes=True,
+        grade_min=0.0,
+        grade_max=150.0,
+        grade_pass=60.0,
+        hidden=True,
+        hidden_until=1797724800,
+        locked=False,
+        lock_time=1797292800,
+        display_type=GRADE_DISPLAY_TYPE_PERCENTAGE,
+        decimals=2,
+    )
+    d = cat.model_dump()
+    assert d["aggregate_outcomes"] is True
+    assert d["grade_min"] == 0.0
+    assert d["grade_max"] == 150.0
+    assert d["grade_pass"] == 60.0
+    assert d["hidden"] is True
+    assert d["hidden_until"] == 1797724800
+    assert d["locked"] is False
+    assert d["lock_time"] == 1797292800
+    assert d["display_type"] == GRADE_DISPLAY_TYPE_PERCENTAGE
+    assert d["decimals"] == 2
+
+
+def test_format_categories_shows_grade_max_pass_hidden_locked():
+    cm = ConversationManager()
+    proposal = GradebookProposal(categories=[
+        GradebookCategory(
+            name="Labs",
+            weight=25.0,
+            aggregate_outcomes=True,
+            grade_min=0.0,
+            grade_max=50.0,
+            grade_pass=30.0,
+            hidden=True,
+            hidden_until=1797724800,
+        ),
+        GradebookCategory(name="Final Exam", weight=75.0, locked=True),
+    ])
+    text = cm._format_categories(proposal)
+    assert "include outcomes" in text
+    assert "min 0" in text
+    assert "max 50" in text
+    assert "pass ≥ 30" in text
+    assert "hidden until" in text
+    assert "hidden" in text.lower()
+    assert "locked" in text.lower()
 
 
 def test_normalize_trigger_rounds_total_to_100():

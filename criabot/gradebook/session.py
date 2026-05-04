@@ -405,6 +405,52 @@ class GradebookSessionEngine:
 
         return session
 
+    async def reset(self, session_id: str, keep_extraction: bool = True) -> GradebookSessionRecord:
+        session = self._active_sessions.get(session_id) or await self.get(session_id)
+        if session is None:
+            raise KeyError("gradebook session not found")
+
+        has_syllabus = bool((session.extraction or {}).get("has_syllabus"))
+        session.proposal = self._proposal_generator.generate_initial(session.course_activities)
+        session.content_mapping = None
+        if not keep_extraction:
+            session.extraction = {"has_syllabus": has_syllabus, "syllabus_sources": list((session.extraction or {}).get("syllabus_sources") or [])}
+
+        session.phase = "PROPOSAL" if has_syllabus else "INTAKE"
+        self._proposal_history[session.session_id] = []
+        self._proposal_history_index[session.session_id] = -1
+        self._push_proposal_history(session)
+        await self._save_session(session)
+
+        # Clear any persisted finalized result for this session so reset is clean.
+        if self._gradebook_db:
+            session_db = await self._gradebook_db.sessions.retrieve(session.session_id)
+            if session_db:
+                await self._gradebook_db.results.delete_by_session(session_db.id)
+
+        return session
+
+    async def delete(self, session_id: str) -> bool:
+        session = self._active_sessions.pop(session_id, None)
+
+        # Cache cleanup
+        if self._gradebook_cache:
+            await self._gradebook_cache.delete(session_id)
+
+        # In-memory history cleanup
+        self._proposal_history.pop(session_id, None)
+        self._proposal_history_index.pop(session_id, None)
+
+        # Database cleanup
+        deleted_db = False
+        if self._gradebook_db:
+            session_db = await self._gradebook_db.sessions.retrieve(session_id)
+            if session_db:
+                await self._gradebook_db.results.delete_by_session(session_db.id)
+            deleted_db = await self._gradebook_db.sessions.delete_session(session_id)
+
+        return deleted_db or (session is not None)
+
     async def finalize(
         self,
         session_id: str,
