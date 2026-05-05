@@ -183,6 +183,20 @@ class ConversationManager:
         extraction = session.extraction or {}
         has_syllabus = bool(extraction.get("has_syllabus"))
 
+        # Explicit effects command (works without question mark).
+        if proposal is not None and re.search(r"\b(show|display|list)\b.*\beffects?\b|\bcurrent\s+effects?\b", text):
+            full = bool(re.search(r"\b(all|detailed|detail)\b", text))
+            effects_block = self._format_effects(proposal, max_display=999 if full else 6)
+            if not effects_block:
+                return "No effects recorded yet."
+            if full:
+                return f"Current effects (newest first):{effects_block}"
+            return f"Recent effects (newest first):{effects_block}\n\nSay 'show all effects' to display everything."
+
+        # Explicit aggregation-method list command (works without question mark).
+        if re.search(r"\b(list|show|display|give\s+me)\b.*\b(grade\s+)?aggregation\s+methods?\b", text):
+            return self._aggregation_methods_help_text()
+
         # Handle questions: answer them without forcing phase transitions
         if text and self._looks_like_question(text):
             answer = self._answer_question(session, text, proposal)
@@ -223,27 +237,23 @@ class ConversationManager:
         if session.phase == "PROPOSAL" and proposal:
             categories_text = self._format_categories(proposal)
             total_weight = sum(cat.weight for cat in proposal.categories)
+            effects_text = self._format_effects(proposal)
             notes_text = self._format_notes(session, proposal)
             findings_text = self._format_findings(session)
-            
-            # Check if user has indicated an aggregation method preference
-            detected_method = self._detect_aggregation_method(text) if text else None
-            if detected_method is not None:
-                proposal.aggregation_method = detected_method
-            
+
             aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
             
             if abs(total_weight - 100.0) > 0.1:
                 return (
                     f"Here is the gradebook structure I built based on your materials:\n\n"
-                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{notes_text}\n\n"
+                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n\n"
                     "⚠ The total weight is not 100% yet. Please adjust the weights so they add up to 100% before we continue."
                 )
             else:
                 aggregation_msg = f"\n\n**Grade Aggregation Method**: {aggregation_name}\n(I'll use '{aggregation_name}' when creating your gradebook. If you prefer a different method, let me know.)"
                 return (
                     f"Here is the gradebook structure based on what I found:\n\n"
-                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{notes_text}"
+                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}"
                     f"{aggregation_msg}\n\n"
                     "Does this look right? If you'd like to adjust any weights, categories, or the grade aggregation method, let me know and I'll refine it."
                 )
@@ -252,15 +262,19 @@ class ConversationManager:
             if proposal:
                 categories_text = self._format_categories(proposal)
                 total_weight = sum(cat.weight for cat in proposal.categories)
+                effects_text = self._format_effects(proposal)
                 notes_text = self._format_notes(session, proposal)
+                aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
                 if abs(total_weight - 100.0) > 0.1:
                     return (
-                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{notes_text}\n\n"
+                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n\n"
+                        f"**Grade Aggregation Method**: {aggregation_name}\n\n"
                         "⚠ Total weight is still not 100%. Please adjust to proceed."
                     )
                 else:
                     return (
-                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{notes_text}\n\n"
+                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n\n"
+                        f"**Grade Aggregation Method**: {aggregation_name}\n\n"
                         "What else would you like to adjust? I can modify weights, add/remove categories, or rename items."
                     )
             else:
@@ -289,6 +303,12 @@ class ConversationManager:
         """Generate contextual answers to common gradebook questions."""
         q = question_text.lower()
         extraction = session.extraction or {}
+
+        if proposal is not None and any(term in q for term in ("current effects", "what is the current effects", "what are the current effects", "effects we are using")):
+            effects_block = self._format_effects(proposal, max_display=999)
+            if effects_block:
+                return f"Current effects (newest first):{effects_block}"
+            return "No effects are active right now."
 
         if "syllabus" in q and any(term in q for term in ("do you have", "did you find", "found", "have one")):
             has_syllabus = bool(extraction.get("has_syllabus"))
@@ -345,16 +365,11 @@ class ConversationManager:
 
         # Questions about aggregation/weighting method
         if any(term in q for term in ("aggregation", "aggregat", "method", "weight", "weighting system")):
-            if "what" in q or "which" in q or "difference" in q:
-                return (
-                    "**Grade Aggregation Methods** determine how Moodle calculates final grades:\n"
-                    "- **Mean of grades (0)**: Simple average of all grades\n"
-                    "- **Weighted mean (10)**: Sum of (grade × weight) / sum of weights (most common)\n"
-                    "- **Simple weighted mean (11)**: Similar to weighted mean with simplified calculation\n"
-                    "- **Mean with extra credits (12)**: Allows grades above 100% for extra credit\n"
-                    "- **Natural (13)**: Moodle's default behavior (usually weighted mean)\n\n"
-                    "Which would you prefer for your course?"
-                )
+            if any(term in q for term in ("current", "active", "currently", "now", "confirm")) and proposal is not None:
+                name = self._get_aggregation_method_name(proposal.aggregation_method)
+                return f"Current aggregation method is **{name}** (code {proposal.aggregation_method})."
+            if any(term in q for term in ("what", "which", "difference", "list", "available", "support")):
+                return self._aggregation_methods_help_text()
             if "recommend" in q or "suggest" in q or "which.*best" in q:
                 return (
                     "For most courses, **Weighted mean (10)** is recommended as it's the standard grading method "
@@ -464,10 +479,17 @@ class ConversationManager:
             keep_highest = getattr(category, 'keep_highest', 0)
             aggregate_only_graded = getattr(category, 'aggregate_only_graded', True)
             aggregate_outcomes = getattr(category, 'aggregate_outcomes', False)
+            effective_children = len(getattr(category, 'subcategories', None) or []) or len(category.items or [])
             if drop_lowest > 0:
-                settings.append(f"drop lowest {drop_lowest}")
+                if effective_children > 0 and drop_lowest >= effective_children:
+                    settings.append(f"drop lowest {drop_lowest} (no effect with {effective_children} children)")
+                else:
+                    settings.append(f"drop lowest {drop_lowest}")
             if keep_highest > 0:
-                settings.append(f"keep top {keep_highest}")
+                if effective_children > 0 and keep_highest >= effective_children:
+                    settings.append(f"keep top {keep_highest} (no effect with {effective_children} children)")
+                else:
+                    settings.append(f"keep top {keep_highest}")
             if not aggregate_only_graded:
                 settings.append("include empty grades")
             if aggregate_outcomes:
@@ -512,9 +534,57 @@ class ConversationManager:
 
         return "\n".join(lines)
 
+    def _generate_effects(self, proposal: GradebookProposal, previous: GradebookProposal | None = None) -> List[str]:
+        """Generate a list of human-readable effects from the current proposal state."""
+        # Prefer explicit effect log entries (chronological), newest first.
+        notes = list(proposal.notes or [])
+        logged = [n[len("Effect:"):].strip() for n in notes if n.startswith("Effect:")]
+        if not logged:
+            return []
+
+        seen = set()
+        ordered = []
+        for item in reversed(logged):
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(item)
+        return ordered
+
+    @staticmethod
+    def _aggregation_methods_help_text() -> str:
+        return (
+            "**Grade Aggregation Methods** determine how Moodle calculates final grades:\n"
+            "- **Mean of grades (0)**: Simple average of all grades\n"
+            "- **Weighted mean of grades (10)**: Sum of (grade × weight) / sum of weights\n"
+            "- **Simple weighted mean of grades (11)**: Weighted calculation with simplified handling\n"
+            "- **Mean of grades (with extra credits) (12)**: Supports extra-credit grades above 100%\n"
+            "- **Natural (13)**: Moodle default aggregation\n\n"
+            "Tell me which one you want to use and I'll apply it."
+        )
+        return effects
+
+    def _format_effects(self, proposal: GradebookProposal, max_display: int = 6) -> str:
+        """Format effects for display, showing recent ones with 'show all' if needed."""
+        effects = self._generate_effects(proposal)
+        if not effects:
+            return ""
+
+        lines = ["", "", "**Effects:**"]
+        if len(effects) <= max_display:
+            for effect in effects:
+                lines.append(f"- {effect}")
+        else:
+            for effect in effects[:max_display]:
+                lines.append(f"- {effect}")
+            lines.append(f"- ... and {len(effects) - max_display} more effect(s)")
+
+        return "\n".join(lines)
+
     def _format_notes(self, session: GradebookSessionRecord, proposal: GradebookProposal) -> str:
         issues = self.validate_weights(proposal)
-        notes = list(proposal.notes or [])
+        notes = [n for n in (proposal.notes or []) if not str(n).startswith("Effect:")]
         conflict_notes = self._syllabus_conflict_warnings(session, proposal)
         if not issues and not notes and not conflict_notes:
             return ""

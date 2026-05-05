@@ -1726,8 +1726,14 @@ class Criabot:
             "content_mapping": session.content_mapping,
         }
 
-    async def gradebook_delete(self, session_id: str) -> bool:
-        return await self._gradebook.delete(session_id=session_id)
+    async def gradebook_delete(self, session_id: str) -> dict:
+        result = await self._gradebook.delete(session_id=session_id)
+        return {
+            "session_id": session_id,
+            "success": result['success'],
+            "existed": result['existed'],
+            "message": result['message']
+        }
 
     async def gradebook_accept(self, session_id: str) -> dict:
         session = await self._gradebook.accept(session_id=session_id)

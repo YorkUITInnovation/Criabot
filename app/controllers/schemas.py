@@ -76,6 +76,7 @@ class APIResponse(BaseModel):
     timestamp: int = round(time.time())
     code: str = "SUCCESS"
     error: Optional[str] = Field(default=None)
+    data: Optional[dict] = Field(default=None)
 
     def dict(self, *args, **kwargs):
 

@@ -4,11 +4,11 @@ import difflib
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 
 from .schemas import (
-    CourseActivity, GradebookCategory, GradebookProposal,
+    CourseActivity, GradebookCategory, GradebookSubcategory, GradebookProposal,
     GRADE_DISPLAY_TYPE_DEFAULT, GRADE_DISPLAY_TYPE_REAL, GRADE_DISPLAY_TYPE_PERCENTAGE,
     GRADE_DISPLAY_TYPE_LETTER, GRADE_DISPLAY_TYPE_REAL_PERCENTAGE, GRADE_DISPLAY_TYPE_REAL_LETTER,
     GRADE_DISPLAY_TYPE_LETTER_REAL, GRADE_DISPLAY_TYPE_PERCENTAGE_REAL,
@@ -86,6 +86,22 @@ class ProposalGenerator:
         low = note.lower()
         return any(low.startswith(prefix) for prefix in ProposalGenerator._EPHEMERAL_NOTE_PREFIXES)
 
+    @staticmethod
+    def _append_unique_note(proposal: GradebookProposal, note: str) -> None:
+        notes = proposal.notes or []
+        if note not in notes:
+            notes.append(note)
+        proposal.notes = notes
+
+    @staticmethod
+    def _append_effect_note(proposal: GradebookProposal, effect: str) -> None:
+        notes = proposal.notes or []
+        entry = f"Effect: {effect.strip()}"
+        # Avoid only immediate duplicate spam; keep chronological history otherwise.
+        if not notes or notes[-1] != entry:
+            notes.append(entry)
+        proposal.notes = notes
+
     def update_from_prompt(self, proposal: GradebookProposal, prompt: str) -> GradebookProposal:
         updated = GradebookProposal.parse_obj(proposal.model_dump())
         prompt_lower = prompt.lower()
@@ -94,7 +110,10 @@ class ProposalGenerator:
         updated.notes = [n for n in (updated.notes or []) if not self._is_ephemeral_note(n)]
 
         # Detect split context early so weight extraction skips subcategory names.
-        is_split_prompt = bool(re.search(r"\bsplit\b.+\binto\b", prompt_lower))
+        # Support both:
+        # - "split ... into ..."
+        # - "add subcategories: ..."
+        is_split_prompt = bool(re.search(r"\b(?:split|divide)\b.+\binto\b|\badd\s+subcategories\b", prompt_lower))
 
         self._apply_removals(updated, prompt)
 
@@ -119,17 +138,74 @@ class ProposalGenerator:
         # Apply per-category settings (drop/keep/extra credit/exclude empty)
         self._apply_category_settings(updated, prompt)
 
+        # Persist aggregation method requests (e.g., "use weighted mean").
+        self._apply_aggregation_method(updated, prompt)
+
         if is_split_prompt:
-            split_parts = self._parse_split_categories(prompt)
-            self._record_split_request(updated, split_parts)
+            self._apply_split_request(updated, prompt)
 
         self._post_update_checks(updated, prompt)
 
         return updated
 
+    @staticmethod
+    def _parse_aggregation_method(prompt: str) -> Optional[int]:
+        text_l = (prompt or "").lower()
+
+        if any(term in text_l for term in ("weighted mean", "weighted average", "weight", "weighted")):
+            if "simple" in text_l:
+                return 11  # Simple weighted mean
+            return 10  # Weighted mean
+
+        if any(term in text_l for term in ("mean of grades", "simple mean", "average", "mean")):
+            if "extra credit" in text_l or "extra credits" in text_l:
+                return 12  # Mean with extra credits
+            return 0  # Mean of grades
+
+        if "extra credit" in text_l or "extra credits" in text_l:
+            return 12
+
+        if any(term in text_l for term in ("natural", "moodle default", "default aggregation")):
+            return 13
+
+        return None
+
+    @staticmethod
+    def _get_aggregation_method_name(method: int) -> str:
+        return {
+            0: "Mean of grades",
+            10: "Weighted mean of grades",
+            11: "Simple weighted mean of grades",
+            12: "Mean of grades (with extra credits)",
+            13: "Natural",
+        }.get(int(method), f"Method {method}")
+
+    def _apply_aggregation_method(self, proposal: GradebookProposal, prompt: str) -> None:
+        method = self._parse_aggregation_method(prompt)
+        if method is None:
+            return
+        old_method = proposal.aggregation_method
+        proposal.aggregation_method = method
+        if old_method != method:
+            name = self._get_aggregation_method_name(method)
+            self._append_effect_note(proposal, f"Aggregation method set to {name}")
+
     def _apply_category_settings(self, proposal: GradebookProposal, prompt: str) -> None:
         """Parse and apply drop_lowest, keep_highest, extra_credit, aggregate_only_graded per category."""
         prompt_lower = prompt.lower()
+
+        # Scoped phrasing: "For Assignments, set drop lowest to 1"
+        for m in re.finditer(
+            r"\bfor\s+([a-zA-Z][a-zA-Z ]{1,30})\s*,?\s*set\s+drop\s+lowest\s+(?:to\s+)?(\d+)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip().rstrip(".,")
+            n = int(m.group(2))
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.drop_lowest = n
+                cat.keep_highest = 0
+                self._append_effect_note(proposal, f"Drop lowest {n} from {cat.name}")
 
         # drop lowest N [from category]
         for m in re.finditer(
@@ -142,6 +218,20 @@ class ProposalGenerator:
             for cat in targets:
                 cat.drop_lowest = n
                 cat.keep_highest = 0  # mutually exclusive
+                self._append_effect_note(proposal, f"Drop lowest {n} from {cat.name}")
+
+        # Scoped phrasing: "For Labs, keep highest 2 items"
+        for m in re.finditer(
+            r"\bfor\s+([a-zA-Z][a-zA-Z ]{1,30})\s*,?\s*keep\s+(?:the\s+)?(?:highest|top|best)\s+(\d+)(?:\s+items?)?",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip().rstrip(".,")
+            n = int(m.group(2))
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.keep_highest = n
+                cat.drop_lowest = 0
+                self._append_effect_note(proposal, f"Keep highest {n} from {cat.name}")
 
         # keep highest / best N [from category]
         for m in re.finditer(
@@ -154,6 +244,7 @@ class ProposalGenerator:
             for cat in targets:
                 cat.keep_highest = n
                 cat.drop_lowest = 0  # mutually exclusive
+                self._append_effect_note(proposal, f"Keep highest {n} from {cat.name}")
 
         # extra credit: "assignments count as extra credit" / "extra credit for labs"
         for m in re.finditer(
@@ -181,6 +272,7 @@ class ProposalGenerator:
             targets = self._resolve_category_targets(proposal, cat_hint)
             for cat in targets:
                 cat.aggregate_only_graded = False
+                self._append_effect_note(proposal, f"{cat.name} includes empty grades in aggregation")
 
         if re.search(r"\bexclude\s+empty\b", prompt_lower):
             cat_m = re.search(r"\bexclude\s+empty\s+(?:grades?\s+)?(?:for\s+)?([a-zA-Z][a-zA-Z ]{1,30})?", prompt_lower)
@@ -188,6 +280,18 @@ class ProposalGenerator:
             targets = self._resolve_category_targets(proposal, cat_hint)
             for cat in targets:
                 cat.aggregate_only_graded = True
+                self._append_effect_note(proposal, f"{cat.name} aggregates only non-empty grades")
+
+        # Alternate phrasing: "aggregate only non-empty grades" / "only graded"
+        for m in re.finditer(
+            r"\bfor\s+([a-zA-Z][a-zA-Z ]{1,30})\s*,?\s*(?:set\s+)?aggregate\s+only\s+(?:non[-\s]?empty|graded)\s+grades?",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip().rstrip(".,")
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.aggregate_only_graded = True
+                self._append_effect_note(proposal, f"{cat.name} aggregates only non-empty grades")
 
         # aggregate outcomes: include or exclude outcome items in aggregation
         if re.search(r"\b(?:include|aggregate)\s+outcomes?\b", prompt_lower):
@@ -267,6 +371,7 @@ class ProposalGenerator:
             targets = self._resolve_category_targets(proposal, cat_hint)
             for cat in targets:
                 cat.hidden = True
+                self._append_effect_note(proposal, f"{cat.name} hidden from students")
 
         # hide until: "hide assignments until 2026-12-20"
         for m in re.finditer(
@@ -281,6 +386,23 @@ class ProposalGenerator:
             for cat in targets:
                 cat.hidden = True
                 cat.hidden_until = ts
+                self._append_effect_note(proposal, f"{cat.name} hidden until {m.group(2).strip()}")
+
+        # Relative-date phrasing: "Set Final Exam as hidden until next week"
+        for m in re.finditer(
+            r"\b(?:set|make|hide)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:as\s+)?hidden\s+until\s+(next\s+week|tomorrow|next\s+month)(?:\b|$)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            rel = m.group(2).strip()
+            ts = self._parse_relative_date_to_timestamp(rel)
+            if ts is None:
+                continue
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.hidden = True
+                cat.hidden_until = ts
+                self._append_effect_note(proposal, f"{cat.name} hidden until {rel}")
 
         for m in re.finditer(
             r"\b(?:show|unhide|reveal)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?:\s+category)?(?:\b|$)",
@@ -291,6 +413,7 @@ class ProposalGenerator:
             for cat in targets:
                 cat.hidden = False
                 cat.hidden_until = None
+                self._append_effect_note(proposal, f"{cat.name} is visible to students")
 
         # locked: "lock the final exam" / "unlock assignments"
         for m in re.finditer(
@@ -375,6 +498,21 @@ class ProposalGenerator:
         except ValueError:
             return None
         return int(dt.timestamp())
+
+    @staticmethod
+    def _parse_relative_date_to_timestamp(relative_text: str) -> Optional[int]:
+        text = (relative_text or "").strip().lower()
+        now = datetime.now(timezone.utc)
+        if text == "tomorrow":
+            target = now + timedelta(days=1)
+        elif text == "next week":
+            target = now + timedelta(days=7)
+        elif text == "next month":
+            target = now + timedelta(days=30)
+        else:
+            return None
+        target = target.replace(hour=0, minute=0, second=0, microsecond=0)
+        return int(target.timestamp())
 
     def _resolve_category_targets(self, proposal: GradebookProposal, hint: str) -> List:
         """Return matching categories for a hint string, or all categories if hint is empty."""
@@ -520,7 +658,9 @@ class ProposalGenerator:
     # (prevents "Homework 15%" being misread as "Assignments 15%" via alias).
     @staticmethod
     def _extract_split_piece_names(prompt: str) -> List[str]:
-        match = re.search(r"\bsplit\b.+?\binto\b(.+)", prompt, flags=re.IGNORECASE)
+        match = re.search(r"\b(?:split|divide)\b.+?\binto\b(.+)", prompt, flags=re.IGNORECASE)
+        if not match:
+            match = re.search(r"\badd\s+subcategories\s*[:;]?\s*(.+)", prompt, flags=re.IGNORECASE)
         if not match:
             return []
         pieces = re.split(r",| and | & ", match.group(1))
@@ -549,8 +689,10 @@ class ProposalGenerator:
         split_piece_names: List[str] = []
         if skip_split_pieces:
             split_piece_names = self._extract_split_piece_names(prompt)
-            # Also strip everything after "split ... into" to avoid parsing subcategory weights.
+            # Also strip split payload text to avoid parsing subcategory weights as top-level weights.
             clean_prompt = re.sub(r"\bsplit\b.+", "", clean_prompt, flags=re.IGNORECASE).strip()
+            clean_prompt = re.sub(r"\bdivide\b.+", "", clean_prompt, flags=re.IGNORECASE).strip()
+            clean_prompt = re.sub(r"\badd\s+subcategories\b\s*[:;]?.+", "", clean_prompt, flags=re.IGNORECASE).strip()
 
         # Guard against parsing non-weight numeric settings (grade min/max/pass, dates, decimals, hide/lock).
         settings_context = bool(re.search(
@@ -688,40 +830,96 @@ class ProposalGenerator:
                 proposal.categories.append(GradebookCategory(name=name, weight=weight, items=[]))
                 proposal.notes.append(f"Added category '{name}' with weight {weight:.1f}%.")
 
+    def _detect_split_parent(self, proposal: GradebookProposal, prompt: str) -> Optional[str]:
+        # 1) "Split Assignments ... into ..."
+        direct = re.search(r"\b(?:split|divide)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(|\s+into\b)", prompt, flags=re.IGNORECASE)
+        if direct:
+            resolved = self._resolve_category_name(proposal, direct.group(1).strip())
+            if resolved:
+                return resolved
+
+        # 2) "In Labs, ... split/divide into ..." or "For Labs, ..."
+        scoped = re.search(r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)\s*,.*\b(?:split|divide)\b", prompt, flags=re.IGNORECASE)
+        if scoped:
+            resolved = self._resolve_category_name(proposal, scoped.group(1).strip())
+            if resolved:
+                return resolved
+
+        # 3) "In Labs, add subcategories:" or "For Labs, add subcategories:"
+        add_subs = re.search(r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)\s*,.*\badd\s+subcategories\b", prompt, flags=re.IGNORECASE)
+        if add_subs:
+            resolved = self._resolve_category_name(proposal, add_subs.group(1).strip())
+            if resolved:
+                return resolved
+
+        return None
+
     def _parse_split_categories(self, prompt: str) -> List[Tuple[str, Optional[float]]]:
-        # Match "split <anything> into <parts>" generically.
-        match = re.search(r"\bsplit\b.+?\binto\b\s*(.+)", prompt, flags=re.IGNORECASE)
+        # Try "split/divide X into Y 10%, Z 15%" pattern
+        match = re.search(r"\b(?:split|divide)\b.+?\binto\b\s*(.+)", prompt, flags=re.IGNORECASE)
+        if not match:
+            # Try "In X, add subcategories: Y 10%, Z 15%" pattern
+            match = re.search(r"\badd\s+subcategories\s*[:;]?\s*(.+)", prompt, flags=re.IGNORECASE)
         if not match:
             return []
 
-        # Remove trailing qualifications like "but keep Assignments as the parent category".
         raw_list = re.sub(r"\bbut\b.+", "", match.group(1), flags=re.IGNORECASE).strip()
+        each_weight = None
+        each_match = re.search(r"\b(?:assign|set|make)?\s*(\d+(?:\.\d+)?)\s*%\s*(?:for\s*)?each\b", raw_list, flags=re.IGNORECASE)
+        if each_match:
+            each_weight = float(each_match.group(1))
+            raw_list = re.sub(r"\b(?:and\s+)?(?:assign|set|make)?\s*\d+(?:\.\d+)?\s*%\s*(?:for\s*)?each\b", "", raw_list, flags=re.IGNORECASE)
+
         pieces = re.split(r",| and | & ", raw_list)
         parsed: List[Tuple[str, Optional[float]]] = []
         for piece in pieces:
             cleaned = piece.strip()
             if not cleaned:
                 continue
-            weighted = re.match(r"([a-zA-Z ]+?)\s*(\d+(?:\.\d+)?)\s*%", cleaned, flags=re.IGNORECASE)
+            weighted = re.match(r"([a-zA-Z][a-zA-Z\- ]*?)\s*(\d+(?:\.\d+)?)\s*%", cleaned, flags=re.IGNORECASE)
             if weighted:
-                parsed.append((weighted.group(1).strip().title(), float(weighted.group(2))))
+                name = weighted.group(1).strip()
+                name = re.sub(r"^[^a-zA-Z]+", "", name)
+                name = re.sub(r"[^a-zA-Z]+$", "", name)
+                if name:
+                    parsed.append((name.title(), float(weighted.group(2))))
             elif re.search(r"[a-zA-Z]", cleaned):
-                parsed.append((re.sub(r"\d+(?:\.\d+)?\s*%", "", cleaned).strip().title(), None))
+                name = re.sub(r"\d+(?:\.\d+)?\s*%", "", cleaned).strip()
+                name = re.sub(r"^[^a-zA-Z]+", "", name)
+                name = re.sub(r"[^a-zA-Z]+$", "", name)
+                if name:
+                    parsed.append((name.title(), None))
+
+        if each_weight is not None and parsed and all(weight is None for _, weight in parsed):
+            parsed = [(name, each_weight) for name, _ in parsed]
+
         return parsed
 
-    def _record_split_request(self, proposal: GradebookProposal, split_parts: List[Tuple[str, Optional[float]]]) -> None:
-        if not split_parts:
+    def _apply_split_request(self, proposal: GradebookProposal, prompt: str) -> None:
+        parent_name = self._detect_split_parent(proposal, prompt)
+        split_parts = self._parse_split_categories(prompt)
+        if not parent_name or not split_parts:
             return
 
-        labels = []
-        for name, weight in split_parts:
-            if weight is None:
-                labels.append(name)
-            else:
-                labels.append(f"{name} {weight:.1f}%")
+        parent = next((cat for cat in proposal.categories if cat.name.lower() == parent_name.lower()), None)
+        if parent is None:
+            return
 
-        proposal.notes.append(
-            "Assignments split requested (treated as internal allocation): " + ", ".join(labels) + "."
+        subcategories: List[GradebookSubcategory] = []
+        labels: List[str] = []
+        for name, weight in split_parts:
+            w = float(weight) if weight is not None else 0.0
+            subcategories.append(GradebookSubcategory(name=name, weight=w))
+            labels.append(f"{name} {w:.1f}%" if weight is not None else name)
+
+        parent.subcategories = subcategories
+        self._append_effect_note(
+            proposal,
+            f"In {parent.name}, split into " + ", ".join(labels),
+        )
+        self._append_unique_note(
+            proposal,
+            f"{parent.name} split requested (treated as internal allocation): " + ", ".join(labels) + ".",
         )
 
     def _apply_removals(self, proposal: GradebookProposal, prompt: str) -> None:
@@ -855,37 +1053,54 @@ class ProposalGenerator:
             for cat in proposal.categories:
                 cat.weight = round(cat.weight * scale, 2)
             total = sum(cat.weight for cat in proposal.categories)
-            proposal.notes.append("Auto-normalized category weights to 100%.")
+            self._append_unique_note(proposal, "Auto-normalized category weights to 100%.")
 
         if abs(total - 100.0) > 0.1:
-            proposal.notes.append(
+            self._append_unique_note(
+                proposal,
                 f"Weight check: total is {total:.1f}% (expected 100%)."
             )
 
         self._check_split_consistency(proposal)
+        self._check_rule_effectiveness(proposal)
 
     def _check_split_consistency(self, proposal: GradebookProposal) -> None:
-        split_note = next(
-            (note for note in reversed(proposal.notes) if "split requested" in note.lower()),
-            None,
-        )
-        if not split_note:
-            return
+        for parent in proposal.categories:
+            parts = list(getattr(parent, "subcategories", []) or [])
+            if not parts:
+                continue
+            split_total = sum(float(part.weight or 0) for part in parts)
+            if abs(split_total - parent.weight) > 0.1:
+                self._append_unique_note(
+                    proposal,
+                    f"{parent.name} internal split totals {split_total:.1f}% while parent weight is {parent.weight:.1f}%. "
+                    "Please update split weights if you want them to match."
+                )
 
-        parent = next((cat for cat in proposal.categories if self._normalize_name(cat.name) == "assignments"), None)
-        if parent is None:
-            return
+    def _check_rule_effectiveness(self, proposal: GradebookProposal) -> None:
+        for category in proposal.categories:
+            child_count = 0
+            if getattr(category, "subcategories", None):
+                child_count = len(category.subcategories)
+            elif getattr(category, "items", None):
+                child_count = len(category.items)
 
-        parts = re.findall(r"\b([A-Za-z][A-Za-z ]+?)\s+(\d+(?:\.\d+)?)%", split_note)
-        if not parts:
-            return
+            if child_count <= 0:
+                continue
 
-        split_total = sum(float(weight) for _, weight in parts)
-        if abs(split_total - parent.weight) > 0.1:
-            proposal.notes.append(
-                f"Assignments internal split totals {split_total:.1f}% while parent weight is {parent.weight:.1f}%. "
-                "Please update split weights if you want them to match."
-            )
+            keep_highest = int(getattr(category, "keep_highest", 0) or 0)
+            if keep_highest > 0 and keep_highest >= child_count:
+                self._append_unique_note(
+                    proposal,
+                    f"{category.name} keep-highest setting has no practical effect right now because the category has only {child_count} graded child {'item' if child_count == 1 else 'items'}."
+                )
+
+            drop_lowest = int(getattr(category, "drop_lowest", 0) or 0)
+            if drop_lowest > 0 and drop_lowest >= child_count:
+                self._append_unique_note(
+                    proposal,
+                    f"{category.name} drop-lowest setting has no practical effect right now because the category has only {child_count} graded child {'item' if child_count == 1 else 'items'}."
+                )
 
     @staticmethod
     def _normalize_name(value: str) -> str:

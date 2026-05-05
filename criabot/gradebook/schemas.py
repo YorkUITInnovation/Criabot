@@ -46,10 +46,16 @@ GRADE_DISPLAY_TYPE_NAMES = {
 }
 
 
+class GradebookSubcategory(BaseModel):
+    name: str
+    weight: float
+
+
 class GradebookCategory(BaseModel):
     name: str
     weight: float
     items: List[str] = Field(default_factory=list)
+    subcategories: List[GradebookSubcategory] = Field(default_factory=list)
 
     # Aggregation / drop-keep settings
     drop_lowest: int = Field(default=0, description="Drop N lowest grade items from this category")

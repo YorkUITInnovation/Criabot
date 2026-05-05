@@ -251,7 +251,9 @@ async def test_gradebook_delete_removes_session_from_engine():
     )
 
     deleted = await engine.delete(session.session_id)
-    assert deleted is True
+    assert isinstance(deleted, dict)
+    assert deleted.get("success") is True
+    assert deleted.get("existed") is True
 
     loaded = await engine.get(session.session_id)
     assert loaded is None

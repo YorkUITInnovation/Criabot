@@ -430,8 +430,17 @@ class GradebookSessionEngine:
 
         return session
 
-    async def delete(self, session_id: str) -> bool:
+    async def delete(self, session_id: str) -> dict:
+        """Delete a gradebook session from memory, cache, and database.
+        
+        Returns:
+            dict with keys:
+            - 'success': bool indicating if deletion occurred
+            - 'existed': bool indicating if session/data was found
+            - 'message': str with status details
+        """
         session = self._active_sessions.pop(session_id, None)
+        existed = session is not None
 
         # Cache cleanup
         if self._gradebook_cache:
@@ -446,10 +455,18 @@ class GradebookSessionEngine:
         if self._gradebook_db:
             session_db = await self._gradebook_db.sessions.retrieve(session_id)
             if session_db:
+                existed = True
                 await self._gradebook_db.results.delete_by_session(session_db.id)
             deleted_db = await self._gradebook_db.sessions.delete_session(session_id)
 
-        return deleted_db or (session is not None)
+        success = deleted_db or session is not None
+        
+        return {
+            'success': success,
+            'existed': existed,
+            'message': f"Session {session_id} deleted." if success else f"Session {session_id} not found."
+        }
+
 
     async def finalize(
         self,
