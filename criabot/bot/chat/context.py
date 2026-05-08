@@ -6,7 +6,7 @@ import re
 import textwrap
 from typing import List, Optional, Dict, Awaitable, Union, Type
 
-from CriadexSDK.ragflow_sdk import RAGFlowSDK
+from CriadexSDK.ragflow_sdk import RAGFlowSDK, CriadexNetworkError, CriadexAPIError
 from CriadexSDK.ragflow_schemas import TextNodeWithScore, Filter, GroupSearchResponse, CompletionUsage, Asset
 from pydantic import BaseModel
 
@@ -27,6 +27,8 @@ class ContextRetrieverResponse(BaseModel):
     search_units: int = 0
     faq_fallback_used: bool = False
     faq_sources: List[dict] = []
+    indexing_in_progress: bool = False
+    indexing_groups: List[str] = []
 
     @classmethod
     def get_search_units(cls, group_responses):
@@ -112,6 +114,44 @@ class ContextRetriever:
         )
         self._known_confidence_threshold = float(os.getenv("RETRIEVAL_KNOWN_THRESHOLD", "0.75"))
         self._semi_known_confidence_threshold = float(os.getenv("RETRIEVAL_SEMI_THRESHOLD", "0.4"))
+        self._indexing_retry_attempts = int(os.getenv("RETRIEVAL_INDEXING_RETRY_ATTEMPTS", "3"))
+        self._indexing_retry_delay_seconds = float(os.getenv("RETRIEVAL_INDEXING_RETRY_DELAY_SECONDS", "1.0"))
+
+    @staticmethod
+    def _extract_listed_file_count(list_payload: object) -> int:
+        if isinstance(list_payload, dict):
+            for key in ("files", "document_names", "documents"):
+                value = list_payload.get(key)
+                if isinstance(value, list):
+                    return len(value)
+
+            response = list_payload.get("response")
+            if isinstance(response, dict):
+                for key in ("files", "document_names", "documents"):
+                    value = response.get(key)
+                    if isinstance(value, list):
+                        return len(value)
+
+        return 0
+
+    async def _group_file_count(self, group_name: str) -> int:
+        try:
+            list_payload = await self._criadex.content.list(group_name=group_name)
+            if inspect.isawaitable(list_payload):
+                list_payload = await list_payload
+            return self._extract_listed_file_count(list_payload)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _set_indexing_metadata(response_obj: GroupSearchResponse, group_name: str, file_count: int) -> GroupSearchResponse:
+        response_obj.metadata = {
+            **(response_obj.metadata or {}),
+            "indexing_in_progress": True,
+            "group_name": group_name,
+            "listed_file_count": file_count,
+        }
+        return response_obj
 
     @classmethod
     def _explicit_web_search_requested(cls, prompt: str) -> bool:
@@ -390,6 +430,49 @@ class ContextRetriever:
 
             if graph_meta:
                 response_obj.metadata = {**(response_obj.metadata or {}), "graph_rag": graph_meta}
+
+            # Fresh uploads may be listed in-group before retrieval is queryable.
+            # Retry briefly and mark as indexing so callers can return a specific status.
+            if not response_obj.nodes and group_name.endswith("-document-index"):
+                attempts = max(self._indexing_retry_attempts, 0)
+                file_count = 0
+                for attempt in range(attempts):
+                    file_count = await self._group_file_count(group_name=group_name)
+                    if file_count < 1:
+                        break
+
+                    if attempt > 0:
+                        await asyncio.sleep(self._indexing_retry_delay_seconds)
+
+                    retry_result = await self._criadex.content.search(
+                        group_name=group_name,
+                        search_config={
+                            **search_config,
+                            "top_k": max(int(search_config.get("top_k", 0) or 0), 80),
+                            "top_n": max(int(search_config.get("top_n", 0) or 0), 30),
+                            "min_k": 0.0,
+                            "min_n": 0.0,
+                        },
+                    )
+                    if inspect.isawaitable(retry_result):
+                        retry_result = await retry_result
+                    retry_response_obj, retry_graph_meta = to_group_response(retry_result)
+                    if retry_response_obj.nodes:
+                        response_obj = retry_response_obj
+                        if retry_graph_meta:
+                            response_obj.metadata = {
+                                **(response_obj.metadata or {}),
+                                "graph_rag": retry_graph_meta,
+                            }
+                        break
+
+                if not response_obj.nodes and file_count > 0:
+                    response_obj = self._set_indexing_metadata(
+                        response_obj=response_obj,
+                        group_name=group_name,
+                        file_count=file_count,
+                    )
+
             return {"group_name": group_name, "response": response_obj}
 
         async def safe_search(group_name: str, search_config: dict):
@@ -398,7 +481,15 @@ class ContextRetriever:
             except Exception as e:
                 # Missing index groups should not crash chat. Treat as "no context".
                 message = str(e)
-                if "GROUP_NOT_FOUND" in message or "Group not found" in message:
+                if (
+                    isinstance(e, CriadexNetworkError)
+                    or (isinstance(e, CriadexAPIError) and getattr(e, "status_code", None) in (404, 503, 504))
+                    or "GROUP_NOT_FOUND" in message
+                    or "Group not found" in message
+                    or "INDEX_NOT_FOUND" in message
+                    or "Name or service not known" in message
+                    or "Network error after" in message
+                ):
                     return None
                 raise
 
@@ -583,6 +674,17 @@ class ContextRetriever:
 
         # If there are no nodes after fallback attempt, return no-context.
         if len(nodes) < 1:
+            indexing_groups: List[str] = []
+            for group_name, group_response in retriever_response.group_responses.items():
+                if not isinstance(group_response, GroupSearchResponse):
+                    continue
+                metadata = group_response.metadata or {}
+                if metadata.get("indexing_in_progress"):
+                    indexing_groups.append(group_name)
+
+            if indexing_groups:
+                retriever_response.indexing_in_progress = True
+                retriever_response.indexing_groups = indexing_groups
             return retriever_response
         ranked_nodes: List[TextNodeWithScore] = []
         try:

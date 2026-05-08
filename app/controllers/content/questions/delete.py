@@ -8,6 +8,7 @@ from app.controllers.content.documents.delete import BotContentDeleteResponse
 from app.core.route import CriaRoute
 
 from criabot.schemas import BotNotFoundError
+from CriadexSDK.ragflow_sdk import CriadexAPIError
 
 view = APIRouter()
 
@@ -43,10 +44,15 @@ class DeleteQuestionRoute(CriaRoute):
         from criabot.bot.bot import Bot
         bot: Bot = await request.app.criabot.get(name=bot_name)
 
-        await bot.delete_group_file(
-            index_type="QUESTION",
-            document_name=document_name
-        )
+        try:
+            await bot.delete_group_file(
+                index_type="QUESTION",
+                document_name=document_name
+            )
+        except CriadexAPIError as ex:
+            # Idempotent delete: already-missing questions should not fail the flow.
+            if ex.status_code != 404:
+                raise
 
         return self.ResponseModel(
             code=SUCCESS_CODE,

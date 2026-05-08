@@ -34,6 +34,7 @@ def criadex_api():
     mock.agents.cohere.rerank = AsyncMock(return_value={"reranked_documents": [], "search_units": 1})
     mock.agents.azure.transform = AsyncMock(return_value={"agent_response": TransformAgentResponse(new_prompt="hello", usage=[])})
     mock.content.search = AsyncMock()
+    mock.content.list = AsyncMock(return_value={"files": []})
     return mock
 
 @pytest.fixture
@@ -81,6 +82,19 @@ async def test_retrieve_no_nodes(retriever, bot_mock):
     assert response.context is None
     assert len(response.nodes) == 0
     retriever._criadex.agents.cohere.rerank.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retrieve_marks_indexing_in_progress_when_group_has_files_but_no_nodes(retriever):
+    retriever._criadex.content.search.return_value = make_group_search_payload(nodes=[])
+    retriever._criadex.content.list.return_value = {"files": ["quiz_syllabus.txt"]}
+    retriever._indexing_retry_attempts = 1
+
+    response = await retriever.retrieve(prompt="hello", metadata_filter=None, extra_bots=[])
+
+    assert response.context is None
+    assert response.indexing_in_progress is True
+    assert "child-document-index" in response.indexing_groups
 
 @pytest.mark.asyncio
 async def test_retrieve_with_text_context(retriever, bot_mock):

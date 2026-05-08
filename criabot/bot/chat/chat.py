@@ -28,6 +28,10 @@ class Chat:
     Lightweight, transient chat instance
     """
 
+    INDEXING_IN_PROGRESS_MESSAGE = (
+        "Your document is still indexing. Please try again in a few moments."
+    )
+
     def __init__(
         self,
         bot: Bot,
@@ -96,6 +100,9 @@ class Chat:
             metadata_filter=metadata_filter,
             extra_bots=extra_bots
         )
+        if response.indexing_in_progress:
+            self.chat_reply_metadata["indexing_in_progress"] = True
+            self.chat_reply_metadata["indexing_groups"] = response.indexing_groups
         if response.faq_fallback_used:
             self.chat_reply_metadata["faq_fallback_used"] = True
             self.chat_reply_metadata["faq_sources"] = response.faq_sources
@@ -124,7 +131,9 @@ class Chat:
         elif isinstance(response.context, QuestionContext):
             reply_history, reply_tokens = self._question_context_reply(response.context)
         elif response.context is None:
-            reply_history, reply_tokens = await self._no_context_reply()
+            reply_history, reply_tokens = await self._no_context_reply(
+                indexing_in_progress=response.indexing_in_progress
+            )
         else:
             raise ValueError("Unexpected context return case!")
 
@@ -366,7 +375,21 @@ class Chat:
         )
         return self._buffer.history, None
 
-    async def _no_context_reply(self):
+    def _indexing_in_progress_message(self):
+        self._buffer.add_message(
+            message=ChatMessage(
+                role="assistant",
+                blocks=[{"type": "text", "text": self.INDEXING_IN_PROGRESS_MESSAGE}],
+                additional_kwargs={},
+                metadata=self.chat_reply_metadata,
+            )
+        )
+        return self._buffer.history, None
+
+    async def _no_context_reply(self, indexing_in_progress: bool = False):
+        if indexing_in_progress:
+            return self._indexing_in_progress_message()
+
         if self._bot_parameters.no_context_llm_guess:
             history, usage = await self._no_context_llm_guess()
             

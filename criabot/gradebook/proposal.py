@@ -94,13 +94,57 @@ class ProposalGenerator:
         proposal.notes = notes
 
     @staticmethod
+    def _effect_topic_key(effect: str) -> str:
+        """Return a stable topic key so later effects override earlier ones on same topic."""
+        text = (effect or "").strip()
+        low = text.lower()
+
+        m = re.match(r"^in\s+(.+?),\s*split\s+into\b", low)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1)).strip()
+            return f"split:{label}"
+
+        m = re.match(r"^keep\s+highest\s+\d+\s+from\s+(.+)$", low)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1)).strip()
+            return f"keephigh:{label}"
+
+        m = re.match(r"^drop\s+lowest\s+\d+\s+from\s+(.+)$", low)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1)).strip()
+            return f"droplow:{label}"
+
+        if low.startswith("aggregation method set to"):
+            return "aggregation_method"
+
+        m = re.match(r"^(.+?)\s+hidden\s+until\b", low)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1)).strip()
+            return f"hiddenuntil:{label}"
+
+        return low
+
+    @staticmethod
     def _append_effect_note(proposal: GradebookProposal, effect: str) -> None:
         notes = proposal.notes or []
-        entry = f"Effect: {effect.strip()}"
-        # Avoid only immediate duplicate spam; keep chronological history otherwise.
-        if not notes or notes[-1] != entry:
-            notes.append(entry)
-        proposal.notes = notes
+        clean_effect = effect.strip()
+        entry = f"Effect: {clean_effect}"
+        topic_key = ProposalGenerator._effect_topic_key(clean_effect)
+
+        # Keep only the latest entry per topic (e.g., latest Labs split overrides older Labs split).
+        filtered = []
+        for n in notes:
+            if not str(n).startswith("Effect:"):
+                filtered.append(n)
+                continue
+            old_effect = str(n)[len("Effect:"):].strip()
+            if ProposalGenerator._effect_topic_key(old_effect) == topic_key:
+                continue
+            filtered.append(n)
+
+        if not filtered or filtered[-1] != entry:
+            filtered.append(entry)
+        proposal.notes = filtered
 
     def update_from_prompt(self, proposal: GradebookProposal, prompt: str) -> GradebookProposal:
         updated = GradebookProposal.parse_obj(proposal.model_dump())
@@ -151,6 +195,14 @@ class ProposalGenerator:
     @staticmethod
     def _parse_aggregation_method(prompt: str) -> Optional[int]:
         text_l = (prompt or "").lower()
+        _VALID_METHOD_IDS = {0, 10, 11, 12, 13}
+
+        # Direct numeric method ID: "method number 13", "method 13", "number 13", "use number 13"
+        numeric_m = re.search(r'\b(?:method\s+(?:number\s+)?|number\s+)(\d+)\b', text_l)
+        if numeric_m:
+            n = int(numeric_m.group(1))
+            if n in _VALID_METHOD_IDS:
+                return n
 
         if any(term in text_l for term in ("weighted mean", "weighted average", "weight", "weighted")):
             if "simple" in text_l:
@@ -388,9 +440,25 @@ class ProposalGenerator:
                 cat.hidden_until = ts
                 self._append_effect_note(proposal, f"{cat.name} hidden until {m.group(2).strip()}")
 
-        # Relative-date phrasing: "Set Final Exam as hidden until next week"
+        # "set/make X as hidden until 2026-05-19"
         for m in re.finditer(
-            r"\b(?:set|make|hide)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:as\s+)?hidden\s+until\s+(next\s+week|tomorrow|next\s+month)(?:\b|$)",
+            r"\b(?:set|make)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:as\s+)?hidden\s+until\s+(\d{4}-\d{2}-\d{2})(?:\b|$)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            ts = self._parse_iso_date_to_timestamp(m.group(2).strip())
+            if ts is None:
+                continue
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.hidden = True
+                cat.hidden_until = ts
+                self._append_effect_note(proposal, f"{cat.name} hidden until {m.group(2).strip()}")
+
+        # Relative-date phrasing: "Set Final Exam as hidden until next week" / "two weeks from now"
+        for m in re.finditer(
+            r"\b(?:set|make|hide)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:as\s+)?hidden\s+until\s+"
+            r"(next\s+week|tomorrow|next\s+month|(?:in\s+)?(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+weeks?(?:\s+from\s+now)?|in\s+\d+\s+days?)(?:\b|$)",
             prompt_lower,
         ):
             cat_hint = m.group(1).strip()
@@ -503,6 +571,11 @@ class ProposalGenerator:
     def _parse_relative_date_to_timestamp(relative_text: str) -> Optional[int]:
         text = (relative_text or "").strip().lower()
         now = datetime.now(timezone.utc)
+        _WORD_NUMS = {
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+        }
+
         if text == "tomorrow":
             target = now + timedelta(days=1)
         elif text == "next week":
@@ -510,7 +583,23 @@ class ProposalGenerator:
         elif text == "next month":
             target = now + timedelta(days=30)
         else:
-            return None
+            # "two weeks from now" / "in 2 weeks" / "3 weeks from now"
+            m_weeks = re.match(
+                r'^(?:in\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+weeks?(?:\s+from\s+now)?$',
+                text,
+            )
+            if m_weeks:
+                raw = m_weeks.group(1)
+                n = int(raw) if raw.isdigit() else _WORD_NUMS.get(raw, 1)
+                target = now + timedelta(weeks=n)
+            else:
+                # "in N days"
+                m_days = re.match(r'^in\s+(\d+)\s+days?$', text)
+                if m_days:
+                    target = now + timedelta(days=int(m_days.group(1)))
+                else:
+                    return None
+
         target = target.replace(hour=0, minute=0, second=0, microsecond=0)
         return int(target.timestamp())
 
@@ -732,6 +821,23 @@ class ProposalGenerator:
 
         # Generic no-% parsing is only safe when prompt is not about other numeric settings.
         if not settings_context:
+            # Imperative no-% phrasing: "make labs 20" / "set assignments 35".
+            # This restores compact commands without requiring "to/is" or "%".
+            direct_no_percent_pattern = re.compile(
+                r"\b(?:set|make|change|adjust|update|increase|decrease)\s+"
+                r"([a-zA-Z][a-zA-Z ]{1,40}?)\s+(\d+(?:\.\d+)?)\b",
+                flags=re.IGNORECASE,
+            )
+            matches.extend(direct_no_percent_pattern.findall(clean_prompt))
+
+            # Chained no-% assignments: "make midterm 24 and final 36".
+            # Parse each category-number pair so both updates are applied.
+            chained_no_percent_pattern = re.compile(
+                r"\b([a-zA-Z][a-zA-Z ]{1,30}?)\s+(\d+(?:\.\d+)?)(?=\s*(?:,|and\b|$))",
+                flags=re.IGNORECASE,
+            )
+            matches.extend(chained_no_percent_pattern.findall(clean_prompt))
+
             generic_pattern = re.compile(
                 r"(?:set|make|change|adjust|update|keep|use|increase|decrease)?\s*"
                 r"([a-zA-Z][a-zA-Z ]{1,40}?)\s*(?:is|are|to|=|:)\s*(\d+(?:\.\d+)?)\b",
@@ -917,6 +1023,9 @@ class ProposalGenerator:
             proposal,
             f"In {parent.name}, split into " + ", ".join(labels),
         )
+        # Remove any prior check notes for the same parent before appending the new one.
+        stale_prefix = f"{parent.name} split requested"
+        proposal.notes = [n for n in (proposal.notes or []) if not str(n).startswith(stale_prefix)]
         self._append_unique_note(
             proposal,
             f"{parent.name} split requested (treated as internal allocation): " + ", ".join(labels) + ".",

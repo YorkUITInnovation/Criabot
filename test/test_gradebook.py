@@ -319,6 +319,51 @@ async def test_gradebook_proposal_typo_adjustments_match_existing_categories():
 
 
 @pytest.mark.asyncio
+async def test_gradebook_proposal_supports_no_percent_imperative_weight():
+    generator = ProposalGenerator()
+    base_proposal = generator.generate_initial([
+        CourseActivity(name="Homework 1", module="assign"),
+        CourseActivity(name="Lab 1", module="lab"),
+    ])
+
+    updated = generator.update_from_prompt(base_proposal, "make labs 20")
+
+    normalized = {cat.name: cat for cat in updated.categories}
+    assert normalized["Labs"].weight == 20.0
+    assert updated.aggregation_method == 13
+
+
+@pytest.mark.asyncio
+async def test_gradebook_proposal_supports_no_percent_multi_updates():
+    generator = ProposalGenerator()
+    base_proposal = generator.generate_initial([
+        CourseActivity(name="Homework 1", module="assign"),
+        CourseActivity(name="Lab 1", module="lab"),
+    ])
+
+    updated = generator.update_from_prompt(base_proposal, "make midterm 24 and final 36")
+
+    normalized = {cat.name: cat for cat in updated.categories}
+    assert normalized["Midterm"].weight == 24.0
+    assert normalized["Final Exam"].weight == 36.0
+
+
+def test_effect_topic_override_keeps_latest_split_for_same_category():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    step1 = generator.update_from_prompt(base, "In Labs, split into Lab Reports 10% and In-lab Work 5%")
+    step2 = generator.update_from_prompt(step1, "In Labs, divide it into: Lab Reports, In-Lab and Pre-Lab and assign 5% for each")
+
+    effects = [n for n in (step2.notes or []) if str(n).startswith("Effect:")]
+    split_effects = [e for e in effects if "split into" in e.lower() and "labs" in e.lower()]
+
+    assert len(split_effects) == 1
+    assert "Lab Reports 5.0%" in split_effects[0]
+    assert "Pre-Lab 5.0%" in split_effects[0]
+
+
+@pytest.mark.asyncio
 async def test_gradebook_proposal_regex_alias_phrases_map_to_existing_categories():
     generator = ProposalGenerator()
     base_proposal = generator.generate_initial([

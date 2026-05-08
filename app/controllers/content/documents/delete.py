@@ -7,6 +7,7 @@ from app.controllers.schemas import NOT_FOUND_CODE, \
 from app.core.route import CriaRoute
 
 from criabot.schemas import BotNotFoundError
+from CriadexSDK.ragflow_sdk import CriadexAPIError
 
 view = APIRouter()
 
@@ -46,10 +47,15 @@ class DeleteDocumentRoute(CriaRoute):
         from criabot.bot.bot import Bot
         bot: Bot = await request.app.criabot.get(name=bot_name)
 
-        await bot.delete_group_file(
-            index_type="DOCUMENT",
-            document_name=document_name
-        )
+        try:
+            await bot.delete_group_file(
+                index_type="DOCUMENT",
+                document_name=document_name
+            )
+        except CriadexAPIError as ex:
+            # Idempotent delete: missing content is a valid terminal state.
+            if ex.status_code != 404:
+                raise
 
         return self.ResponseModel(
             code=SUCCESS_CODE,

@@ -23,8 +23,5 @@ pytest-asyncio
 pytest-cov
 pytest-dotenv
 
-# Don't freak out, the token is read-only on CriadexSDK
-# Due for renewal: November 20th, 2024
-# v1.2.idk4
-# criadexsdk @ git+https://github.com/YorkUITInnovation/CriadexSDK
+# update after merge to master
 criadexsdk @ git+https://github.com/YorkUITInnovation/CriadexSDK@graphrag

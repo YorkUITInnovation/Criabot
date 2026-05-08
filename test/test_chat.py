@@ -124,6 +124,21 @@ async def test_send_no_context_with_llm_message(chat, bot_mock):
     assert "do not know" in history[0]["blocks"][0]["text"]
     assert history[1]["blocks"][0]["text"] == "hello"
 
+
+@pytest.mark.asyncio
+async def test_send_no_context_with_indexing_in_progress(chat, bot_mock):
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=None,
+        group_responses={},
+        indexing_in_progress=True,
+        indexing_groups=["test-document-index"],
+    )
+
+    reply = await chat.send(prompt="hello", metadata_filter=None, extra_bots=[])
+
+    assert reply.content.content == Chat.INDEXING_IN_PROGRESS_MESSAGE
+    bot_mock.criadex.agents.azure.chat.assert_not_called()
+
 @pytest.mark.asyncio
 async def test_send_with_criadex_error(chat):
     chat._retriever.retrieve.side_effect = httpx.HTTPStatusError("error", request=MagicMock(), response=MagicMock())

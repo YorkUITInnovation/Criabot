@@ -22,7 +22,7 @@ class UploadDocumentResponse(APIResponse):
 
 class DocumentConfig(BaseModel):
     nodes: List[dict]
-    assets: List[Asset] = Field(default_factory=list)
+    assets: List[dict] = Field(default_factory=list)
 
 
 class DocumentUploadConfig(ContentUploadConfig):

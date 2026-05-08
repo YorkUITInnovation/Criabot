@@ -5,6 +5,7 @@ import re
 from typing import List, Dict
 
 from .schemas import GradebookProposal, GradebookSessionRecord, GRADE_DISPLAY_TYPE_NAMES
+from .proposal import ProposalGenerator
 
 
 class ConversationManager:
@@ -178,6 +179,52 @@ class ConversationManager:
 
         return session.phase
 
+    @staticmethod
+    def _looks_like_gradebook_refinement(text: str) -> bool:
+        """Return True if the prompt appears to contain a valid gradebook refinement request."""
+        t = text.lower()
+        # Explicit weight change indicators.
+        if "%" in t:
+            return True
+        if re.search(r"\b\d+(\.\d+)?\s*%", t):
+            return True
+        # Action verbs with numeric values (no-% style: "make labs 20").
+        if re.search(r"\b(?:set|make|change|adjust|update|increase|decrease|give|assign)\b", t):
+            return True
+        # Structural modifications.
+        refinement_keywords = (
+            "split", "divide", "subcategor", "rename", "remove", "delete", "add",
+            "hide", "hidden", "show", "unhide", "reveal", "lock", "unlock",
+            "drop", "keep", "extra credit", "aggregat", "method", "weighted",
+            "natural", "mean", "weight", "rebalance", "redistribute", "proportion",
+            "normalize", "swap", "move", "to category",
+        )
+        for kw in refinement_keywords:
+            if kw in t:
+                return True
+        # Direct method number: "number 13", "method 13".
+        if re.search(r'\b(?:method\s+(?:number\s+)?|number\s+)\d+\b', t):
+            return True
+        # Dates (ISO or relative).
+        if re.search(r'\b\d{4}-\d{2}-\d{2}\b', t):
+            return True
+        if re.search(r'\b(?:next\s+week|tomorrow|next\s+month|weeks?\s+from\s+now|in\s+\d+\s+days?)\b', t):
+            return True
+        return False
+
+    @staticmethod
+    def _unsupported_request_warning() -> str:
+        return (
+            "⚠ I couldn't understand that request. Here are things you can do:\n\n"
+            "**Weights**: 'Set Labs to 20%' · 'Make Midterm 25' · 'Change Assignments to 35%'\n"
+            "**Aggregation**: 'Use weighted mean' · 'Switch to Natural' · 'Method number 13'\n"
+            "**Splits**: 'In Labs, split into Lab Reports 10%, In-Lab 5%'\n"
+            "**Settings**: 'Drop lowest 1 from Assignments' · 'Keep top 2 from Labs'\n"
+            "**Visibility**: 'Hide Midterm until 2026-05-19' · 'Set Final as hidden until next week'\n"
+            "**Structure**: 'Rename Labs to Laboratory' · 'Remove Quizzes' · 'Add Projects 15%'\n\n"
+            "Please try again with one of the above."
+        )
+
     def make_reply(self, session: GradebookSessionRecord, proposal: GradebookProposal | None, prompt: str = "") -> str:
         text = (prompt or "").lower().strip()
         extraction = session.extraction or {}
@@ -260,6 +307,9 @@ class ConversationManager:
 
         if session.phase == "REFINEMENT":
             if proposal:
+                # If the prompt isn't a recognizable refinement action, warn the user.
+                if text and not self._looks_like_gradebook_refinement(text) and not self._looks_like_affirmation(text):
+                    return self._unsupported_request_warning()
                 categories_text = self._format_categories(proposal)
                 total_weight = sum(cat.weight for cat in proposal.categories)
                 effects_text = self._format_effects(proposal)
@@ -542,13 +592,14 @@ class ConversationManager:
         if not logged:
             return []
 
-        seen = set()
+        # Deduplicate by topic key (newest wins) so same-topic overrides don't show duplicates.
+        seen_topics = set()
         ordered = []
         for item in reversed(logged):
-            key = item.lower()
-            if key in seen:
+            topic = ProposalGenerator._effect_topic_key(item)
+            if topic in seen_topics:
                 continue
-            seen.add(key)
+            seen_topics.add(topic)
             ordered.append(item)
         return ordered
 
@@ -563,7 +614,6 @@ class ConversationManager:
             "- **Natural (13)**: Moodle default aggregation\n\n"
             "Tell me which one you want to use and I'll apply it."
         )
-        return effects
 
     def _format_effects(self, proposal: GradebookProposal, max_display: int = 6) -> str:
         """Format effects for display, showing recent ones with 'show all' if needed."""
