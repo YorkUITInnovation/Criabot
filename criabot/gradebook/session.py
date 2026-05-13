@@ -37,6 +37,56 @@ class GradebookSessionEngine:
         self._proposal_history: Dict[str, List[dict]] = {}
         self._proposal_history_index: Dict[str, int] = {}
 
+    @staticmethod
+    def _history_key() -> str:
+        return "_proposal_history"
+
+    @staticmethod
+    def _history_index_key() -> str:
+        return "_proposal_history_index"
+
+    def _load_history_from_session(self, session: GradebookSessionRecord) -> None:
+        """Hydrate in-memory history from persisted session extraction when available."""
+        extraction = session.extraction or {}
+        raw_history = extraction.get(self._history_key())
+        raw_index = extraction.get(self._history_index_key())
+        if not isinstance(raw_history, list):
+            return
+
+        cleaned_history = [entry for entry in raw_history if isinstance(entry, dict)]
+        if not cleaned_history:
+            return
+
+        if isinstance(raw_index, int):
+            idx = max(0, min(raw_index, len(cleaned_history) - 1))
+        else:
+            idx = len(cleaned_history) - 1
+
+        self._proposal_history[session.session_id] = cleaned_history
+        self._proposal_history_index[session.session_id] = idx
+
+    def _persist_history_to_session(self, session: GradebookSessionRecord) -> None:
+        """Persist in-memory history into extraction so undo/redo survives process restarts."""
+        session.extraction = session.extraction or {}
+        session.extraction[self._history_key()] = list(self._proposal_history.get(session.session_id, []))
+        session.extraction[self._history_index_key()] = int(self._proposal_history_index.get(session.session_id, -1))
+
+    def _ensure_history_initialized(self, session: GradebookSessionRecord) -> None:
+        """Ensure history exists for current session proposal before mutating or restoring."""
+        history = self._proposal_history.get(session.session_id)
+        if history:
+            return
+
+        self._load_history_from_session(session)
+        history = self._proposal_history.get(session.session_id)
+        if history:
+            return
+
+        if session.proposal is not None:
+            self._proposal_history[session.session_id] = [session.proposal.model_dump()]
+            self._proposal_history_index[session.session_id] = 0
+            self._persist_history_to_session(session)
+
     def _push_proposal_history(self, session: GradebookSessionRecord) -> None:
         if session.proposal is None:
             return
@@ -53,6 +103,7 @@ class GradebookSessionEngine:
 
         history.append(proposal_dict)
         self._proposal_history_index[session.session_id] = len(history) - 1
+        self._persist_history_to_session(session)
 
     def _is_undo_prompt(self, prompt: str) -> bool:
         lowered = prompt.lower()
@@ -63,6 +114,7 @@ class GradebookSessionEngine:
         return bool(re.search(r"\bredo\b", lowered))
 
     def _restore_from_history(self, session: GradebookSessionRecord, direction: str) -> bool:
+        self._ensure_history_initialized(session)
         history = self._proposal_history.get(session.session_id, [])
         if not history:
             return False
@@ -80,6 +132,7 @@ class GradebookSessionEngine:
 
         session.proposal = GradebookProposal.parse_obj(history[next_index])
         self._proposal_history_index[session.session_id] = next_index
+        self._persist_history_to_session(session)
         return True
 
     @staticmethod
@@ -336,18 +389,16 @@ class GradebookSessionEngine:
         session.extraction = session.extraction or {}
         session.extraction["latest_prompt"] = prompt
 
+        self._ensure_history_initialized(session)
+
         if self._is_undo_prompt(prompt):
             restored = self._restore_from_history(session, direction="undo")
-            if not restored and session.proposal:
-                session.proposal.notes.append("Nothing to undo.")
             session.phase = "REFINEMENT" if session.proposal else session.phase
             await self._save_session(session)
             return session
 
         if self._is_redo_prompt(prompt):
             restored = self._restore_from_history(session, direction="redo")
-            if not restored and session.proposal:
-                session.proposal.notes.append("Nothing to redo.")
             session.phase = "REFINEMENT" if session.proposal else session.phase
             await self._save_session(session)
             return session
@@ -358,6 +409,8 @@ class GradebookSessionEngine:
             self._push_proposal_history(session)
 
         if session.proposal is not None:
+            # Capture baseline before applying prompt so undo can restore prior state.
+            self._push_proposal_history(session)
             session.proposal = self._proposal_generator.update_from_prompt(session.proposal, prompt)
             self._push_proposal_history(session)
 
@@ -420,6 +473,7 @@ class GradebookSessionEngine:
         self._proposal_history[session.session_id] = []
         self._proposal_history_index[session.session_id] = -1
         self._push_proposal_history(session)
+        self._persist_history_to_session(session)
         await self._save_session(session)
 
         # Clear any persisted finalized result for this session so reset is clean.

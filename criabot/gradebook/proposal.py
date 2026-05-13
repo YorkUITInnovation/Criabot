@@ -13,6 +13,7 @@ from .schemas import (
     GRADE_DISPLAY_TYPE_LETTER, GRADE_DISPLAY_TYPE_REAL_PERCENTAGE, GRADE_DISPLAY_TYPE_REAL_LETTER,
     GRADE_DISPLAY_TYPE_LETTER_REAL, GRADE_DISPLAY_TYPE_PERCENTAGE_REAL,
 )
+from .formula_parser import FormulaParser
 
 
 class ProposalGenerator:
@@ -79,6 +80,8 @@ class ProposalGenerator:
         "weight check:",
         "auto-normalized",
         "removed category",
+        "formula ignored:",
+        "formula was valid, but no target category was found.",
     )
 
     @staticmethod
@@ -116,6 +119,12 @@ class ProposalGenerator:
 
         if low.startswith("aggregation method set to"):
             return "aggregation_method"
+
+        # Formula effects: both "Applied formula to X" and "Cleared formula from X" should share same topic.
+        m = re.match(r"^(?:applied|cleared)\s+formula\s+(?:to|from)\s+(.+?)(?::|$)", low)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1)).strip()
+            return f"formula:{label}"
 
         m = re.match(r"^(.+?)\s+hidden\s+until\b", low)
         if m:
@@ -182,6 +191,12 @@ class ProposalGenerator:
         # Apply per-category settings (drop/keep/extra credit/exclude empty)
         self._apply_category_settings(updated, prompt)
 
+        # Parse and persist optional formula-driven grading requests.
+        self._apply_formula_request(updated, prompt)
+
+        # Parse clear/remove formula directives after apply, so replacement prompts work.
+        self._apply_formula_clear_request(updated, prompt)
+
         # Persist aggregation method requests (e.g., "use weighted mean").
         self._apply_aggregation_method(updated, prompt)
 
@@ -191,6 +206,92 @@ class ProposalGenerator:
         self._post_update_checks(updated, prompt)
 
         return updated
+
+    def _detect_formula_target_category(self, proposal: GradebookProposal, prompt: str, item_refs: List[str]) -> Optional[GradebookCategory]:
+        """Best-effort target category detection for a formula prompt."""
+        prompt_l = (prompt or "").lower()
+
+        explicit = re.search(r"\b(?:set|use|apply)\s+([a-zA-Z][a-zA-Z ]{1,40})\s+(?:as|formula|calculation)", prompt_l)
+        if explicit:
+            hint = explicit.group(1).strip()
+            targets = self._resolve_category_targets(proposal, hint)
+            if targets:
+                return targets[0]
+
+        for category in proposal.categories:
+            if category.name.lower() in prompt_l:
+                return category
+
+        for ref in item_refs:
+            ref_targets = self._resolve_category_targets(proposal, ref)
+            if ref_targets:
+                return ref_targets[0]
+
+        final_targets = self._resolve_category_targets(proposal, "final")
+        if final_targets:
+            return final_targets[0]
+
+        return proposal.categories[0] if proposal.categories else None
+
+    def _apply_formula_request(self, proposal: GradebookProposal, prompt: str) -> None:
+        """Extract, validate, and store a formula request in the proposal when present."""
+        detected = FormulaParser.extract_formula_and_detect(prompt)
+        if not detected:
+            return
+
+        raw_formula = str(detected.get("formula") or "").strip()
+        if not raw_formula:
+            return
+
+        validation = FormulaParser.parse_formula(raw_formula)
+        if not validation.is_valid:
+            self._append_unique_note(
+                proposal,
+                f"Formula ignored: {validation.error_message}",
+            )
+            return
+
+        target = self._detect_formula_target_category(
+            proposal=proposal,
+            prompt=prompt,
+            item_refs=validation.item_references or [],
+        )
+        if target is None:
+            self._append_unique_note(
+                proposal,
+                "Formula was valid, but no target category was found.",
+            )
+            return
+
+        normalized = validation.normalized_formula or raw_formula.lstrip("=").strip()
+        target.calculation_formula = f"={normalized}"
+        target.formula_item_refs = list(validation.item_references or [])
+        self._append_effect_note(
+            proposal,
+            f"Applied formula to {target.name}: {target.calculation_formula}",
+        )
+
+    def _apply_formula_clear_request(self, proposal: GradebookProposal, prompt: str) -> None:
+        """Clear existing formulas based on explicit clear/remove formula directives."""
+        text_l = (prompt or "").lower()
+        if not re.search(r"\b(?:clear|remove|delete|unset)\b.*\bformula\b", text_l):
+            return
+
+        target_hint = ""
+        target_match = re.search(
+            r"\b(?:clear|remove|delete|unset)\s+(?:the\s+)?formula\s+(?:from|for|on)\s+([a-zA-Z][a-zA-Z ]{1,40})",
+            text_l,
+        )
+        if target_match:
+            target_hint = target_match.group(1).strip().rstrip(".,")
+
+        targets = self._resolve_category_targets(proposal, target_hint)
+        for cat in targets:
+            if not getattr(cat, "calculation_formula", None):
+                continue
+            cat.calculation_formula = None
+            cat.formula_item_refs = []
+            self._append_effect_note(proposal, f"Cleared formula from {cat.name}")
 
     @staticmethod
     def _parse_aggregation_method(prompt: str) -> Optional[int]:
@@ -204,21 +305,28 @@ class ProposalGenerator:
             if n in _VALID_METHOD_IDS:
                 return n
 
-        if any(term in text_l for term in ("weighted mean", "weighted average", "weight", "weighted")):
+        # Only treat text as aggregation intent when method/aggregation context is explicit.
+        has_agg_context = bool(
+            re.search(r"\b(?:aggregation|aggregate|method|grade\s+aggregation)\b", text_l)
+            or re.search(r"\b(?:use|set|switch|change)\b", text_l)
+            or any(term in text_l for term in ("weighted mean", "weighted average", "simple weighted", "mean of grades", "simple mean", "natural"))
+        )
+
+        if has_agg_context and any(term in text_l for term in ("weighted mean", "weighted average", "simple weighted")):
             if "simple" in text_l:
                 return 11  # Simple weighted mean
             return 10  # Weighted mean
 
-        if any(term in text_l for term in ("mean of grades", "simple mean", "average", "mean")):
+        if has_agg_context and any(term in text_l for term in ("mean of grades", "simple mean", "mean")):
             if "extra credit" in text_l or "extra credits" in text_l:
                 return 12  # Mean with extra credits
             return 0  # Mean of grades
 
-        if "extra credit" in text_l or "extra credits" in text_l:
-            return 12
-
-        if any(term in text_l for term in ("natural", "moodle default", "default aggregation")):
+        if has_agg_context and any(term in text_l for term in ("natural", "moodle default", "default aggregation")):
             return 13
+
+        if has_agg_context and ("extra credit" in text_l or "extra credits" in text_l):
+            return 12
 
         return None
 
@@ -414,20 +522,9 @@ class ProposalGenerator:
             for cat in targets:
                 cat.grade_min = val
 
-        # hidden: "hide assignments from students" / "show midterm"
-        for m in re.finditer(
-            r"\bhide\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?:\s+(?:category|from\s+students?))?(?:\b|$)",
-            prompt_lower,
-        ):
-            cat_hint = m.group(1).strip().rstrip()
-            targets = self._resolve_category_targets(proposal, cat_hint)
-            for cat in targets:
-                cat.hidden = True
-                self._append_effect_note(proposal, f"{cat.name} hidden from students")
-
         # hide until: "hide assignments until 2026-12-20"
         for m in re.finditer(
-            r"\bhide\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:category\s+)?until\s+(\d{4}-\d{2}-\d{2})(?:\b|$)",
+            r"\bhide\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:category\s+)?(?:until|untill)\s+(\d{4}-\d{2}-\d{2})(?:\b|$)",
             prompt_lower,
         ):
             cat_hint = m.group(1).strip()
@@ -442,7 +539,7 @@ class ProposalGenerator:
 
         # "set/make X as hidden until 2026-05-19"
         for m in re.finditer(
-            r"\b(?:set|make)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:as\s+)?hidden\s+until\s+(\d{4}-\d{2}-\d{2})(?:\b|$)",
+            r"\b(?:set|make)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:as\s+)?hidden\s+(?:until|untill)\s+(\d{4}-\d{2}-\d{2})(?:\b|$)",
             prompt_lower,
         ):
             cat_hint = m.group(1).strip()
@@ -455,22 +552,39 @@ class ProposalGenerator:
                 cat.hidden_until = ts
                 self._append_effect_note(proposal, f"{cat.name} hidden until {m.group(2).strip()}")
 
-        # Relative-date phrasing: "Set Final Exam as hidden until next week" / "two weeks from now"
+        # Relative-date phrasing for both "set/make X as hidden until ..." and "hide X until ...".
+        # Supports: "next week", "in 2 months", "3 weeks from now", "tomorrow", "in 5 days"
         for m in re.finditer(
-            r"\b(?:set|make|hide)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:as\s+)?hidden\s+until\s+"
-            r"(next\s+week|tomorrow|next\s+month|(?:in\s+)?(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+weeks?(?:\s+from\s+now)?|in\s+\d+\s+days?)(?:\b|$)",
+            r"\b(?:set|make|hide)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:as\s+)?(?:hidden\s+)?(?:until|untill)\s+"
+            r"(next\s+week|tomorrow|next\s+month|(?:in\s+)?(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:weeks?|months?|days?)(?:\s+from\s+now)?)(?:\b|$)",
             prompt_lower,
         ):
             cat_hint = m.group(1).strip()
-            rel = m.group(2).strip()
-            ts = self._parse_relative_date_to_timestamp(rel)
+            date_part = m.group(2).strip()
+            ts = self._parse_relative_date_to_timestamp(date_part)
+            display_text = date_part
+            
             if ts is None:
                 continue
             targets = self._resolve_category_targets(proposal, cat_hint)
             for cat in targets:
                 cat.hidden = True
                 cat.hidden_until = ts
-                self._append_effect_note(proposal, f"{cat.name} hidden until {rel}")
+                self._append_effect_note(proposal, f"{cat.name} hidden until {display_text}")
+
+        # hidden: "hide assignments from students" / "hide midterm"
+        # Keep this after hide-until handlers so date expressions are not swallowed.
+        for m in re.finditer(
+            r"\bhide\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?=\s+(?:category|from\s+students?)\b|\s*$)(?:\s+(?:category|from\s+students?))?(?:\b|$)",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip().rstrip()
+            if re.search(r"\b(?:until|untill)\b", cat_hint):
+                continue
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.hidden = True
+                self._append_effect_note(proposal, f"{cat.name} hidden from students")
 
         for m in re.finditer(
             r"\b(?:show|unhide|reveal)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?:\s+category)?(?:\b|$)",
@@ -593,12 +707,32 @@ class ProposalGenerator:
                 n = int(raw) if raw.isdigit() else _WORD_NUMS.get(raw, 1)
                 target = now + timedelta(weeks=n)
             else:
-                # "in N days"
-                m_days = re.match(r'^in\s+(\d+)\s+days?$', text)
-                if m_days:
-                    target = now + timedelta(days=int(m_days.group(1)))
+                # "in N months" / "N months from now" / "next month" already handled
+                m_months = re.match(
+                    r'^(?:in\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+months?(?:\s+from\s+now)?$',
+                    text,
+                )
+                if m_months:
+                    raw = m_months.group(1)
+                    n = int(raw) if raw.isdigit() else _WORD_NUMS.get(raw, 1)
+                    # Add months by year+month arithmetic to handle month lengths correctly
+                    month = now.month + n
+                    year = now.year
+                    while month > 12:
+                        month -= 12
+                        year += 1
+                    try:
+                        target = now.replace(year=year, month=month, day=1)
+                    except ValueError:
+                        # Handle day overflow (e.g., Jan 31 + 1 month -> Feb 28/29)
+                        target = now.replace(year=year, month=month + 1, day=1) - timedelta(days=1)
                 else:
-                    return None
+                    # "in N days"
+                    m_days = re.match(r'^in\s+(\d+)\s+days?$', text)
+                    if m_days:
+                        target = now + timedelta(days=int(m_days.group(1)))
+                    else:
+                        return None
 
         target = target.replace(hour=0, minute=0, second=0, microsecond=0)
         return int(target.timestamp())
@@ -625,6 +759,23 @@ class ProposalGenerator:
         return self._resolve_category_name(proposal, match.group(1).strip())
 
     def _apply_remaining_weight_directive(
+        self,
+        proposal: GradebookProposal,
+        weights: Dict[str, float],
+        remaining_target: str,
+    ) -> Dict[str, float]:
+        current = {cat.name: float(cat.weight) for cat in proposal.categories}
+        for name, value in weights.items():
+            current[name] = float(value)
+
+        remainder = 100.0 - sum(
+            weight for name, weight in current.items()
+            if name.lower() != remaining_target.lower()
+        )
+        weights[remaining_target] = round(remainder, 2)
+        return weights
+
+    def _rebalance_weights(
         self,
         proposal: GradebookProposal,
         weights: Dict[str, float],
@@ -920,6 +1071,8 @@ class ProposalGenerator:
                     lock_time=getattr(src, "lock_time", None) if src else None,
                     display_type=getattr(src, "display_type", GRADE_DISPLAY_TYPE_DEFAULT) if src else GRADE_DISPLAY_TYPE_DEFAULT,
                     decimals=getattr(src, "decimals", -1) if src else -1,
+                    calculation_formula=getattr(src, "calculation_formula", None) if src else None,
+                    formula_item_refs=list(getattr(src, "formula_item_refs", []) or []) if src else [],
                 )
             )
         return rebuilt

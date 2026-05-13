@@ -75,6 +75,16 @@ class GradebookCategory(BaseModel):
     display_type: int = Field(default=GRADE_DISPLAY_TYPE_DEFAULT, description="How grades are displayed (0=default, 1=real, 2=percentage, 3=letter, ...)")
     decimals: int = Field(default=-1, description="Decimal places to display (-1 = course default, 0-5 = explicit)")
 
+    # Optional formula-based computation metadata.
+    calculation_formula: Optional[str] = Field(
+        default=None,
+        description="Excel-style formula used to compute the category total (e.g. =([midterm]*0.4)+([final]*0.6))",
+    )
+    formula_item_refs: List[str] = Field(
+        default_factory=list,
+        description="Referenced item names/IDs extracted from calculation_formula.",
+    )
+
 
 class GradebookProposal(BaseModel):
     categories: List[GradebookCategory] = Field(default_factory=list)

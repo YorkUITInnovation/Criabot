@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from .schemas import GradebookProposal, GradebookSessionRecord, GRADE_DISPLAY_TYPE_NAMES
 from .proposal import ProposalGenerator
+from .formula_parser import FormulaParser
 
 
 class ConversationManager:
@@ -54,6 +55,22 @@ class ConversationManager:
         return any(token in text for token in context_tokens)
 
     @staticmethod
+    def _looks_like_upload_signal(text: str) -> bool:
+        text_l = text.lower()
+        upload_tokens = (
+            "uploaded",
+            "upload",
+            "attached",
+            "attachment",
+            "syllabus",
+            "supporting document",
+            "support document",
+            "course outline",
+            "grading policy",
+        )
+        return any(token in text_l for token in upload_tokens)
+
+    @staticmethod
     def _looks_like_question(text: str) -> bool:
         """Detect if user is asking a question rather than providing instructions."""
         text_l = text.lower().strip()
@@ -99,37 +116,46 @@ class ConversationManager:
 
     @staticmethod
     def _detect_aggregation_method(text: str) -> int | None:
-        """Detect aggregation method preference from user text."""
+        """Detect aggregation method preference only when aggregation intent is explicit."""
         text_l = text.lower()
-        
-        # Weighted mean variants
-        if any(term in text_l for term in ("weighted mean", "weighted average", "weight", "weighted")):
+
+        has_agg_context = bool(
+            re.search(r"\b(?:aggregation|aggregate|method|grade\s+aggregation)\b", text_l)
+            or re.search(r"\b(?:use|set|switch|change)\b", text_l)
+            or any(term in text_l for term in ("weighted mean", "weighted average", "simple weighted", "mean of grades", "simple mean", "natural"))
+        )
+
+        if has_agg_context and any(term in text_l for term in ("weighted mean", "weighted average", "simple weighted")):
             if "simple" in text_l:
-                return 11  # Simple weighted mean
-            return 10  # Weighted mean (default)
-        
-        # Mean variants
-        if any(term in text_l for term in ("mean of grades", "simple mean", "average", "mean")):
+                return 11
+            return 10
+
+        if has_agg_context and any(term in text_l for term in ("mean of grades", "simple mean")):
             if "extra credit" in text_l or "extra credits" in text_l:
-                return 12  # Mean with extra credits
-            if "simple" in text_l:
-                return 0  # Mean of grades
-            return 0  # Mean of grades
-        
-        # Extra credits
-        if "extra credit" in text_l or "extra credits" in text_l:
-            return 12  # Mean with extra credits
-        
-        # Natural
-        if any(term in text_l for term in ("natural", "moodle default", "default aggregation")):
-            return 13  # Natural
-        
+                return 12
+            return 0
+
+        if has_agg_context and ("extra credit" in text_l or "extra credits" in text_l):
+            return 12
+
+        if has_agg_context and any(term in text_l for term in ("natural", "moodle default", "default aggregation")):
+            return 13
+
         return None
 
     def next_phase(self, session: GradebookSessionRecord, prompt: str) -> str:
         text = prompt.lower().strip()
         extraction = session.extraction or {}
         has_syllabus = bool(extraction.get("has_syllabus"))
+
+        # Help/capability prompts should not alter phase.
+        if self._looks_like_help_request(text):
+            return session.phase
+
+        # Explicit proposal requests should not be interpreted as acceptance.
+        if self._looks_like_proposal_request(text):
+            if session.phase in {"INTAKE", "ANALYSIS", "PROPOSAL", "REFINEMENT", "ACCEPTED", "COMPLETED"}:
+                return "PROPOSAL"
 
         # Check for acceptance keywords
         if self._looks_like_affirmation(text):
@@ -164,8 +190,11 @@ class ConversationManager:
             # Stay in INTAKE if user hasn't provided syllabus/content yet
             return "INTAKE"
 
-        if session.phase in {"ANALYSIS", "REFINEMENT"}:
+        if session.phase == "ANALYSIS":
             return "PROPOSAL"
+
+        if session.phase == "REFINEMENT":
+            return "REFINEMENT"
 
         if session.phase == "PROPOSAL":
             return "REFINEMENT"  # Default to refinement if unclear
@@ -188,9 +217,21 @@ class ConversationManager:
             return True
         if re.search(r"\b\d+(\.\d+)?\s*%", t):
             return True
-        # Action verbs with numeric values (no-% style: "make labs 20").
-        if re.search(r"\b(?:set|make|change|adjust|update|increase|decrease|give|assign)\b", t):
+        # Formula-only prompts (with or without explicit keywords) are valid refinements.
+        if ConversationManager._extract_formula_from_prompt(text):
             return True
+        if re.search(r"\b(?:clear|remove|delete|unset)\b.*\bformula\b", t):
+            return True
+        # Action verbs must be accompanied by gradebook context or numeric targets
+        # to avoid false positives like "make me a pizza".
+        if re.search(r"\b(?:set|make|change|adjust|update|increase|decrease|give|assign|replace|apply|use)\b", t):
+            has_numeric_target = bool(re.search(r"\b\d+(?:\.\d+)?\s*%?\b", t))
+            has_gradebook_context = bool(re.search(
+                r"\b(?:assignments?|labs?|midterm|final(?:\s+exam)?|quizzes?|projects?|participation|category|categories|weight|weights|aggregation|method|formula|gradebook|drop|keep|hide|show|rename|split|subcategor(?:y|ies))\b",
+                t,
+            ))
+            if has_numeric_target or has_gradebook_context:
+                return True
         # Structural modifications.
         refinement_keywords = (
             "split", "divide", "subcategor", "rename", "remove", "delete", "add",
@@ -213,16 +254,103 @@ class ConversationManager:
         return False
 
     @staticmethod
+    def _looks_like_formula_request(text: str) -> bool:
+        """Detect if user is asking about or requesting formula support."""
+        t = text.lower()
+        formula_keywords = (
+            "formula", "calculate", "use this formula", "equation", "set.*as",
+            "computation", "compute", "final grade.*formula", "grade calculation",
+        )
+        return any(kw in t for kw in formula_keywords)
+
+    @staticmethod
+    def _looks_like_help_request(text: str) -> bool:
+        """Detect direct help/capabilities requests even without question punctuation."""
+        t = text.lower().strip()
+        if not t:
+            return False
+
+        direct_terms = {
+            "help",
+            "show help",
+            "commands",
+            "supported commands",
+            "what can you do",
+            "what do you support",
+            "what instruction do you support",
+            "what instructions do you support",
+            "show supported commands",
+        }
+        if t in direct_terms:
+            return True
+
+        patterns = (
+            r"\bwhat\s+can\s+you\s+do\b",
+            r"\bwhat\s+(?:do\s+you\s+)?support\b",
+            r"\b(?:which|what)\s+instructions?\s+do\s+you\s+support\b",
+            r"\bsupported\s+commands?\b",
+            r"\bhelp\b",
+        )
+        return any(re.search(p, t) for p in patterns)
+
+    @staticmethod
+    def _extract_formula_from_prompt(text: str) -> Optional[Dict]:
+        """
+        Extract formula from user prompt if present.
+
+        Returns:
+            Dict with formula details if detected, None otherwise.
+        """
+        return FormulaParser.extract_formula_and_detect(text)
+
+    @staticmethod
     def _unsupported_request_warning() -> str:
         return (
-            "⚠ I couldn't understand that request. Here are things you can do:\n\n"
-            "**Weights**: 'Set Labs to 20%' · 'Make Midterm 25' · 'Change Assignments to 35%'\n"
-            "**Aggregation**: 'Use weighted mean' · 'Switch to Natural' · 'Method number 13'\n"
-            "**Splits**: 'In Labs, split into Lab Reports 10%, In-Lab 5%'\n"
-            "**Settings**: 'Drop lowest 1 from Assignments' · 'Keep top 2 from Labs'\n"
-            "**Visibility**: 'Hide Midterm until 2026-05-19' · 'Set Final as hidden until next week'\n"
-            "**Structure**: 'Rename Labs to Laboratory' · 'Remove Quizzes' · 'Add Projects 15%'\n\n"
-            "Please try again with one of the above."
+            "⚠ I couldn't understand that request. Try one of these:\n\n"
+            "- Set weights: 'Set Labs to 20%'\n"
+            "- Aggregation: 'Use weighted mean' or 'Use mean'\n"
+            "- Splits: 'In Labs, split into Lab Reports 10%, In-Lab 5%'\n"
+            "- Formula: 'Set Assignments formula to =average([[hw1]],[[hw2]])'\n"
+            "- Visibility/rules: 'Hide Midterm until 2026-05-19' or 'Drop lowest 1 from Assignments'\n"
+            "- Finalize: 'Accept proposal and generate mapping'\n"
+            "- Undo/Redo: 'undo' or 'redo'\n\n"
+            "Tip: type 'help' to see the full supported instruction list."
+        )
+
+    @staticmethod
+    @staticmethod
+    def _supported_instructions_help_text() -> str:
+        return (
+            "Here are supported instructions you can use:\n\n"
+            "**Syllabus/Supporting docs**\n"
+            "- 'Use my uploaded syllabus and give me a proposal'\n"
+            "- 'Analyze the latest uploaded supporting document and regenerate proposal'\n"
+            "- 'I uploaded a new file, use it and rebuild the gradebook proposal'\n\n"
+            "**Weights and categories**\n"
+            "- 'Set Assignments 35%, Labs 15%, Midterm 20%, Final 30%'\n"
+            "- 'Change Labs to 20% and rebalance automatically'\n"
+            "- 'Rename Labs to Laboratory' · 'Remove Quizzes' · 'Add Projects 15%'\n\n"
+            "**Aggregation method**\n"
+            "- 'Use Weighted mean of grades'\n"
+            "- 'Switch to Natural'\n"
+            "- 'Show aggregation methods'\n\n"
+            "**Excel-style formulas**\n"
+            "- 'Set Assignments formula to =average([[hw1]],[[hw2]],[[project]])'\n"
+            "- 'Use formula =([[midterm]]*0.4)+([[final]]*0.6) for Final Exam'\n"
+            "- 'Clear formula from Labs'\n"
+            "Use Moodle item references like `[[item_id]]` (legacy `[item]` is also accepted).\n"
+            "Default separator is comma `,` (YorkU standard).\n\n"
+            "If a formula is invalid, I'll return a direct warning and ask you to retry.\n"
+            "Formula help: [YorkU custom formula guide](https://lthelp.yorku.ca/gradebook/creating-a-custom-formula)\n"
+            "Excel help: [Excel formula reference](https://support.microsoft.com/excel)\n\n"
+            "**Rules and visibility**\n"
+            "- 'Drop lowest 1 from Assignments'\n"
+            "- 'Keep highest 2 from Labs'\n"
+            "- 'Hide Midterm until 2026-05-19'\n\n"
+            "**Finalize flow**\n"
+            "- 'Accept proposal and generate mapping'\n"
+            "- 'Show mapping rows before finalize'\n"
+            "- 'Finalize now'"
         )
 
     def make_reply(self, session: GradebookSessionRecord, proposal: GradebookProposal | None, prompt: str = "") -> str:
@@ -244,11 +372,39 @@ class ConversationManager:
         if re.search(r"\b(list|show|display|give\s+me)\b.*\b(grade\s+)?aggregation\s+methods?\b", text):
             return self._aggregation_methods_help_text()
 
+        # Direct capability/help command (works with short prompts like "help").
+        if text and self._looks_like_help_request(text):
+            return self._supported_instructions_help_text()
+
         # Handle questions: answer them without forcing phase transitions
         if text and self._looks_like_question(text):
             answer = self._answer_question(session, text, proposal)
             if answer:
                 return answer
+
+        # Uploaded/attached context should trigger analysis guidance, not unsupported warnings.
+        if text and self._looks_like_upload_signal(text):
+            return (
+                "Thanks, I received your syllabus/supporting document. "
+                "I'll analyze it and use it to improve your gradebook proposal. "
+                "If you're ready, say 'show proposal' or ask for specific refinements."
+            )
+
+        # In proposal/refinement phases, reject clearly off-topic/non-action text
+        # instead of re-rendering proposal as if the input were valid.
+        if session.phase in {"PROPOSAL", "REFINEMENT"} and text:
+            is_action = (
+                self._looks_like_gradebook_refinement(text)
+                or self._extract_formula_from_prompt(text) is not None
+                or self._looks_like_affirmation(text)
+                or self._looks_like_proposal_request(text)
+                or self._looks_like_help_request(text)
+                or self._looks_like_question(text)
+                or self._looks_like_upload_signal(text)
+                or re.search(r"\b(undo|redo)\b", text)  # Allow undo/redo to pass through
+            )
+            if not is_action:
+                return self._unsupported_request_warning()
 
         if session.phase == "INTAKE":
             if has_syllabus:
@@ -282,6 +438,12 @@ class ConversationManager:
             )
 
         if session.phase == "PROPOSAL" and proposal:
+            # For formula parsing failures, return a focused warning instead of re-rendering full proposal.
+            if self._extract_formula_from_prompt(prompt) is not None:
+                formula_error = self._formula_error_reply(proposal)
+                if formula_error:
+                    return formula_error
+
             categories_text = self._format_categories(proposal)
             total_weight = sum(cat.weight for cat in proposal.categories)
             effects_text = self._format_effects(proposal)
@@ -307,9 +469,11 @@ class ConversationManager:
 
         if session.phase == "REFINEMENT":
             if proposal:
-                # If the prompt isn't a recognizable refinement action, warn the user.
-                if text and not self._looks_like_gradebook_refinement(text) and not self._looks_like_affirmation(text):
-                    return self._unsupported_request_warning()
+                # For formula parsing failures, return a focused warning instead of re-rendering full proposal.
+                if self._extract_formula_from_prompt(prompt) is not None:
+                    formula_error = self._formula_error_reply(proposal)
+                    if formula_error:
+                        return formula_error
                 categories_text = self._format_categories(proposal)
                 total_weight = sum(cat.weight for cat in proposal.categories)
                 effects_text = self._format_effects(proposal)
@@ -425,6 +589,20 @@ class ConversationManager:
                     "For most courses, **Weighted mean (10)** is recommended as it's the standard grading method "
                     "where each category contributes according to its assigned weight. "
                     "Use **Natural (13)** if you want Moodle's default behavior, or **Mean with extra credits (12)** if your course offers extra credit opportunities."
+                )
+
+        # Questions about formulas
+        if any(term in q for term in ("formula", "equation", "calculate", "computation", "do you support.*formula")):
+            if "support" in q or "can.*do" in q or "help" in q or "how" in q:
+                return self._formula_help_text()
+            if "example" in q:
+                return (
+                    "**Formula Examples:**\n"
+                    "- `=([hw1]+[hw2]+[hw3])/3` — Average of three homeworks\n"
+                    "- `=([midterm]*0.4)+([final]*0.6)` — Weighted average: 40% midterm, 60% final\n"
+                    "- `=[quiz1]+[quiz2]*0.5` — Quiz 1 full, Quiz 2 half weight\n"
+                    "- `=([lab]*0.5)+([project]*0.5)` — Split between lab and project\n\n"
+                    "Tell me the formula you'd like and which category it should apply to."
                 )
 
         # Questions about Moodle mapping
@@ -570,6 +748,10 @@ class ConversationManager:
             if decimals >= 0:
                 settings.append(f"{decimals} decimal{'s' if decimals != 1 else ''}")
 
+            formula = getattr(category, 'calculation_formula', None)
+            if formula:
+                settings.append(f"formula: {formula}")
+
             if settings:
                 lines.append(f"  ↳ {', '.join(settings)}")
 
@@ -614,6 +796,54 @@ class ConversationManager:
             "- **Natural (13)**: Moodle default aggregation\n\n"
             "Tell me which one you want to use and I'll apply it."
         )
+
+    @staticmethod
+    def _formula_help_text() -> str:
+        return (
+            "**Excel-Style Formulas** allow you to define custom grade calculations using item references.\n"
+            "Use Moodle-style double square brackets around item IDs: `[[item_id]]`.\n"
+            "(Legacy single-bracket input like `[item]` is accepted and normalized.)\n\n"
+            "**Examples:**\n"
+            "- Simple average: `=average([[hw1]],[[hw2]],[[hw3]])`\n"
+            "- Weighted calculation: `=([[midterm]]*0.3)+([[final]]*0.7)`\n"
+            "- Nested functions: `=round(average([[q1]],[[q2]]),2)`\n"
+            "- Conditional: `=if([[bonus]]>0, [[score]]+[[bonus]], [[score]])`\n\n"
+            "**Supported operators:** `+` (addition), `-` (subtraction), `*` (multiplication), `/` (division)\n"
+            "Use parentheses `()` for grouping operations. Use comma `,` between function arguments.\n\n"
+            "Tell me the formula you'd like to use and which category it applies to."
+        )
+
+    @staticmethod
+    def _formula_ignored_notes(proposal: GradebookProposal | None) -> List[str]:
+        if proposal is None:
+            return []
+        notes = proposal.notes or []
+        return [str(n) for n in notes if str(n).startswith("Formula ignored:")]
+
+    def _formula_error_reply(self, proposal: GradebookProposal | None) -> str:
+        errors = self._formula_ignored_notes(proposal)
+        if not errors:
+            return ""
+
+        lines = [
+            "I couldn't apply that formula yet.",
+            "",
+            "Please review the issue and retry:",
+        ]
+        for err in errors[-2:]:
+            lines.append(f"- {err.replace('Formula ignored: ', '').strip()}")
+
+        lines.extend([
+            "",
+            "Tips:",
+            "- Use item references like [[hw1]] and start with '='.",
+            "- Use comma ',' between function arguments (YorkU standard).",
+            "",
+            "Help resources:",
+            "- [YorkU custom formula guide](https://lthelp.yorku.ca/gradebook/creating-a-custom-formula)",
+            "- [Excel formula help](https://support.microsoft.com/excel)",
+        ])
+        return "\n".join(lines)
 
     def _format_effects(self, proposal: GradebookProposal, max_display: int = 6) -> str:
         """Format effects for display, showing recent ones with 'show all' if needed."""

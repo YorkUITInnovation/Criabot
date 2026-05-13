@@ -6,8 +6,9 @@ from unittest.mock import AsyncMock, MagicMock
 from criabot.gradebook.analyzer import SyllabusAnalyzer
 from criabot.gradebook.content_mapper import ContentMapper
 from criabot.gradebook.conversation import ConversationManager
+from criabot.gradebook.formula_parser import FormulaParser
 from criabot.gradebook.proposal import ProposalGenerator
-from criabot.gradebook.schemas import CourseActivity, GradebookCategory, GradebookProposal, MoodleResource
+from criabot.gradebook.schemas import CourseActivity, GradebookCategory, GradebookProposal, GradebookSessionRecord, MoodleResource
 from criabot.gradebook.session import GradebookSessionEngine
 
 
@@ -667,6 +668,317 @@ def test_format_categories_shows_per_category_settings():
     assert "extra credit" in text.lower()
 
 
+def test_proposal_formula_is_applied_to_target_category():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(
+        base,
+        "Set Final Exam as =([[midterm]]*0.4)+([[final]]*0.6)",
+    )
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Final Exam"].calculation_formula == "=([[midterm]]*0.4)+([[final]]*0.6)"
+    assert by_name["Final Exam"].formula_item_refs == ["midterm", "final"]
+    assert any("Applied formula to Final Exam" in note for note in (updated.notes or []))
+
+
+def test_invalid_formula_adds_validation_note():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(
+        base,
+        "Use this formula: =[[midterm]]++[[final]]",
+    )
+
+    assert any("Formula ignored:" in note for note in (updated.notes or []))
+
+
+def test_format_categories_includes_formula_setting():
+    cm = ConversationManager()
+    proposal = GradebookProposal(categories=[
+        GradebookCategory(
+            name="Final Exam",
+            weight=100.0,
+            calculation_formula="=([[midterm]]*0.4)+([[final]]*0.6)",
+            formula_item_refs=["midterm", "final"],
+        ),
+    ])
+
+    text = cm._format_categories(proposal)
+    assert "formula:" in text
+    assert "([[midterm]]*0.4)+([[final]]*0.6)" in text
+
+
+def test_conversation_help_request_returns_supported_instruction_list():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s1",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="PROPOSAL",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="what instruction do you support")
+
+    assert "supported instructions" in reply.lower()
+    assert "excel-style formulas" in reply.lower()
+
+
+def test_conversation_offtopic_prompt_returns_unsupported_warning_in_refinement():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s2",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="make me a pizza")
+
+    assert "couldn't understand" in reply.lower()
+    assert "type 'help'" in reply.lower()
+
+
+def test_conversation_formula_only_prompt_is_not_rejected_in_refinement():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s3",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Final Exam", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(
+        session,
+        session.proposal,
+        prompt="=if([[midterm]]>[[final]],[[midterm]],[[final]])",
+    )
+
+    assert "couldn't understand" not in reply.lower()
+    assert "updated proposal" in reply.lower()
+
+
+def test_conversation_undo_prompt_is_not_rejected_in_refinement():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s3u",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="undo")
+
+    assert "couldn't understand" not in reply.lower()
+    assert "updated proposal" in reply.lower()
+
+
+def test_conversation_upload_signal_in_refinement_returns_analysis_message():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s3up",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="Uploaded syllabus_example.docx")
+
+    assert "couldn't understand" not in reply.lower()
+    assert "received your syllabus/supporting document" in reply.lower()
+
+
+def test_conversation_formula_target_prompt_is_not_rejected_in_refinement():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s4",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Final Exam", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(
+        session,
+        session.proposal,
+        prompt="Use formula for Final Exam: =([[final_theory]]*0.7)+([[final_practical]]*0.3)",
+    )
+
+    assert "couldn't understand" not in reply.lower()
+    assert "updated proposal" in reply.lower()
+
+
+def test_conversation_clear_formula_prompt_is_not_rejected_in_refinement():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s5",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Labs", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(
+        session,
+        session.proposal,
+        prompt="Clear formula from Labs and keep the category weight unchanged.",
+    )
+
+    assert "couldn't understand" not in reply.lower()
+    assert "updated proposal" in reply.lower()
+
+
+def test_conversation_formula_error_returns_friendly_warning_instead_of_proposal():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s5b",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=GradebookProposal(
+            categories=[GradebookCategory(name="Midterm", weight=100.0)],
+            notes=["Formula ignored: Missing closing parenthesis in formula."],
+        ),
+    )
+
+    reply = cm.make_reply(
+        session,
+        session.proposal,
+        prompt="Set Midterm formula to malformed input: =round(([[quiz1]]+[[quiz2]],2)",
+    )
+
+    assert "updated proposal" not in reply.lower()
+    assert "couldn't apply that formula yet" in reply.lower()
+    assert "retry" in reply.lower()
+    assert "lthelp.yorku.ca/gradebook/creating-a-custom-formula" in reply.lower()
+    assert "support.microsoft.com/excel" in reply.lower()
+
+
+def test_formula_if_expression_is_parsed_without_truncation():
+    result = FormulaParser.extract_formula_and_detect("=if([[midterm]]>[[final]],[[midterm]],[[final]])")
+    assert result is not None
+    assert result["formula"] == "=if([[midterm]]>[[final]],[[midterm]],[[final]])"
+
+
+def test_formula_prompt_with_average_does_not_change_aggregation_method():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(
+        base,
+        "Replace Labs formula with: =average([[lab1]],[[lab2]],[[lab3]],[[lab4]])",
+    )
+
+    assert updated.aggregation_method == base.aggregation_method
+    assert not any("Aggregation method set to" in n for n in (updated.notes or []))
+
+
+def test_clear_formula_from_category_removes_formula_settings():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    with_formula = generator.update_from_prompt(base, "Set Labs formula to =average([[lab1]],[[lab2]])")
+    cleared = generator.update_from_prompt(with_formula, "Clear formula from Labs and keep the category weight unchanged.")
+
+    by_name = {c.name: c for c in cleared.categories}
+    assert by_name["Labs"].calculation_formula is None
+    assert by_name["Labs"].formula_item_refs == []
+    assert any("Cleared formula from Labs" in n for n in (cleared.notes or []))
+
+
+def test_formula_effects_properly_deduplicate_on_clear():
+    """Regression test: formula effects should deduplicate so clear properly removes apply.
+    
+    When a formula is applied and then cleared in subsequent prompts, the effects
+    should deduplicate so that the final effect shows only "Cleared formula from X",
+    not both "Applied formula" and "Cleared formula".
+    """
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    
+    # Apply a formula
+    with_formula = generator.update_from_prompt(
+        base, 
+        "Set Midterm formula to =if([[midterm]]>[[final]],[[midterm]],[[final]])"
+    )
+    midterm_cat = next(c for c in with_formula.categories if c.name == "Midterm")
+    assert midterm_cat.calculation_formula == "=if([[midterm]]>[[final]],[[midterm]],[[final]])"
+    
+    # Count "Applied formula" effects
+    apply_effects = [n for n in (with_formula.notes or []) if "Applied formula to Midterm" in n]
+    assert len(apply_effects) == 1, "Should have one 'Applied formula' effect"
+    
+    # Clear the formula using explicit "clear formula" directive
+    cleared = generator.update_from_prompt(with_formula, "clear formula from Midterm")
+    midterm_cat = next(c for c in cleared.categories if c.name == "Midterm")
+    assert midterm_cat.calculation_formula is None, "Formula should be None after clear"
+    
+    # Check effects: should have "Cleared formula", and old "Applied formula" should be gone due to deduplication
+    effects = [n for n in (cleared.notes or []) if "formula" in n.lower()]
+    apply_effects = [e for e in effects if "Applied formula to Midterm" in e]
+    clear_effects = [e for e in effects if "Cleared formula from Midterm" in e]
+    
+    assert len(clear_effects) == 1, f"Should have exactly one 'Cleared formula' effect, got {clear_effects}"
+    assert len(apply_effects) == 0, f"Old 'Applied formula' effects should be gone (deduplicated), got {apply_effects}"
+
+
+def test_formula_ignored_note_does_not_persist_to_next_turn():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    invalid = generator.update_from_prompt(base, "Set Midterm formula to malformed input: =round(([[quiz1]]+[[quiz2]],2)")
+    assert any("Formula ignored:" in n for n in (invalid.notes or []))
+
+    valid = generator.update_from_prompt(invalid, "Set Midterm formula to =if([[midterm]]>[[final]],[[midterm]],[[final]])")
+    assert not any("Formula ignored:" in n for n in (valid.notes or []))
+
+
+def test_next_phase_mixed_affirmation_and_proposal_request_stays_proposal():
+    cm = ConversationManager()
+    proposal = GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)])
+    session = GradebookSessionRecord(
+        session_id="s6",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="PROPOSAL",
+        proposal=proposal,
+    )
+
+    phase = cm.next_phase(session, "okay use it and give me a proposal")
+    assert phase == "PROPOSAL"
+
+
+def test_next_phase_refinement_stays_refinement_for_refinement_prompt():
+    cm = ConversationManager()
+    proposal = GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)])
+    session = GradebookSessionRecord(
+        session_id="s7",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=proposal,
+    )
+
+    phase = cm.next_phase(session, "set assignments formula to =average([[hw1]],[[hw2]])")
+    assert phase == "REFINEMENT"
+
+
 # --- Grade max, grade_pass, hidden, locked, display_type, decimals tests ---
 
 def test_proposal_grade_max_parsed():
@@ -745,6 +1057,26 @@ def test_proposal_hidden_until_parsed():
     by_name = {c.name: c for c in updated.categories}
     assert by_name["Labs"].hidden is True
     assert by_name["Labs"].hidden_until is not None
+
+
+def test_proposal_hidden_until_relative_parsed_from_hide_phrase():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "hide Final Exam until next week")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Final Exam"].hidden is True
+    assert by_name["Final Exam"].hidden_until is not None
+    assert any("effect: final exam hidden until next week" in str(n).lower() for n in (updated.notes or []))
+    assert not any("effect: final exam hidden from students" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_proposal_hidden_until_accepts_untill_typo():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "hide midterm untill 2026-08-12")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Midterm"].hidden is True
+    assert by_name["Midterm"].hidden_until is not None
 
 
 def test_proposal_locked_parsed():
@@ -1062,6 +1394,45 @@ async def test_gradebook_chat_supports_undo_and_redo():
     undone = await engine.chat(session.session_id, "undo")
     assert undone.proposal is not None
     assert {cat.name: cat.weight for cat in undone.proposal.categories}["Labs"] == 15.0
+
+    redone = await engine.chat(session.session_id, "redo")
+    assert redone.proposal is not None
+    assert {cat.name: cat.weight for cat in redone.proposal.categories}["Labs"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_undo_redo_survives_history_cache_loss():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1001",
+        professor_id="prof_b",
+        bot_name="eecs-bot-2",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%")],
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign"),
+            CourseActivity(name="Lab 1", module="lab"),
+        ],
+    )
+
+    # Simulate stateless request handling by dropping process-local history.
+    engine._proposal_history.clear()
+    engine._proposal_history_index.clear()
+
+    updated = await engine.chat(session.session_id, "set labs to 20%")
+    assert updated.proposal is not None
+    assert {cat.name: cat.weight for cat in updated.proposal.categories}["Labs"] == 20.0
+
+    # Simulate another request served without in-memory history.
+    engine._proposal_history.clear()
+    engine._proposal_history_index.clear()
+
+    undone = await engine.chat(session.session_id, "undo")
+    assert undone.proposal is not None
+    assert {cat.name: cat.weight for cat in undone.proposal.categories}["Labs"] == 15.0
+
+    # And redo should still work after another memory drop.
+    engine._proposal_history.clear()
+    engine._proposal_history_index.clear()
 
     redone = await engine.chat(session.session_id, "redo")
     assert redone.proposal is not None
