@@ -1496,3 +1496,500 @@ async def test_gradebook_get_returns_none_for_expired_active_session():
     session.last_touched_at = int(time.time()) - 10
 
     assert await engine.get(session.session_id) is None
+
+
+# --- Grade-Item-First Schema Tests ---
+
+def test_course_activity_with_all_fields():
+    """Test CourseActivity with complete grade-item-first fields."""
+    activity = CourseActivity(
+        cmid=101,
+        module="assign",
+        name="Homework 1",
+        grade_item_id=501,
+        itemtype="mod"
+    )
+    assert activity.cmid == 101
+    assert activity.module == "assign"
+    assert activity.name == "Homework 1"
+    assert activity.grade_item_id == 501
+    assert activity.itemtype == "mod"
+
+
+def test_course_activity_with_optional_grade_item_fields():
+    """Test CourseActivity with missing optional grade_item_id."""
+    activity = CourseActivity(
+        cmid=101,
+        module="quiz",
+        name="Midterm Exam"
+    )
+    assert activity.cmid == 101
+    assert activity.module == "quiz"
+    assert activity.name == "Midterm Exam"
+    assert activity.grade_item_id is None
+    assert activity.itemtype == "mod"  # defaults to "mod"
+
+
+def test_course_activity_itemtype_defaults_to_mod():
+    """Test that itemtype defaults to 'mod' when not specified."""
+    activity = CourseActivity(
+        name="Lab Work",
+        module="lab",
+        grade_item_id=502
+    )
+    assert activity.itemtype == "mod"
+
+
+def test_course_activity_with_manual_itemtype():
+    """Test CourseActivity with manual grade entry."""
+    activity = CourseActivity(
+        name="Extra Credit",
+        grade_item_id=503,
+        itemtype="manual"
+    )
+    assert activity.name == "Extra Credit"
+    assert activity.grade_item_id == 503
+    assert activity.itemtype == "manual"
+
+
+def test_course_activity_only_requires_name():
+    """Test that only 'name' is required field."""
+    activity = CourseActivity(name="Assignment")
+    assert activity.name == "Assignment"
+    assert activity.cmid is None
+    assert activity.module is None
+    assert activity.grade_item_id is None
+    assert activity.itemtype == "mod"
+
+
+# --- Grade-Item-First ContentMapper Tests ---
+
+@pytest.mark.asyncio
+async def test_mapper_includes_grade_item_id_in_output():
+    """Test that build_mapping includes grade_item_id and itemtype in result."""
+    from criabot.gradebook.content_mapper import ContentMapper
+    from criabot.gradebook.proposal import ProposalGenerator
+    
+    activities = [
+        CourseActivity(
+            name="Homework 1",
+            module="assign",
+            cmid=101,
+            grade_item_id=501,
+            itemtype="mod"
+        ),
+        CourseActivity(
+            name="Quiz 1",
+            module="quiz",
+            cmid=102,
+            grade_item_id=502,
+            itemtype="mod"
+        ),
+    ]
+
+    # Generate a proposal to use with the mapper
+    generator = ProposalGenerator()
+    proposal = generator.generate_initial(activities)
+
+    mapper = ContentMapper()
+    result = await mapper.build_mapping(
+        course_activities=activities,
+        proposal=proposal
+    )
+
+    assert "graded_activities" in result
+    graded = result["graded_activities"]
+
+    # Verify grade_item_id is present in mapping
+    assert len(graded) > 0
+    for item in graded:
+        assert "grade_item_id" in item
+        assert "itemtype" in item
+        assert "moodle_cmid" in item
+        assert "activity_name" in item
+        assert "suggested_category" in item
+
+
+@pytest.mark.asyncio
+async def test_mapper_preserves_grade_item_id_across_mapping():
+    """Test that grade_item_id is preserved exactly as provided."""
+    from criabot.gradebook.content_mapper import ContentMapper
+    from criabot.gradebook.proposal import ProposalGenerator
+    
+    test_grade_item_id = 505
+    activities = [
+        CourseActivity(
+            name="Test Activity",
+            module="forum",
+            cmid=105,
+            grade_item_id=test_grade_item_id,
+            itemtype="mod"
+        ),
+    ]
+
+    generator = ProposalGenerator()
+    proposal = generator.generate_initial(activities)
+
+    mapper = ContentMapper()
+    result = await mapper.build_mapping(
+        course_activities=activities,
+        proposal=proposal
+    )
+
+    graded = result["graded_activities"]
+    assert len(graded) > 0
+    assert graded[0]["grade_item_id"] == test_grade_item_id
+
+
+@pytest.mark.asyncio
+async def test_mapper_handles_missing_grade_item_id():
+    """Test mapper behavior when grade_item_id is not provided."""
+    from criabot.gradebook.content_mapper import ContentMapper
+    from criabot.gradebook.proposal import ProposalGenerator
+    
+    activities = [
+        CourseActivity(
+            name="Unmapped Assignment",
+            module="assign",
+            cmid=110
+            # grade_item_id is None
+        ),
+    ]
+
+    generator = ProposalGenerator()
+    proposal = generator.generate_initial(activities)
+
+    mapper = ContentMapper()
+    result = await mapper.build_mapping(
+        course_activities=activities,
+        proposal=proposal
+    )
+
+    graded = result["graded_activities"]
+    if graded:
+        # grade_item_id should be None or 0 if not provided
+        assert graded[0]["grade_item_id"] is None or graded[0]["grade_item_id"] == 0
+
+
+@pytest.mark.asyncio
+async def test_mapper_tracks_itemtype_from_course_activity():
+    """Test that mapper correctly propagates itemtype."""
+    from criabot.gradebook.content_mapper import ContentMapper
+    from criabot.gradebook.proposal import ProposalGenerator
+    
+    activities = [
+        CourseActivity(
+            name="Manual Grade Item",
+            grade_item_id=510,
+            itemtype="manual"
+        ),
+        CourseActivity(
+            name="Module Grade Item",
+            module="assign",
+            cmid=111,
+            grade_item_id=511,
+            itemtype="mod"
+        ),
+    ]
+
+    generator = ProposalGenerator()
+    proposal = generator.generate_initial(activities)
+
+    mapper = ContentMapper()
+    result = await mapper.build_mapping(
+        course_activities=activities,
+        proposal=proposal
+    )
+
+    graded = result["graded_activities"]
+    assert len(graded) > 0
+
+    # Find items and check itemtype
+    for item in graded:
+        if item["grade_item_id"] == 510:
+            assert item["itemtype"] == "manual"
+        elif item["grade_item_id"] == 511:
+            assert item["itemtype"] == "mod"
+
+
+@pytest.mark.asyncio
+async def test_mapper_output_structure_includes_all_required_fields():
+    """Test complete mapping output structure for finalize."""
+    from criabot.gradebook.content_mapper import ContentMapper
+    from criabot.gradebook.proposal import ProposalGenerator
+    
+    activities = [
+        CourseActivity(
+            name="Graded Lab",
+            module="lab",
+            cmid=120,
+            grade_item_id=520,
+            itemtype="mod"
+        ),
+    ]
+
+    generator = ProposalGenerator()
+    proposal = generator.generate_initial(activities)
+
+    mapper = ContentMapper()
+    result = await mapper.build_mapping(
+        course_activities=activities,
+        proposal=proposal
+    )
+
+    graded = result["graded_activities"]
+    if graded:
+        item = graded[0]
+        # Verify all expected fields are present
+        required_fields = [
+            "grade_item_id",
+            "itemtype",
+            "moodle_cmid",
+            "module_type",
+            "activity_name",
+            "suggested_category",
+            "confirmed_category",
+            "finalized",
+            "confidence",
+            "mapping_method"
+        ]
+        for field in required_fields:
+            assert field in item, f"Missing field: {field}"
+
+
+@pytest.mark.asyncio
+async def test_mapper_keyword_mapping_no_assignment_bias():
+    """Test that Quiz, Midterm, Final keywords map correctly and don't default to Assignments."""
+    mapper = ContentMapper()
+    
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=25.0),
+            GradebookCategory(name="Quizzes", weight=25.0),
+            GradebookCategory(name="Midterm", weight=25.0),
+            GradebookCategory(name="Final Exam", weight=25.0),
+        ]
+    )
+    
+    activities = [
+        CourseActivity(cmid=1, module="quiz", name="Quiz 1", grade_item_id=101, itemtype="mod"),
+        CourseActivity(cmid=2, module="quiz", name="Midterm Exam", grade_item_id=102, itemtype="mod"),
+        CourseActivity(cmid=3, module="quiz", name="Final Exam Week", grade_item_id=103, itemtype="mod"),
+        CourseActivity(cmid=4, module="assign", name="Assignment 1", grade_item_id=104, itemtype="mod"),
+    ]
+    
+    result = await mapper.build_mapping(activities, proposal)
+    graded = result["graded_activities"]
+    
+    assert len(graded) == 4
+    # Verify no defaulting to Assignments
+    assert graded[0]["suggested_category"] == "Quizzes", "Quiz 1 should map to Quizzes"
+    assert graded[1]["suggested_category"] == "Midterm", "Midterm Exam should map to Midterm"
+    assert graded[2]["suggested_category"] == "Final Exam", "Final Exam Week should map to Final Exam"
+    assert graded[3]["suggested_category"] == "Assignments", "Assignment 1 should map to Assignments"
+
+
+@pytest.mark.asyncio
+async def test_mapper_uncategorized_when_no_match():
+    """Test that unmatchable items are marked UNCATEGORIZED, not defaulted to first category."""
+    mapper = ContentMapper()
+    # Explicitly set criadex to None to disable LLM (simulates LLM not available)
+    mapper._criadex = None
+    
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=50.0),
+            GradebookCategory(name="Exams", weight=50.0),
+        ]
+    )
+    
+    # Create an activity with a name that has NO matching keywords
+    # "Foo Bar Baz" contains no keywords from NAME_CATEGORY_KEYWORDS
+    activities = [
+        CourseActivity(
+            cmid=100,
+            module="workshop",  # workshop is not in MODULE_CATEGORY_HINTS
+            name="Foo Bar Baz Activity XYZ",  # Name has no matching keywords
+            grade_item_id=200,
+            itemtype="mod"
+        ),
+    ]
+    
+    result = await mapper.build_mapping(activities, proposal)
+    graded = result["graded_activities"]
+    uncategorized = result["uncategorized_activities"]
+    
+    # Item should be marked UNCATEGORIZED, not defaulted to "Assignments"
+    assert len(uncategorized) == 1, f"Expected 1 uncategorized item, got {len(uncategorized)}"
+    assert graded[0]["suggested_category"] == mapper.UNCATEGORIZED
+    assert graded[0]["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_mapper_item_source_distinction():
+    """Test that mapper tracks item_source: 'activity' vs 'manual'."""
+    mapper = ContentMapper()
+    
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=100.0),
+        ]
+    )
+    
+    activities = [
+        CourseActivity(cmid=1, module="assign", name="HW1", grade_item_id=101, itemtype="mod"),
+        CourseActivity(cmid=None, module=None, name="Participation", grade_item_id=102, itemtype="manual"),
+    ]
+    
+    result = await mapper.build_mapping(activities, proposal)
+    graded = result["graded_activities"]
+    
+    assert graded[0]["item_source"] == "activity", "First item should be marked as activity"
+    assert graded[1]["item_source"] == "manual", "Second item should be marked as manual"
+
+
+@pytest.mark.asyncio
+async def test_mapper_multiple_manual_items_without_cmid_are_distinct():
+    """Ensure manual grade items (cmid=None) do not overwrite each other in mapping."""
+    mapper = ContentMapper()
+    mapper._criadex = None
+
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Participation", weight=50.0),
+            GradebookCategory(name="Midterm", weight=50.0),
+        ]
+    )
+
+    activities = [
+        CourseActivity(cmid=None, module=None, name="Participation", grade_item_id=501, itemtype="manual"),
+        CourseActivity(cmid=None, module=None, name="Mid-term Exam", grade_item_id=502, itemtype="manual"),
+    ]
+
+    result = await mapper.build_mapping(activities, proposal)
+    graded = result["graded_activities"]
+
+    assert len(graded) == 2
+    assert graded[0]["item_source"] == "manual"
+    assert graded[1]["item_source"] == "manual"
+    assert graded[0]["suggested_category"] == "Participation"
+    assert graded[1]["suggested_category"] == "Midterm"
+
+
+@pytest.mark.asyncio
+async def test_mapper_keyword_confidence_levels():
+    """Test that keyword matches report appropriate confidence scores."""
+    mapper = ContentMapper()
+    
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Quizzes", weight=50.0),
+            GradebookCategory(name="Assignments", weight=50.0),
+        ]
+    )
+    
+    activities = [
+        CourseActivity(cmid=1, module=None, name="quiz 1", grade_item_id=101, itemtype="mod"),
+        CourseActivity(cmid=2, module=None, name="knowledge check", grade_item_id=102, itemtype="mod"),
+    ]
+    
+    result = await mapper.build_mapping(activities, proposal)
+    graded = result["graded_activities"]
+    
+    # "quiz" keyword has high confidence (0.90)
+    assert graded[0]["confidence"] >= 0.90, "Quiz keyword should have high confidence"
+    # "knowledge check" has lower confidence (0.80)
+    assert graded[1]["confidence"] >= 0.80, "Knowledge check keyword should have good confidence"
+
+
+@pytest.mark.asyncio
+async def test_mapper_extended_keyword_set():
+    """Test that new extended keyword set (lab, project, midterm, etc.) works correctly."""
+    mapper = ContentMapper()
+    # Disable LLM for this test to ensure deterministic matching
+    mapper._criadex = None
+    
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Labs", weight=15.0),
+            GradebookCategory(name="Projects", weight=20.0),
+            GradebookCategory(name="Midterm", weight=30.0),
+            GradebookCategory(name="Final Exam", weight=35.0),
+        ]
+    )
+    
+    activities = [
+        CourseActivity(cmid=1, module="lab", name="Lab 1", grade_item_id=101, itemtype="mod"),
+        CourseActivity(cmid=2, module=None, name="Final Project", grade_item_id=102, itemtype="mod"),
+        CourseActivity(cmid=3, module=None, name="Mid-term Exam", grade_item_id=103, itemtype="mod"),
+        CourseActivity(cmid=4, module=None, name="Final Written Exam", grade_item_id=104, itemtype="mod"),
+    ]
+    
+    result = await mapper.build_mapping(activities, proposal)
+    graded = result["graded_activities"]
+    
+    # Diagnostic: print what we got for each item
+    for i, item in enumerate(graded):
+        print(f"Item {i}: {item['activity_name']} -> {item['suggested_category']} (confidence: {item['confidence']})")
+    
+    assert graded[0]["suggested_category"] == "Labs"
+    assert graded[1]["suggested_category"] == "Projects"
+    assert graded[2]["suggested_category"] == "Midterm", f"Expected Midterm but got {graded[2]['suggested_category']}"
+    assert graded[3]["suggested_category"] == "Final Exam"
+
+
+@pytest.mark.asyncio
+async def test_mapper_respects_proposal_items_list():
+    """Test that items explicitly listed in proposal categories are matched with high confidence."""
+    mapper = ContentMapper()
+    
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=100.0, items=["Specific HW 1", "Specific HW 2"]),
+        ]
+    )
+    
+    activities = [
+        CourseActivity(cmid=1, module="assign", name="Specific HW 1", grade_item_id=101, itemtype="mod"),
+        CourseActivity(cmid=2, module="assign", name="Different Assignment", grade_item_id=102, itemtype="mod"),
+    ]
+    
+    result = await mapper.build_mapping(activities, proposal)
+    graded = result["graded_activities"]
+    
+    # First item is explicitly in proposal items list
+    assert graded[0]["suggested_category"] == "Assignments"
+    assert graded[0]["confidence"] == 0.95, "Explicit proposal item should have highest confidence (0.95)"
+    
+    # Second item matches by keyword
+    assert graded[1]["suggested_category"] == "Assignments"
+    assert graded[1]["confidence"] < 0.95, "Keyword match should have lower confidence than explicit"
+
+
+@pytest.mark.asyncio
+async def test_mapper_ignores_assignment_only_proposal_items_bias():
+    """If only Assignments has proposal items, keyword/module mapping should still route quizzes correctly."""
+    mapper = ContentMapper()
+    mapper._criadex = None
+
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=25.0, items=["assignment1", "quiz 1", "quiz 2"]),
+            GradebookCategory(name="Labs", weight=15.0, items=[]),
+            GradebookCategory(name="Midterm", weight=30.0, items=[]),
+            GradebookCategory(name="Final Exam", weight=30.0, items=[]),
+        ]
+    )
+
+    activities = [
+        CourseActivity(cmid=1, module="assign", name="assignment1", grade_item_id=101, itemtype="mod"),
+        CourseActivity(cmid=2, module="quiz", name="quiz 1", grade_item_id=102, itemtype="mod"),
+        CourseActivity(cmid=3, module="quiz", name="quiz 2", grade_item_id=103, itemtype="mod"),
+    ]
+
+    result = await mapper.build_mapping(activities, proposal)
+    graded = result["graded_activities"]
+
+    assert graded[0]["suggested_category"] == "Assignments"
+    assert graded[1]["suggested_category"] != "Assignments"
+    assert graded[2]["suggested_category"] != "Assignments"

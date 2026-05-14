@@ -18,6 +18,8 @@ class CourseActivity(BaseModel):
     cmid: Optional[int] = None
     module: Optional[str] = None
     name: str
+    grade_item_id: Optional[int] = None
+    itemtype: Optional[str] = Field(default="mod", description="Grade item type: 'mod' for activities, 'manual' for manual entries, etc.")
 
 
 # Moodle GRADE_DISPLAY_TYPE constants

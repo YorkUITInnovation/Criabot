@@ -20,5 +20,8 @@ server:
 search:
   safe_search: 0
   autocomplete: ""
+  formats:
+    - html
+    - json
 
 # Valkey URL is provided via SEARXNG_VALKEY_URL in docker-compose.

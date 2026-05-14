@@ -63,9 +63,14 @@ class WebSearchClient:
             "safesearch": 1,
             "categories": "general",
         }
+        headers = {
+            "User-Agent": "CriaBot-WebSearch/1.0",
+            "X-Forwarded-For": "127.0.0.1",
+            "X-Real-IP": "127.0.0.1",
+        }
 
         async with httpx.AsyncClient(timeout=self._timeout_seconds, follow_redirects=True) as client:
-            response = await client.get(f"{self._base_url}/search", params=params)
+            response = await client.get(f"{self._base_url}/search", params=params, headers=headers)
             response.raise_for_status()
             payload = response.json()
 

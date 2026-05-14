@@ -70,7 +70,11 @@ def merge_configurations(
         no_context_message=base.no_context_message,
         no_context_use_message=base.no_context_use_message,
         no_context_llm_guess=base.no_context_llm_guess,
-        system_message=base.system_message
+        system_message=base.system_message,
+        web_search_global_enabled=base.web_search_global_enabled,
+        web_search_enabled=base.web_search_enabled,
+        faq_fallback_enabled=base.faq_fallback_enabled,
+        faq_fallback_threshold=base.faq_fallback_threshold,
     )
     
     # Merge all remaining configs (later overrides earlier)
@@ -102,6 +106,14 @@ def merge_configurations(
             merged.no_context_llm_guess = config.no_context_llm_guess
         if config.system_message is not None:
             merged.system_message = config.system_message
+        if config.web_search_global_enabled is not None:
+            merged.web_search_global_enabled = config.web_search_global_enabled
+        if config.web_search_enabled is not None:
+            merged.web_search_enabled = config.web_search_enabled
+        if config.faq_fallback_enabled is not None:
+            merged.faq_fallback_enabled = config.faq_fallback_enabled
+        if config.faq_fallback_threshold is not None:
+            merged.faq_fallback_threshold = config.faq_fallback_threshold
     
     return merged
 

@@ -611,6 +611,8 @@ class Criabot:
                 no_context_llm_guess=params_model.no_context_llm_guess,
                 # system_message: child override if present, otherwise inherit from merged parents
                 system_message=params_model.system_message or merged_parents.system_message,
+                web_search_global_enabled=params_model.web_search_global_enabled,
+                web_search_enabled=params_model.web_search_enabled,
                 faq_fallback_enabled=params_model.faq_fallback_enabled,
                 faq_fallback_threshold=params_model.faq_fallback_threshold,
             )
