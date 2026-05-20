@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from criabot.bot.chat.context import ContextRetriever, TextContext, QuestionContext, ContextRetrieverResponse
-from criabot.bot.chat.web_search import infer_search_language
+from criabot.bot.chat.web_search import WebSearchClient, infer_search_language
 from CriadexSDK.ragflow_schemas import TextNodeWithScore, TextNode, GroupSearchResponse, RerankAgentResponse, TransformAgentResponse, RelatedPrompt, ChatMessage
 
 
@@ -487,6 +487,8 @@ async def test_retrieve_merges_web_search_on_explicit_request(retriever):
     assert isinstance(response.context, TextContext)
     assert "local answer" in response.context.text
     assert "web answer" in response.context.text
+    assert "WEB_SEARCH" in response.group_responses
+    assert response.group_responses["WEB_SEARCH"].nodes[0].node.metadata.get("source_type") == "web_search"
 
 
 @pytest.mark.asyncio
@@ -578,3 +580,36 @@ async def test_retrieve_runs_web_search_for_time_sensitive_query(retriever):
 def test_infer_search_language_french_and_english():
     assert infer_search_language("Quels sont les meilleurs cours en intelligence artificielle?") == "fr"
     assert infer_search_language("Please search latest Python release notes") == "en-US"
+
+
+@pytest.mark.asyncio
+async def test_web_search_client_retries_with_cleaned_explicit_query():
+    empty_response = MagicMock()
+    empty_response.raise_for_status.return_value = None
+    empty_response.json.return_value = {"results": []}
+
+    hit_response = MagicMock()
+    hit_response.raise_for_status.return_value = None
+    hit_response.json.return_value = {
+        "results": [{"title": "Python Release Notes", "url": "https://example.com/python", "content": "Latest release notes."}],
+    }
+
+    client = AsyncMock()
+    client.get = AsyncMock(side_effect=[empty_response, hit_response])
+
+    client_context = AsyncMock()
+    client_context.__aenter__.return_value = client
+    client_context.__aexit__.return_value = None
+
+    with patch("criabot.bot.chat.web_search.httpx.AsyncClient", return_value=client_context):
+        results = await WebSearchClient(base_url="http://example.test").search(
+            "search the web for the latest Python release notes",
+            language="en-US",
+        )
+
+    assert len(results) == 1
+    first_params = client.get.await_args_list[0].kwargs["params"]
+    second_params = client.get.await_args_list[1].kwargs["params"]
+    assert first_params["q"] == "search the web for the latest Python release notes"
+    assert second_params["q"] == "the latest Python release notes"
+    assert second_params["language"] == "en-US"

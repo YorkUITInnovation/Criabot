@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import uuid
 from typing import List, Optional
 
 from .schemas import CourseActivity, GradebookProposal
@@ -69,6 +71,7 @@ class ContentMapper:
         self,
         course_activities: List[CourseActivity],
         proposal: Optional[GradebookProposal],
+        mapper_chat_id: Optional[str] = None,
     ) -> dict:
         proposal_categories = proposal.categories if proposal else []
         category_names = [c.name for c in proposal_categories]
@@ -101,8 +104,14 @@ class ContentMapper:
 
         # Stage 2: Call LLM only for low-confidence or unmatched items (cost control)
         llm_by_cmid = {}
+        active_mapper_chat_id = mapper_chat_id
         if llm_candidates:
-            llm_by_cmid = await self._llm_assignments(llm_candidates, category_names)
+            llm_by_cmid, active_mapper_chat_id = await self._llm_assignments(
+                llm_candidates,
+                category_names,
+                preferred_chat_id=mapper_chat_id,
+                return_chat_id=True,
+            )
 
         # Combine results: prefer high-confidence deterministic, use LLM for low-confidence
         for idx, activity in enumerate(course_activities):
@@ -144,66 +153,162 @@ class ContentMapper:
 
             mapping.append(item)
 
+        validation_errors = self.validate_mapping(mapping, proposal)
+
+        # Normalize invalid category references to uncategorized so downstream
+        # handling does not apply stale/deleted categories.
+        invalid_by_cmid = {
+            item.get("moodle_cmid"): item
+            for item in validation_errors
+            if item.get("moodle_cmid") is not None
+        }
+        if invalid_by_cmid:
+            for item in mapping:
+                cmid = item.get("moodle_cmid")
+                if cmid in invalid_by_cmid:
+                    item["suggested_category"] = self.UNCATEGORIZED
+                    item["confirmed_category"] = self.UNCATEGORIZED
+                    if item not in uncategorized:
+                        uncategorized.append(item)
+
         return {
             "graded_activities": mapping,
             "unmatched_activities": unmatched,
             "uncategorized_activities": uncategorized,
             "resource_suggestions": [],
+            "validation_errors": validation_errors,
+            "llm_mapper_chat_id": active_mapper_chat_id,
         }
 
-    async def _llm_assignments(self, course_activities: List[CourseActivity], category_names: List[str]) -> dict:
+    def validate_mapping(self, mapping_rows: List[dict], proposal: Optional[GradebookProposal]) -> List[dict]:
+        """Validate mapped category labels exist in the current proposal."""
+        if proposal is None:
+            return []
+
+        valid_categories = {
+            str(category.name).strip().lower()
+            for category in (proposal.categories or [])
+            if str(category.name).strip()
+        }
+        issues: List[dict] = []
+        for row in mapping_rows or []:
+            suggested = str(row.get("suggested_category") or "").strip()
+            if not suggested:
+                continue
+            if suggested in {self.UNCATEGORIZED, self.NOT_GRADED}:
+                continue
+            if suggested.lower() in valid_categories:
+                continue
+            issues.append(
+                {
+                    "moodle_cmid": row.get("moodle_cmid"),
+                    "activity_name": row.get("activity_name"),
+                    "missing_category": suggested,
+                    "reason": "Category was removed, renamed, or not present in the current proposal.",
+                }
+            )
+        return issues
+
+    async def _llm_assignments(
+        self,
+        course_activities: List[CourseActivity],
+        category_names: List[str],
+        preferred_chat_id: Optional[str] = None,
+        return_chat_id: bool = False,
+    ) -> dict | tuple[dict, Optional[str]]:
+        def _ret(data: dict, chat_id: Optional[str]) -> dict | tuple[dict, Optional[str]]:
+            if return_chat_id:
+                return data, chat_id
+            return data
+
         if not course_activities:
             logger.warning("No course activities provided for LLM assignments.")
-            return {}
+            return _ret({}, preferred_chat_id)
         if not category_names:
             logger.warning("No category names provided for LLM assignments.")
-            return {}
+            return _ret({}, preferred_chat_id)
         if self._criadex is None:
             logger.error("Criadex instance is not initialized. Cannot perform LLM assignments.")
-            return {}
+            return _ret({}, preferred_chat_id)
 
         prompt = self._build_llm_prompt(course_activities, category_names)
-        try:
-            response = await self._criadex.agents.azure.chat(
-                model_id=self._llm_model_id,
-                agent_config={
-                    "history": [
-                        {
-                            "role": "system",
-                            "blocks": [
-                                {
-                                    "type": "text",
-                                    "text": "You are a Moodle gradebook expert. Classify grade items into categories based on "
-                                           "YorkU eClass and Moodle standards. For items without clear matches, you may suggest "
-                                           f"'{self.UNCATEGORIZED}' if the category genuinely doesn't fit existing categories. "
-                                           "Prioritize accuracy over defaults. Always explain your reasoning."
-                                }
-                            ],
-                            "additional_kwargs": {},
-                            "metadata": {},
-                        },
-                        {
-                            "role": "user",
-                            "blocks": [{"type": "text", "text": prompt}],
-                            "additional_kwargs": {},
-                            "metadata": {},
-                        },
-                    ]
-                },
-            )
-        except Exception as e:
-            logger.exception(f"LLM mapping request failed: {e}")
-            return {}
+        response = None
+        resolved_chat_id: Optional[str] = None
+        # Keep chat_id on every attempt because Criadex contract requires it.
+        for attempt in range(3):
+            if attempt == 0 and preferred_chat_id:
+                chat_id = preferred_chat_id
+            else:
+                chat_id = f"gradebook-mapper-{uuid.uuid4().hex[:12]}"
+            try:
+                ragflow_tenant_id = os.getenv("RAGFLOW_TENANT_ID")
+                await self._criadex.agents.azure.ensure_dialog(
+                    chat_id=chat_id,
+                    model_id=self._llm_model_id,
+                    tenant_id=ragflow_tenant_id,
+                )
+            except Exception as e:
+                logger.warning(f"Could not ensure gradebook mapper dialog: {e}")
+
+            agent_config = {
+                "history": [
+                    {
+                        "role": "system",
+                        "blocks": [
+                            {
+                                "type": "text",
+                                "text": "You are a Moodle gradebook expert. Classify grade items into categories based on "
+                                       "YorkU eClass and Moodle standards. For items without clear matches, you may suggest "
+                                       f"'{self.UNCATEGORIZED}' if the category genuinely doesn't fit existing categories. "
+                                       "Prioritize accuracy over defaults. Always explain your reasoning."
+                            }
+                        ],
+                        "additional_kwargs": {},
+                        "metadata": {},
+                    },
+                    {
+                        "role": "user",
+                        "blocks": [{"type": "text", "text": prompt}],
+                        "additional_kwargs": {},
+                        "metadata": {},
+                    },
+                ],
+            }
+            agent_config["chat_id"] = chat_id
+
+            try:
+                response = await self._criadex.agents.azure.chat(
+                    model_id=self._llm_model_id,
+                    agent_config=agent_config,
+                )
+                resolved_chat_id = chat_id
+                break
+            except Exception as e:
+                err_text = str(e).lower()
+                ownership_conflict = ("don't own the chat" in err_text or "do not own the chat" in err_text)
+                if ownership_conflict and attempt < 2:
+                    logger.warning(
+                        "LLM mapper chat ownership conflict for chat_id %s. Retrying with a new chat_id.",
+                        chat_id,
+                    )
+                    continue
+                if ownership_conflict:
+                    logger.warning(
+                        "LLM mapper chat ownership conflict persisted after retries; falling back to deterministic mapping."
+                    )
+                else:
+                    logger.exception(f"LLM mapping request failed: {e}")
+                return _ret({}, preferred_chat_id)
 
         content = self._extract_chat_content(response)
         if not content:
             logger.error("LLM response content is empty. Falling back to deterministic mapping.")
-            return {}
+            return _ret({}, preferred_chat_id)
 
         parsed = self._extract_json_array(content)
         if not parsed:
             logger.error("Failed to parse LLM response into JSON array. Falling back to deterministic mapping.")
-            return {}
+            return _ret({}, preferred_chat_id)
 
         valid_categories = {name.lower(): name for name in category_names}
         valid_categories[self.NOT_GRADED] = self.NOT_GRADED
@@ -230,7 +335,7 @@ class ContentMapper:
                 logger.exception(f"Error processing LLM response row: {e}")
                 continue
 
-        return out
+        return _ret(out, resolved_chat_id or preferred_chat_id)
 
     def _build_llm_prompt(self, course_activities: List[CourseActivity], category_names: List[str]) -> str:
         activity_rows = []
@@ -433,12 +538,12 @@ class ContentMapper:
         return self.UNCATEGORIZED, 0.0, f"No matching keywords found. {item_source} needs manual categorization or LLM suggestion.", item_source
 
     @staticmethod
-    def _resolve_existing_category(category_name: str, existing_categories: List[str]) -> str:
+    def _resolve_existing_category(category_name: str, existing_categories: List[str]) -> Optional[str]:
         normalized_target = ContentMapper._normalize(category_name)
         for existing in existing_categories:
             if ContentMapper._normalize(existing) == normalized_target:
                 return existing
-        return category_name
+        return None
 
     @staticmethod
     def _normalize(value: Optional[str]) -> str:

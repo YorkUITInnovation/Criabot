@@ -1580,6 +1580,20 @@ class Criabot:
             raise KeyError("gradebook session not found")
         return session.model_dump()
 
+    @staticmethod
+    def _normalize_bool_flag(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"", "0", "false", "no", "off", "n"}:
+                return False
+            if normalized in {"1", "true", "yes", "on", "y"}:
+                return True
+        return False
+
     async def gradebook_chat(self, session_id: str, prompt: str) -> dict:
         session = await self._gradebook.chat(session_id=session_id, prompt=prompt)
         reply_message = self._gradebook_conversation.make_reply(session=session, proposal=session.proposal, prompt=prompt)
@@ -1588,6 +1602,7 @@ class Criabot:
             "phase": session.phase,
             "reply": reply_message,
             "proposal": session.proposal.model_dump() if session.proposal else None,
+            "proposal_changed": self._normalize_bool_flag((session.extraction or {}).get("proposal_changed", False)),
         }
 
     @staticmethod
@@ -1662,6 +1677,8 @@ class Criabot:
             )
 
         clipped = extracted_text[:8000]
+
+        uploaded_document_name: Optional[str] = None
         if looks_like_syllabus:
             ingest_prompt = (
                 f"I uploaded a syllabus document named '{filename}'. "
@@ -1674,6 +1691,45 @@ class Criabot:
             )
 
         session = await self._gradebook.chat(session_id=session_id, prompt=ingest_prompt)
+
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", (filename or "upload").strip())
+        uploaded_document_name = f"gb-{session.session_id}-{int(time.time())}-{safe_name}"
+
+        if uploaded_document_name:
+            try:
+                from criabot.bot.bot import Bot
+
+                # Upload to the current session bot document group and track for cleanup.
+                group_name = Bot.bot_group_name(session.bot_name, "DOCUMENT")
+                await self._criadex.content.upload(
+                    group_name=group_name,
+                    file={
+                        "file_name": uploaded_document_name,
+                        "file_contents": {
+                            "nodes": [
+                                {
+                                    "text": clipped,
+                                    "type": "UncategorizedText",
+                                    "metadata": {
+                                        "source": "gradebook_chat_upload",
+                                        "session_id": session.session_id,
+                                        "original_filename": filename,
+                                    },
+                                }
+                            ],
+                        },
+                        "file_metadata": {
+                            "source": "gradebook_chat_upload",
+                            "session_id": session.session_id,
+                            "original_filename": filename,
+                            "mimetype": filetype,
+                        },
+                    },
+                )
+                await self._gradebook.register_uploaded_document(session.session_id, uploaded_document_name)
+            except Exception as exc:
+                logger.warning("Gradebook chat upload indexing failed for %s: %s", filename, exc)
+                uploaded_document_name = None
 
         extraction = session.extraction or {}
         if not isinstance(extraction, dict):
@@ -1707,6 +1763,7 @@ class Criabot:
             "phase": session.phase,
             "reply": reply_message,
             "proposal": session.proposal.model_dump() if session.proposal else None,
+            "uploaded_document_name": uploaded_document_name,
         }
 
     async def gradebook_proposal(self, session_id: str) -> dict:
@@ -1734,7 +1791,11 @@ class Criabot:
             "session_id": session_id,
             "success": result['success'],
             "existed": result['existed'],
-            "message": result['message']
+            "message": result['message'],
+            "data": {
+                "docs_deleted": result.get('docs_deleted', 0),
+                "docs_failed": result.get('docs_failed', []),
+            },
         }
 
     async def gradebook_accept(self, session_id: str) -> dict:

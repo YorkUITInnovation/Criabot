@@ -17,6 +17,14 @@ _FRENCH_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _TOKEN_RE = re.compile(r"[a-zA-ZÀ-ÿ']+")
+_EXPLICIT_WEB_PREFIX_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:search|look(?:\s+it)?\s+up|check)\s+(?:the\s+)?(?:web|internet|online)\s+(?:for|about)?\s+",
+    re.IGNORECASE,
+)
+_EXPLICIT_WEB_PREFIX_FR_RE = re.compile(
+    r"^\s*(?:cherche|recherche|trouve)\s+(?:sur\s+(?:le\s+)?web|sur\s+internet|en\s+ligne)\s+",
+    re.IGNORECASE,
+)
 _FRENCH_STOPWORDS = {
     "le", "la", "les", "de", "des", "du", "et", "ou", "en", "sur", "avec", "sans", "pour",
     "est", "sont", "dans", "que", "qui", "quoi", "comment", "pourquoi", "quel", "quelle", "quels",
@@ -46,20 +54,34 @@ class WebSearchClient:
         self._timeout_seconds = timeout_seconds
         self._max_results = max_results
 
-    async def search(self, query: str, language: str | None = None) -> List[dict]:
-        if not query.strip():
+    @staticmethod
+    def _candidate_queries(query: str) -> List[str]:
+        stripped_query = (query or "").strip()
+        if not stripped_query:
             return []
 
-        effective_language = (language or infer_search_language(query)).strip()
-        if not effective_language:
-            effective_language = "en-US"
-        if effective_language.lower() in {"fr-ca", "fr_fr", "fr-ca", "fr_ca"}:
-            effective_language = "fr"
+        candidates = [stripped_query]
+        for pattern in (_EXPLICIT_WEB_PREFIX_RE, _EXPLICIT_WEB_PREFIX_FR_RE):
+            cleaned_query = pattern.sub("", stripped_query).strip(" .?")
+            if cleaned_query and cleaned_query.lower() != stripped_query.lower():
+                candidates.append(cleaned_query)
 
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _candidate_languages(language: str) -> List[str]:
+        normalized_language = (language or "").strip() or "en-US"
+        candidates = [normalized_language]
+        base_language = re.split(r"[-_]", normalized_language, maxsplit=1)[0].strip()
+        if base_language and base_language.lower() != normalized_language.lower():
+            candidates.append(base_language)
+        return list(dict.fromkeys(candidates))
+
+    async def _perform_search(self, query: str, language: str) -> List[dict]:
         params = {
             "q": query,
             "format": "json",
-            "language": effective_language,
+            "language": language,
             "safesearch": 1,
             "categories": "general",
         }
@@ -79,6 +101,37 @@ class WebSearchClient:
             return []
 
         return results[:self._max_results]
+
+    async def search(self, query: str, language: str | None = None) -> List[dict]:
+        if not query.strip():
+            return []
+
+        effective_language = (language or infer_search_language(query)).strip()
+        if not effective_language:
+            effective_language = "en-US"
+        if effective_language.lower() in {"fr-ca", "fr_fr", "fr-ca", "fr_ca"}:
+            effective_language = "fr"
+
+        attempts = [(candidate_query, effective_language) for candidate_query in self._candidate_queries(query)]
+        for fallback_language in self._candidate_languages(effective_language)[1:]:
+            for candidate_query in self._candidate_queries(query):
+                attempts.append((candidate_query, fallback_language))
+
+        last_error: httpx.HTTPError | None = None
+        for candidate_query, candidate_language in attempts:
+            try:
+                results = await self._perform_search(candidate_query, candidate_language)
+            except httpx.HTTPError as exc:
+                last_error = exc
+                continue
+
+            if results:
+                return results
+
+        if last_error is not None:
+            raise last_error
+
+        return []
 
 
 def build_web_search_nodes(results: List[dict], group_name: str = "WEB_SEARCH") -> List[TextNodeWithScore]:

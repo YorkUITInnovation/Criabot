@@ -233,6 +233,20 @@ class ContextRetriever:
         return build_web_search_nodes(results)
 
     @staticmethod
+    def _attach_web_group_response(
+            retriever_response: ContextRetrieverResponse,
+            web_nodes: List[TextNodeWithScore],
+    ) -> None:
+        retriever_response.group_responses = retriever_response.group_responses or {}
+        retriever_response.group_responses["WEB_SEARCH"] = GroupSearchResponse(
+            nodes=web_nodes or [],
+            assets=[],
+            search_units=0,
+            metadata={"group_name": "WEB_SEARCH", "source_type": "web_search"},
+        )
+        retriever_response.search_units = ContextRetrieverResponse.get_search_units(retriever_response.group_responses)
+
+    @staticmethod
     def _looks_like_group_search_result(payload: object) -> bool:
         if isinstance(payload, GroupSearchResponse):
             return True
@@ -649,6 +663,7 @@ class ContextRetriever:
                 try:
                     web_nodes = await self._search_web_nodes(prompt)
                     if web_nodes:
+                        self._attach_web_group_response(retriever_response, web_nodes)
                         nodes = self.normalize_ranked_nodes([*nodes, *web_nodes])
                         if nodes:
                             retriever_response.context = TextContext(
@@ -663,6 +678,7 @@ class ContextRetriever:
                 try:
                     web_nodes = await self._search_web_nodes(prompt)
                     if web_nodes:
+                        self._attach_web_group_response(retriever_response, web_nodes)
                         retriever_response.context = TextContext(
                             text=build_text_context(nodes=web_nodes),
                             nodes=web_nodes,

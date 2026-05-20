@@ -14,6 +14,40 @@ from .schemas import (
     GRADE_DISPLAY_TYPE_LETTER_REAL, GRADE_DISPLAY_TYPE_PERCENTAGE_REAL,
 )
 from .formula_parser import FormulaParser
+from .formula_resolver import FormulaResolver
+
+
+def validate_proposal_weights(proposal: GradebookProposal) -> List[Dict[str, object]]:
+    """Validate proposal weights only for aggregation methods that require it."""
+    method = int(getattr(proposal, "aggregation_method", 13))
+    if method not in {10, 11, 12}:
+        return []
+
+    categories = list(getattr(proposal, "categories", []) or [])
+    if not categories:
+        return []
+
+    weighted_categories = categories
+    if method == 12:
+        weighted_categories = [cat for cat in categories if not bool(getattr(cat, "extra_credit", False))]
+
+    total_weight = sum(float(getattr(cat, "weight", 0.0)) for cat in weighted_categories)
+    errors: List[Dict[str, object]] = []
+    if abs(total_weight - 100.0) > 0.01:
+        errors.append(
+            {
+                "path": ["proposal"],
+                "aggregation_method": method,
+                "total_weight": total_weight,
+                "expected": 100.0,
+                "details": (
+                    f"Weight sum for proposal categories is {total_weight}, expected 100.0 "
+                    f"for aggregation method {method}."
+                ),
+            }
+        )
+
+    return errors
 
 
 class ProposalGenerator:
@@ -56,9 +90,27 @@ class ProposalGenerator:
 
     def generate_initial(self, activities: List[CourseActivity]) -> GradebookProposal:
         categories = [GradebookCategory(name=name, weight=weight, items=[]) for name, weight in self.DEFAULT_CATEGORIES]
+        by_name = {category.name: category for category in categories}
+
+        def ensure_category(name: str) -> GradebookCategory:
+            existing = by_name.get(name)
+            if existing is not None:
+                return existing
+
+            # Inferred categories start at zero weight so we don't disturb the
+            # default 100% baseline before the professor reviews the proposal.
+            category = GradebookCategory(name=name, weight=0.0, items=[])
+            categories.append(category)
+            by_name[name] = category
+            return category
+
         for activity in activities:
             activity_name = activity.name.lower()
-            if "lab" in activity_name:
+            module_name = (activity.module or "").lower()
+
+            if module_name == "quiz" or any(keyword in activity_name for keyword in ("quiz", "knowledge check", "test")):
+                ensure_category("Quizzes").items.append(activity.name)
+            elif "lab" in activity_name:
                 categories[1].items.append(activity.name)
             elif "midterm" in activity_name:
                 categories[2].items.append(activity.name)
@@ -81,6 +133,7 @@ class ProposalGenerator:
         "auto-normalized",
         "removed category",
         "formula ignored:",
+        "formula warning:",
         "formula was valid, but no target category was found.",
     )
 
@@ -120,10 +173,25 @@ class ProposalGenerator:
         if low.startswith("aggregation method set to"):
             return "aggregation_method"
 
-        # Formula effects: both "Applied formula to X" and "Cleared formula from X" should share same topic.
+        m = re.match(r"^added\s+'?(.+?)'?\s+with\s+weight\s+\d+(?:\.\d+)?%", low)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1)).strip(" '")
+            return f"category_add:{label}"
+
+        m = re.match(r"^(?:set|changed?|adjusted?|updated?)\s+(.+?)\s+to\s+\d+(?:\.\d+)?%", low)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1)).strip(" '")
+            return f"weight:{label}"
+
+        # Formula effects on the same category should share one topic key.
         m = re.match(r"^(?:applied|cleared)\s+formula\s+(?:to|from)\s+(.+?)(?::|$)", low)
         if m:
-            label = re.sub(r"\s+", " ", m.group(1)).strip()
+            label = re.sub(r"\s+", " ", m.group(1)).strip(" '\"")
+            return f"formula:{label}"
+
+        m = re.match(r"^stored\s+formula\s+for\s+(.+?)(?:\s*\(|:|$)", low)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1)).strip(" '\"")
             return f"formula:{label}"
 
         m = re.match(r"^(.+?)\s+hidden\s+until\b", low)
@@ -155,7 +223,12 @@ class ProposalGenerator:
             filtered.append(entry)
         proposal.notes = filtered
 
-    def update_from_prompt(self, proposal: GradebookProposal, prompt: str) -> GradebookProposal:
+    def update_from_prompt(
+        self,
+        proposal: GradebookProposal,
+        prompt: str,
+        course_activities: Optional[List[CourseActivity]] = None,
+    ) -> GradebookProposal:
         updated = GradebookProposal.parse_obj(proposal.model_dump())
         prompt_lower = prompt.lower()
 
@@ -186,13 +259,15 @@ class ProposalGenerator:
         if weights:
             self._apply_weight_updates(updated, weights)
 
+        self._apply_add_category_requests(updated, prompt, explicit_updates=weights)
+
         self._apply_directive_normalization(updated, prompt, explicit_updates=weights)
 
         # Apply per-category settings (drop/keep/extra credit/exclude empty)
         self._apply_category_settings(updated, prompt)
 
         # Parse and persist optional formula-driven grading requests.
-        self._apply_formula_request(updated, prompt)
+        self._apply_formula_request(updated, prompt, course_activities=course_activities or [])
 
         # Parse clear/remove formula directives after apply, so replacement prompts work.
         self._apply_formula_clear_request(updated, prompt)
@@ -233,7 +308,12 @@ class ProposalGenerator:
 
         return proposal.categories[0] if proposal.categories else None
 
-    def _apply_formula_request(self, proposal: GradebookProposal, prompt: str) -> None:
+    def _apply_formula_request(
+        self,
+        proposal: GradebookProposal,
+        prompt: str,
+        course_activities: List[CourseActivity],
+    ) -> None:
         """Extract, validate, and store a formula request in the proposal when present."""
         detected = FormulaParser.extract_formula_and_detect(prompt)
         if not detected:
@@ -264,12 +344,46 @@ class ProposalGenerator:
             return
 
         normalized = validation.normalized_formula or raw_formula.lstrip("=").strip()
-        target.calculation_formula = f"={normalized}"
+        if course_activities:
+            resolved_formula, unresolved_refs, suggestions = FormulaResolver.resolve_formula(
+                formula=f"={normalized}",
+                activities=course_activities,
+                category_names=[c.name for c in (proposal.categories or [])],
+            )
+        else:
+            # Backward-compatible behavior: when activity context is unavailable,
+            # keep normalized refs as-is and treat the formula as applied.
+            resolved_formula = FormulaParser.moodle_compatible_formula(f"={normalized}")
+            unresolved_refs = []
+            suggestions = {}
+
+        target.calculation_formula = resolved_formula
         target.formula_item_refs = list(validation.item_references or [])
-        self._append_effect_note(
-            proposal,
-            f"Applied formula to {target.name}: {target.calculation_formula}",
-        )
+        target.formula_unresolved_refs = list(unresolved_refs or [])
+
+        if unresolved_refs:
+            unresolved_text = ", ".join(f"[{ref}]" for ref in unresolved_refs)
+            self._append_unique_note(
+                proposal,
+                f"Formula warning: unresolved references {unresolved_text}.",
+            )
+            # Include compact "did you mean" hints for the first unresolved ref.
+            first_ref = unresolved_refs[0]
+            hint = suggestions.get(first_ref) or []
+            if hint:
+                self._append_unique_note(
+                    proposal,
+                    f"Formula warning: did you mean one of {', '.join(hint[:3])} for [{first_ref}]?",
+                )
+            self._append_effect_note(
+                proposal,
+                f"Stored formula for '{target.name}' (unresolved refs: {unresolved_text}).",
+            )
+        else:
+            self._append_effect_note(
+                proposal,
+                f"Applied formula to {target.name}: {target.calculation_formula}",
+            )
 
     def _apply_formula_clear_request(self, proposal: GradebookProposal, prompt: str) -> None:
         """Clear existing formulas based on explicit clear/remove formula directives."""
@@ -282,6 +396,11 @@ class ProposalGenerator:
             r"\b(?:clear|remove|delete|unset)\s+(?:the\s+)?formula\s+(?:from|for|on)\s+([a-zA-Z][a-zA-Z ]{1,40})",
             text_l,
         )
+        if not target_match:
+            target_match = re.search(
+                r"\b(?:clear|remove|delete|unset)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,40})\s+formula\b",
+                text_l,
+            )
         if target_match:
             target_hint = target_match.group(1).strip().rstrip(".,")
 
@@ -291,6 +410,7 @@ class ProposalGenerator:
                 continue
             cat.calculation_formula = None
             cat.formula_item_refs = []
+            cat.formula_unresolved_refs = []
             self._append_effect_note(proposal, f"Cleared formula from {cat.name}")
 
     @staticmethod
@@ -1073,6 +1193,7 @@ class ProposalGenerator:
                     decimals=getattr(src, "decimals", -1) if src else -1,
                     calculation_formula=getattr(src, "calculation_formula", None) if src else None,
                     formula_item_refs=list(getattr(src, "formula_item_refs", []) or []) if src else [],
+                    formula_unresolved_refs=list(getattr(src, "formula_unresolved_refs", []) or []) if src else [],
                 )
             )
         return rebuilt
@@ -1082,12 +1203,105 @@ class ProposalGenerator:
         for name, weight in weights.items():
             key = name.lower()
             if key in normalized_map:
-                normalized_map[key].weight = weight
+                existing = normalized_map[key]
+                if abs(float(existing.weight) - float(weight)) > 0.001:
+                    existing.weight = weight
+                    self._append_effect_note(proposal, f"Set {existing.name} to {weight:.1f}%")
             else:
                 # Allow adding a new category when the user explicitly sets its weight
                 # (e.g., "add quizzes 5%" / "quizzes 5%").
                 proposal.categories.append(GradebookCategory(name=name, weight=weight, items=[]))
-                proposal.notes.append(f"Added category '{name}' with weight {weight:.1f}%.")
+                self._append_effect_note(proposal, f"Added '{name}' with weight {weight:.1f}%")
+
+    def _parse_add_category_requests(self, proposal: GradebookProposal, prompt: str) -> List[str]:
+        requested: List[str] = []
+        seen: set = set()
+
+        for match in re.finditer(
+            r"\b(?:add|added)\s+(?:new\s+)?(?:category\s+)?(?:as\s+)?([a-z][a-z\s]{1,40}?)(?=(?:\s+with\b|\s+at\b|\s+to\b|\s*[:.,;!?]|$))",
+            prompt,
+            flags=re.IGNORECASE,
+        ):
+            raw = re.sub(r"\s+", " ", (match.group(1) or "").strip())
+            if not raw:
+                continue
+            if re.search(r"\b(?:it|them|its\s+weight|subcategor(?:y|ies))\b", raw, flags=re.IGNORECASE):
+                continue
+
+            resolved = self._resolve_category_name(proposal, raw)
+            if not resolved:
+                cleaned = self._clean_new_category_name(raw)
+                if not cleaned:
+                    continue
+                resolved = cleaned
+
+            key = resolved.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            requested.append(resolved)
+
+        return requested
+
+    def _extract_recent_removed_transfer(self, proposal: GradebookProposal, category_name: str) -> Optional[Tuple[float, str]]:
+        category_l = (category_name or "").strip().lower()
+        if not category_l:
+            return None
+
+        for note in reversed(proposal.notes or []):
+            text = str(note or "")
+            if text.startswith("Effect:"):
+                text = text[len("Effect:"):].strip()
+            match = re.match(
+                r"Removed\s+'([^']+)'\s+and\s+assigned\s+([0-9]+(?:\.[0-9]+)?)%\s+to\s+(.+)$",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                continue
+
+            removed_name = (match.group(1) or "").strip().lower()
+            if removed_name != category_l:
+                continue
+
+            try:
+                weight = float(match.group(2))
+            except Exception:
+                continue
+
+            target_name = self._resolve_category_name(proposal, (match.group(3) or "").strip())
+            if not target_name:
+                continue
+
+            target = next((c for c in proposal.categories if c.name.lower() == target_name.lower()), None)
+            if target is None or float(getattr(target, "weight", 0.0)) < weight:
+                continue
+
+            return weight, target.name
+
+        return None
+
+    def _apply_add_category_requests(
+        self,
+        proposal: GradebookProposal,
+        prompt: str,
+        explicit_updates: Dict[str, float],
+    ) -> None:
+        requested = self._parse_add_category_requests(proposal, prompt)
+        if not requested:
+            return
+
+        explicit_keys = {k.lower() for k in (explicit_updates or {}).keys()}
+        existing_map = {cat.name.lower(): cat for cat in proposal.categories}
+
+        for name in requested:
+            key = name.lower()
+            if key in explicit_keys or key in existing_map:
+                continue
+
+            inferred_weight = 0.0
+            proposal.categories.append(GradebookCategory(name=name, weight=inferred_weight, items=[]))
+            self._append_effect_note(proposal, f"Added '{name}' with weight {inferred_weight:.1f}%")
 
     def _detect_split_parent(self, proposal: GradebookProposal, prompt: str) -> Optional[str]:
         # 1) "Split Assignments ... into ..."
@@ -1098,14 +1312,22 @@ class ProposalGenerator:
                 return resolved
 
         # 2) "In Labs, ... split/divide into ..." or "For Labs, ..."
-        scoped = re.search(r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)\s*,.*\b(?:split|divide)\b", prompt, flags=re.IGNORECASE)
+        scoped = re.search(
+            r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,.*\b(?:split|divide)\b",
+            prompt,
+            flags=re.IGNORECASE,
+        )
         if scoped:
             resolved = self._resolve_category_name(proposal, scoped.group(1).strip())
             if resolved:
                 return resolved
 
         # 3) "In Labs, add subcategories:" or "For Labs, add subcategories:"
-        add_subs = re.search(r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)\s*,.*\badd\s+subcategories\b", prompt, flags=re.IGNORECASE)
+        add_subs = re.search(
+            r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,.*\badd\s+subcategories\b",
+            prompt,
+            flags=re.IGNORECASE,
+        )
         if add_subs:
             resolved = self._resolve_category_name(proposal, add_subs.group(1).strip())
             if resolved:
@@ -1164,6 +1386,10 @@ class ProposalGenerator:
         if parent is None:
             return
 
+        # Always overwrite previous subcategories and remove prior split notes for this parent
+        parent.subcategories = []
+        proposal.notes = [n for n in (proposal.notes or []) if not (str(n).startswith(f"Effect: In {parent.name}, split into") or str(n).startswith(f"{parent.name} split requested"))]
+
         subcategories: List[GradebookSubcategory] = []
         labels: List[str] = []
         for name, weight in split_parts:
@@ -1176,33 +1402,130 @@ class ProposalGenerator:
             proposal,
             f"In {parent.name}, split into " + ", ".join(labels),
         )
-        # Remove any prior check notes for the same parent before appending the new one.
-        stale_prefix = f"{parent.name} split requested"
-        proposal.notes = [n for n in (proposal.notes or []) if not str(n).startswith(stale_prefix)]
         self._append_unique_note(
             proposal,
             f"{parent.name} split requested (treated as internal allocation): " + ", ".join(labels) + ".",
         )
 
-    def _apply_removals(self, proposal: GradebookProposal, prompt: str) -> None:
-        removals = re.findall(r"\b(?:remove|delete)\s+([a-zA-Z][a-zA-Z ]{1,40})\b", prompt, flags=re.IGNORECASE)
-        if not removals:
-            return
+    # Redistribution intent keywords for removal prompts.
+    _REDISTRIBUTE_EVENLY_PATTERNS = re.compile(
+        r"\b(?:evenly|equally|proportionally|split\s+evenly|distribute\s+evenly|"
+        r"redistribute|divide\s+(?:it\s+)?equally|share\s+equally|spread\s+equally)\b",
+        re.IGNORECASE,
+    )
+    _REDISTRIBUTE_TO_PATTERNS = re.compile(
+        r"\band\s+(?:give\s+(?:its\s+)?weight\s+to|give\s+to|assign\s+(?:it\s+)?to|"
+        r"move\s+(?:weight\s+)?to|reallocate\s+to|redistribute\s+(?:to|among)|"
+        r"distribute\s+to|split\s+(?:weight\s+)?among|split\s+(?:it\s+)?between|"
+        r"add\s+(?:it\s+)?to)\s+([a-z\s,&]+)",
+        re.IGNORECASE,
+    )
 
-        for raw_name in removals:
-            resolved = self._resolve_category_name(proposal, raw_name)
-            if not resolved:
+    def _apply_removals(self, proposal: GradebookProposal, prompt: str) -> None:
+        """Handle category removal with three distinct weight modes.
+
+        Supports:
+        1. ``remove X``                     – free the weight (total decreases)
+        2. ``remove X evenly``              – redistribute freed weight to remaining categories
+        3. ``remove X and give/assign to Y``– transfer freed weight to specific category Y
+        """
+        def _clean_phrase(value: str) -> str:
+            cleaned = re.sub(
+                r"\b(?:the|a|an|its|lowest|highest|category|categories|weight|one|single)\b",
+                " ",
+                value,
+                flags=re.IGNORECASE,
+            )
+            return re.sub(r"\s+", " ", cleaned).strip(" ,.")
+
+        # Match any remove/delete/drop, capture everything after.
+        pattern = re.compile(
+            r"\b(?:remove|delete|drop)\s+(?:the\s+)?([a-z][a-z\s]{0,40}?)(?:\s+and\s|\s+evenly|\s+equally|\s+proportionally|[,:;.!?]|$)",
+            re.IGNORECASE,
+        )
+
+        handled: set = set()
+
+
+        for match in pattern.finditer(prompt):
+            raw_category = _clean_phrase(match.group(1) or "")
+            resolved = self._resolve_category_name(proposal, raw_category)
+            if not resolved or resolved in handled:
+                # If not found, acknowledge with a note/effect.
+                if not resolved:
+                    self._append_effect_note(
+                        proposal,
+                        f"Tried to remove '{raw_category}', but category was not found. No changes made.",
+                    )
                 continue
-            removable = next((cat for cat in proposal.categories if cat.name.lower() == resolved.lower()), None)
+
+            removable = next(
+                (cat for cat in proposal.categories if cat.name.lower() == resolved.lower()),
+                None,
+            )
             if removable is None:
+                self._append_effect_note(
+                    proposal,
+                    f"Tried to remove '{raw_category}', but category was not found. No changes made.",
+                )
                 continue
+
+            handled.add(resolved)
             removed_weight = removable.weight
             proposal.categories = [cat for cat in proposal.categories if cat is not removable]
-            if proposal.categories:
+
+            if not proposal.categories:
+                self._append_effect_note(proposal, f"Removed '{resolved}' ({removed_weight:.1f}% freed)")
+                continue
+
+            # Determine redistribution intent from the full prompt.
+            tail = prompt[match.start():]  # look at the tail to catch "and give to Y"
+            to_match = self._REDISTRIBUTE_TO_PATTERNS.search(tail)
+
+            if to_match:
+                # Mode 3: assign freed weight to explicit target(s).
+                raw_targets = _clean_phrase(to_match.group(1) or "")
+                target_str = re.sub(r"\b(?:and|or)\b", ",", raw_targets, flags=re.IGNORECASE)
+                candidate_names = [t.strip().rstrip(",. ") for t in target_str.split(",") if t.strip()]
+                resolved_targets = [
+                    self._resolve_category_name(proposal, t)
+                    for t in candidate_names
+                ]
+                resolved_targets = [t for t in resolved_targets if t]
+                target_cats = [cat for cat in proposal.categories if cat.name in resolved_targets]
+
+                if target_cats:
+                    share = removed_weight / len(target_cats)
+                    for cat in target_cats:
+                        cat.weight += share
+                    target_label = ", ".join(cat.name for cat in target_cats)
+                    self._append_effect_note(
+                        proposal,
+                        f"Removed '{resolved}' and assigned {removed_weight:.1f}% to {target_label}",
+                    )
+                else:
+                    # Target not found — fall back to free (don't silently redistribute).
+                    self._append_effect_note(
+                        proposal,
+                        f"Removed '{resolved}' ({removed_weight:.1f}% freed; target not found)",
+                    )
+
+            elif self._REDISTRIBUTE_EVENLY_PATTERNS.search(tail):
+                # Mode 2: distribute freed weight evenly across all remaining categories.
                 share = removed_weight / len(proposal.categories)
                 for cat in proposal.categories:
                     cat.weight += share
-            proposal.notes.append(f"Removed category '{resolved}' and redistributed {removed_weight:.1f}% across remaining categories.")
+                self._append_effect_note(
+                    proposal,
+                    f"Removed '{resolved}' and distributed {removed_weight:.1f}% evenly",
+                )
+
+            else:
+                # Mode 1 (default): free the weight — total decreases.
+                self._append_effect_note(
+                    proposal,
+                    f"Removed '{resolved}' ({removed_weight:.1f}% freed)",
+                )
 
     def _resolve_category_name(self, proposal: GradebookProposal, raw_name: str) -> Optional[str]:
         cleaned = self._normalize_name(raw_name)
@@ -1317,11 +1640,13 @@ class ProposalGenerator:
             total = sum(cat.weight for cat in proposal.categories)
             self._append_unique_note(proposal, "Auto-normalized category weights to 100%.")
 
-        if abs(total - 100.0) > 0.1:
-            self._append_unique_note(
-                proposal,
-                f"Weight check: total is {total:.1f}% (expected 100%)."
-            )
+        for issue in validate_proposal_weights(proposal):
+            if issue.get("path") == ["proposal"]:
+                self._append_unique_note(
+                    proposal,
+                    f"Weight check: total is {float(issue.get('total_weight', total)):.1f}% (expected 100%)."
+                )
+                break
 
         self._check_split_consistency(proposal)
         self._check_rule_effectiveness(proposal)

@@ -63,10 +63,19 @@ class GradebookFinalizeRoute(CriaRoute):
             reorganize_resources=payload.reorganize_resources,
         )
 
+        response_message = "Gradebook finalized. Categories and content mapping confirmed."
+        if str(result.get("phase") or "").upper() != "COMPLETED":
+            validation = ((result.get("content_mapping") or {}).get("validation") or {})
+            errors = list(validation.get("errors") or [])
+            if errors:
+                response_message = f"Finalize blocked by validation: {errors[0]}"
+            else:
+                response_message = "Finalize blocked by validation. Resolve proposal checks and try again."
+
         return self.ResponseModel(
             code=SUCCESS_CODE,
             status=200,
-            message="Gradebook finalized. Categories and content mapping confirmed.",
+            message=response_message,
             session_id=session_id,
             phase=result["phase"],
             summary=result["summary"],

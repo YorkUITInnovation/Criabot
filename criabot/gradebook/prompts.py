@@ -4,5 +4,6 @@ ANALYSIS_PROMPT = (
 )
 
 REFINEMENT_PROMPT = (
-    "Refine the current gradebook proposal according to professor feedback while ensuring total weight equals 100."
+    "Refine the current gradebook proposal according to professor feedback while ensuring weights match the selected aggregation method. "
+    "Support dual-action instructions like deleting/dropping one category and reallocating its weight to one or more targets."
 )

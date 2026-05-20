@@ -5,7 +5,7 @@ import re
 from typing import List, Dict, Optional
 
 from .schemas import GradebookProposal, GradebookSessionRecord, GRADE_DISPLAY_TYPE_NAMES
-from .proposal import ProposalGenerator
+from .proposal import ProposalGenerator, validate_proposal_weights
 from .formula_parser import FormulaParser
 
 
@@ -160,20 +160,27 @@ class ConversationManager:
         # Check for acceptance keywords
         if self._looks_like_affirmation(text):
             if session.phase in ["PROPOSAL", "REFINEMENT"]:
-                total = sum(cat.weight for cat in (session.proposal.categories if session.proposal else []))
-                if abs(total - 100.0) <= 0.1:
+                proposal = session.proposal
+                proposal_errors = validate_proposal_weights(proposal) if proposal else [{"path": ["proposal"]}]
+                has_weight_error = any(err.get("path") == ["proposal"] for err in proposal_errors)
+                if not has_weight_error:
                     return "ACCEPTED"
                 else:
-                    return session.phase  # Cannot accept if weights don't sum to 100%
+                    return session.phase
 
         # Check for rejection/refinement keywords
         if self._looks_like_rejection(text):
-            if session.phase == "PROPOSAL":
+            if session.phase in {"PROPOSAL", "ACCEPTED", "COMPLETED"}:
                 return "REFINEMENT"
             return session.phase
 
         # Questions during flow: stay in current phase, respond naturally
         if self._looks_like_question(text):
+            if session.phase in {"ACCEPTED", "COMPLETED"}:
+                if self._looks_like_gradebook_refinement(text) or self._looks_like_gradebook_instruction(text):
+                    return "REFINEMENT"
+                if session.phase == "COMPLETED" and text:
+                    return "REFINEMENT"
             return session.phase
 
         # Phase transitions based on current state
@@ -205,6 +212,13 @@ class ConversationManager:
                 return "ANALYSIS"
             if self._looks_like_proposal_request(text):
                 return "PROPOSAL"
+            if self._looks_like_gradebook_refinement(text) or self._looks_like_gradebook_instruction(text):
+                return "REFINEMENT"
+
+            # After finalization, any non-question freeform text is treated as
+            # an edit intent so the user can continue refining in-place.
+            if session.phase == "COMPLETED" and text:
+                return "REFINEMENT"
 
         return session.phase
 
@@ -234,7 +248,7 @@ class ConversationManager:
                 return True
         # Structural modifications.
         refinement_keywords = (
-            "split", "divide", "subcategor", "rename", "remove", "delete", "add",
+            "split", "divide", "subcategor", "rename", "remove", "delete", "add", "added",
             "hide", "hidden", "show", "unhide", "reveal", "lock", "unlock",
             "drop", "keep", "extra credit", "aggregat", "method", "weighted",
             "natural", "mean", "weight", "rebalance", "redistribute", "proportion",
@@ -308,6 +322,8 @@ class ConversationManager:
         return (
             "⚠ I couldn't understand that request. Try one of these:\n\n"
             "- Set weights: 'Set Labs to 20%'\n"
+            "- Add category: 'Add Quizzes' or 'Added Quizzes'\n"
+            "- Add category with weight: 'Add Quizzes 10%'\n"
             "- Aggregation: 'Use weighted mean' or 'Use mean'\n"
             "- Splits: 'In Labs, split into Lab Reports 10%, In-Lab 5%'\n"
             "- Formula: 'Set Assignments formula to =average([[hw1]],[[hw2]])'\n"
@@ -317,7 +333,6 @@ class ConversationManager:
             "Tip: type 'help' to see the full supported instruction list."
         )
 
-    @staticmethod
     @staticmethod
     def _supported_instructions_help_text() -> str:
         return (
@@ -329,7 +344,15 @@ class ConversationManager:
             "**Weights and categories**\n"
             "- 'Set Assignments 35%, Labs 15%, Midterm 20%, Final 30%'\n"
             "- 'Change Labs to 20% and rebalance automatically'\n"
-            "- 'Rename Labs to Laboratory' · 'Remove Quizzes' · 'Add Projects 15%'\n\n"
+            "- 'Rename Labs to Laboratory'\n"
+            "- 'Add Quizzes' — creates the category at 0% so you can rebalance later\n"
+            "- 'Add Projects 15%' — creates the category with that weight immediately\n"
+            "- 'Added Quizzes' — shorthand phrasing also works\n\n"
+            "**Remove / drop a category**\n"
+            "- 'Remove Quizzes' — frees the weight (total decreases; you can reallocate later)\n"
+            "- 'Drop Labs evenly' — removes Labs and spreads its weight equally across remaining categories\n"
+            "- 'Delete Midterm and give weight to Final Exam' — removes Midterm and adds its weight to Final Exam\n"
+            "- 'Remove Assignments and split weight among Labs and Midterm' — removes Assignments and splits weight equally between the two targets\n\n"
             "**Aggregation method**\n"
             "- 'Use Weighted mean of grades'\n"
             "- 'Switch to Natural'\n"
@@ -439,7 +462,9 @@ class ConversationManager:
 
         if session.phase == "PROPOSAL" and proposal:
             # For formula parsing failures, return a focused warning instead of re-rendering full proposal.
-            if self._extract_formula_from_prompt(prompt) is not None:
+            formula_requested = self._extract_formula_from_prompt(prompt) is not None
+            proposal_changed = bool((session.extraction or {}).get("proposal_changed"))
+            if formula_requested and proposal_changed:
                 formula_error = self._formula_error_reply(proposal)
                 if formula_error:
                     return formula_error
@@ -452,7 +477,10 @@ class ConversationManager:
 
             aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
             
-            if abs(total_weight - 100.0) > 0.1:
+            proposal_errors = validate_proposal_weights(proposal)
+            has_weight_error = any(err.get("path") == ["proposal"] for err in proposal_errors)
+
+            if has_weight_error:
                 return (
                     f"Here is the gradebook structure I built based on your materials:\n\n"
                     f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n\n"
@@ -470,7 +498,9 @@ class ConversationManager:
         if session.phase == "REFINEMENT":
             if proposal:
                 # For formula parsing failures, return a focused warning instead of re-rendering full proposal.
-                if self._extract_formula_from_prompt(prompt) is not None:
+                formula_requested = self._extract_formula_from_prompt(prompt) is not None
+                proposal_changed = bool((session.extraction or {}).get("proposal_changed"))
+                if formula_requested and proposal_changed:
                     formula_error = self._formula_error_reply(proposal)
                     if formula_error:
                         return formula_error
@@ -479,7 +509,9 @@ class ConversationManager:
                 effects_text = self._format_effects(proposal)
                 notes_text = self._format_notes(session, proposal)
                 aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
-                if abs(total_weight - 100.0) > 0.1:
+                proposal_errors = validate_proposal_weights(proposal)
+                has_weight_error = any(err.get("path") == ["proposal"] for err in proposal_errors)
+                if has_weight_error:
                     return (
                         f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n\n"
                         f"**Grade Aggregation Method**: {aggregation_name}\n\n"
@@ -507,8 +539,8 @@ class ConversationManager:
         if session.phase == "COMPLETED":
             return (
                 "✓ Gradebook finalized successfully! "
-                "All course activities have been mapped and are now ready in Moodle. "
-                "You can download a summary or make adjustments directly in Moodle."
+                "You can still edit it here by sending a change request (for example: 'change midterm to 30%'). "
+                "After edits, regenerate mapping and finalize again to apply the override to Moodle."
             )
 
         return "Gradebook session updated. How can I help?"
@@ -571,7 +603,7 @@ class ConversationManager:
 
         # Questions about adding/removing categories
         if ("add" in q or "remove" in q or "delete" in q) and ("categor" in q or "item" in q):
-            return "You can add or remove categories anytime by describing them. Say something like: 'Add a Projects category with 15%' or 'Remove the Labs category and redistribute to Assignments.'"
+            return "You can add or remove categories anytime by describing them. Say 'Add Quizzes' to create it at 0%, 'Add a Projects category with 15%' to create it with weight, or 'Remove the Labs category and redistribute to Assignments.'"
 
         # Questions about uploads
         if "upload" in q or "file" in q:
@@ -820,17 +852,86 @@ class ConversationManager:
         notes = proposal.notes or []
         return [str(n) for n in notes if str(n).startswith("Formula ignored:")]
 
+    @staticmethod
+    def _formula_unresolved_notes(
+        proposal: GradebookProposal | None,
+        target_category: str | None = None,
+    ) -> List[str]:
+        if proposal is None:
+            return []
+        notes: List[str] = []
+        target_norm = (target_category or "").strip().lower()
+        for category in proposal.categories:
+            if target_norm and str(getattr(category, "name", "")).strip().lower() != target_norm:
+                continue
+            unresolved = list(getattr(category, "formula_unresolved_refs", []) or [])
+            if not unresolved:
+                continue
+            refs = ", ".join(f"[{ref}]" for ref in unresolved)
+            notes.append(f"{category.name}: unresolved formula refs {refs}")
+        return notes
+
+    @staticmethod
+    def _latest_formula_effect_target(proposal: GradebookProposal | None) -> str | None:
+        if proposal is None:
+            return None
+        notes = list(proposal.notes or [])
+        for note in reversed(notes):
+            text = str(note)
+            if not text.startswith("Effect:"):
+                continue
+            effect = text[len("Effect:"):].strip()
+
+            # Effect: Applied formula to Assignments: =...
+            applied = re.match(r"^Applied\s+formula\s+to\s+(.+?)(?::|$)", effect, flags=re.IGNORECASE)
+            if applied:
+                return applied.group(1).strip(" '")
+
+            # Effect: Stored formula for 'Labs' (unresolved refs: ...).
+            stored = re.match(r"^Stored\s+formula\s+for\s+'?(.+?)'?(?:\s*\(|:|$)", effect, flags=re.IGNORECASE)
+            if stored:
+                return stored.group(1).strip(" '")
+
+            cleared = re.match(r"^Cleared\s+formula\s+from\s+(.+?)(?::|$)", effect, flags=re.IGNORECASE)
+            if cleared:
+                return cleared.group(1).strip(" '")
+
+        return None
+
     def _formula_error_reply(self, proposal: GradebookProposal | None) -> str:
         errors = self._formula_ignored_notes(proposal)
+        latest_target = self._latest_formula_effect_target(proposal)
+        unresolved_notes = self._formula_unresolved_notes(proposal, target_category=latest_target)
         if not errors:
-            return ""
+            if not unresolved_notes:
+                return ""
+
+        # When parsing failed this turn, focus on parser errors only and do not
+        # include stale unresolved refs from prior formulas/categories.
+        if errors:
+            unresolved_notes = []
+
+        combined: List[str] = []
+        seen = set()
+        for item in (errors[-2:] + unresolved_notes[-2:]):
+            key = item.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(item)
+
+        header = "I couldn't apply that formula yet."
+        guidance = "Please review the issue and retry:"
+        if not errors and unresolved_notes:
+            header = "I saved the formula, but some references are still unresolved."
+            guidance = "Please fix these references to fully apply it:"
 
         lines = [
-            "I couldn't apply that formula yet.",
+            header,
             "",
-            "Please review the issue and retry:",
+            guidance,
         ]
-        for err in errors[-2:]:
+        for err in combined:
             lines.append(f"- {err.replace('Formula ignored: ', '').strip()}")
 
         lines.extend([
@@ -866,13 +967,24 @@ class ConversationManager:
         issues = self.validate_weights(proposal)
         notes = [n for n in (proposal.notes or []) if not str(n).startswith("Effect:")]
         conflict_notes = self._syllabus_conflict_warnings(session, proposal)
-        if not issues and not notes and not conflict_notes:
+        unresolved_notes = self._formula_unresolved_notes(proposal)
+        if not issues and not notes and not conflict_notes and not unresolved_notes:
             return ""
 
         lines = ["", "", "**Checks:**"]
         for issue in issues:
             lines.append(f"- {issue}")
-        for note in notes[-3:]:
+        # Deduplicate repeated warnings to keep the response concise.
+        merged_notes = notes[-4:] + unresolved_notes[-2:]
+        seen = set()
+        deduped = []
+        for note in merged_notes:
+            key = str(note).strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(note)
+        for note in deduped:
             lines.append(f"- {note}")
         for note in conflict_notes:
             lines.append(f"- {note}")
@@ -973,13 +1085,14 @@ class ConversationManager:
     def validate_weights(self, proposal: GradebookProposal) -> List[str]:
         """Validate that proposal weights are reasonable"""
         issues = []
-        total_weight = sum(cat.weight for cat in proposal.categories)
-
-        if abs(total_weight - 100.0) > 0.1:
-            issues.append(f"Total weight is {total_weight:.1f}%, should be 100%")
+        for error in validate_proposal_weights(proposal):
+            path = error.get("path") or []
+            total_weight = float(error.get("total_weight", 0.0))
+            if path == ["proposal"]:
+                issues.append(f"Total weight is {total_weight:.1f}%, should be 100%")
 
         for category in proposal.categories:
-            if category.weight <= 0:
+            if category.weight < 0:
                 issues.append(f"Category '{category.name}' has invalid weight {category.weight}")
             if category.weight > 100:
                 issues.append(f"Category '{category.name}' weight {category.weight}% seems too high")

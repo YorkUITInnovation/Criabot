@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
 import uuid
-from typing import Dict, List, TYPE_CHECKING
+from typing import Dict, List, TYPE_CHECKING, Any
 
 from .conversation import ConversationManager
 from .content_mapper import ContentMapper
@@ -14,6 +15,9 @@ from criabot.cache.objects.gradebooks import _parse_time_to_seconds
 
 if TYPE_CHECKING:
     from criabot.database.gradebook.gradebook_db import GradebookDatabaseAPI
+
+
+logger = logging.getLogger(__name__)
 
 
 class GradebookSessionEngine:
@@ -26,6 +30,7 @@ class GradebookSessionEngine:
     ) -> None:
         self._gradebook_db = gradebook_db
         self._gradebook_cache = gradebook_cache
+        self._criadex = criadex
         self._proposal_generator = ProposalGenerator()
         self._content_mapper = ContentMapper(criadex=criadex, llm_model_id=mapping_llm_model_id)
         self._conversation = ConversationManager()
@@ -36,6 +41,35 @@ class GradebookSessionEngine:
         self._active_sessions: Dict[str, GradebookSessionRecord] = {}
         self._proposal_history: Dict[str, List[dict]] = {}
         self._proposal_history_index: Dict[str, int] = {}
+
+    @staticmethod
+    def _uploaded_documents_extraction_key() -> str:
+        return "_uploaded_document_ids"
+
+    def _persist_uploaded_docs_to_extraction(self, session: GradebookSessionRecord) -> None:
+        session.extraction = session.extraction or {}
+        session.extraction[self._uploaded_documents_extraction_key()] = list(session.uploaded_document_ids or [])
+
+    @staticmethod
+    def _hydrate_uploaded_docs_from_extraction(extraction: dict | None) -> List[str]:
+        if not isinstance(extraction, dict):
+            return []
+        values = extraction.get(GradebookSessionEngine._uploaded_documents_extraction_key()) or []
+        if not isinstance(values, list):
+            return []
+        return [str(v).strip() for v in values if str(v).strip()]
+
+    async def register_uploaded_document(self, session_id: str, document_name: str) -> None:
+        """Track an uploaded document name for session-bound cleanup at delete time."""
+        if not document_name:
+            return
+        session = self._active_sessions.get(session_id) or await self.get(session_id)
+        if session is None:
+            return
+        if document_name not in session.uploaded_document_ids:
+            session.uploaded_document_ids.append(document_name)
+            self._persist_uploaded_docs_to_extraction(session)
+            await self._save_session(session)
 
     @staticmethod
     def _history_key() -> str:
@@ -162,37 +196,34 @@ class GradebookSessionEngine:
                 return True
         return False
 
-    @staticmethod
-    def _detect_syllabus_sources(resources: List[MoodleResource]) -> List[str]:
+    def _detect_syllabus_sources(self, resources: List[MoodleResource], uploaded_docs: List[str]) -> List[str]:
         sources: List[str] = []
+        seen = set()
+        # 1. All visible course/section 0 files and syllabus-like resources
         for resource in resources:
-            name = (resource.name or "").lower()
+            name = (resource.name or "").strip()
             section = (resource.section or "").lower()
             preview = (resource.content_preview or "").lower()
+            if not name or name in seen:
+                continue
+            # Only include if in section 0, or syllabus-like, or has syllabus-like preview
             if (
-                "syllabus" in name
-                or "syllabi" in name
-                or "syllabe" in name
-                or "plan de cours" in name
-                or "plan du cours" in name
-                or "programme" in name
-                or "outline" in name
-                or "grading" in preview
-                or "assessment" in preview
-                or "syllabus" in preview
-                or "syllabe" in preview
-                or "bar\u00e8me" in preview
-                or "plan de cours" in preview
-                or "plan du cours" in preview
-                or section in {"0", "section 0"}
-                or "%" in preview
+                section in {"0", "section 0"}
+                or any(k in name.lower() for k in ["syllabus", "syllabi", "syllabe", "plan de cours", "plan du cours", "programme", "outline"])
+                or any(k in preview for k in ["grading", "assessment", "syllabus", "syllabe", "bar\u00e8me", "plan de cours", "plan du cours", "%"])
             ):
-                if resource.name:
-                    sources.append(resource.name)
+                sources.append(name)
+                seen.add(name)
+        # 2. Add files uploaded in this session (if not already listed)
+        for doc in uploaded_docs:
+            if doc and doc not in seen:
+                sources.append(doc)
+                seen.add(doc)
         return sources
 
     async def _save_session(self, session: GradebookSessionRecord) -> None:
         session.last_touched_at = int(time.time())
+        self._persist_uploaded_docs_to_extraction(session)
         if self._gradebook_db:
             from criabot.database.gradebook.tables.gradebook_sessions import GradebookSessionsConfig
 
@@ -265,6 +296,7 @@ class GradebookSessionEngine:
             proposal=proposal,
             content_mapping=session_model.metadata_json,
             last_touched_at=int(session_model.updated_at.timestamp()),
+            uploaded_document_ids=self._hydrate_uploaded_docs_from_extraction(session_model.extraction_json),
         )
         self._active_sessions[session_id] = record
         if self._gradebook_cache:
@@ -301,6 +333,7 @@ class GradebookSessionEngine:
             proposal=proposal,
             content_mapping=session_model.content_mapping,
             last_touched_at=session_model.last_touched_at,
+            uploaded_document_ids=self._hydrate_uploaded_docs_from_extraction(session_model.extraction),
         )
         self._active_sessions[session_id] = record
         return record
@@ -332,7 +365,12 @@ class GradebookSessionEngine:
                 if resource.name
             ]
         session_id = "gb-" + str(uuid.uuid4())
-        syllabus_sources = self._detect_syllabus_sources(moodle_resources)
+        uploaded_docs = []
+        # If any uploaded docs are tracked for this session, include them
+        # (for new session, this is empty; for resumed, hydrate from extraction)
+        # This ensures only current session uploads are included
+        extraction = {}
+        syllabus_sources = self._detect_syllabus_sources(moodle_resources, uploaded_docs)
         has_syllabus = len(syllabus_sources) > 0
         phase = "ANALYSIS" if has_syllabus else "INTAKE"
         proposal = self._proposal_generator.generate_initial(course_activities) if phase == "ANALYSIS" else None
@@ -393,26 +431,69 @@ class GradebookSessionEngine:
 
         if self._is_undo_prompt(prompt):
             restored = self._restore_from_history(session, direction="undo")
+            session.extraction["proposal_changed"] = bool(restored)
             session.phase = "REFINEMENT" if session.proposal else session.phase
+            if restored:
+                # Any proposal mutation invalidates prior accepted mapping/validation.
+                session.content_mapping = None
+                session.extraction.pop("llm_mapper_chat_id", None)
             await self._save_session(session)
             return session
 
         if self._is_redo_prompt(prompt):
             restored = self._restore_from_history(session, direction="redo")
+            session.extraction["proposal_changed"] = bool(restored)
             session.phase = "REFINEMENT" if session.proposal else session.phase
+            if restored:
+                # Any proposal mutation invalidates prior accepted mapping/validation.
+                session.content_mapping = None
+                session.extraction.pop("llm_mapper_chat_id", None)
             await self._save_session(session)
             return session
 
+        previous_phase = session.phase
         session.phase = self._conversation.next_phase(session, prompt)
         if session.phase in {"ANALYSIS", "REFINEMENT", "PROPOSAL"} and session.proposal is None:
             session.proposal = self._proposal_generator.generate_initial(session.course_activities)
             self._push_proposal_history(session)
 
-        if session.proposal is not None:
+        proposal_changed = False
+        force_mutation_on_first_post_finalize_edit = bool(
+            previous_phase in {"ACCEPTED", "COMPLETED"}
+            and session.phase == "REFINEMENT"
+            and str(prompt or "").strip()
+        )
+        should_mutate_proposal = bool(
+            session.proposal is not None
+            and (
+                force_mutation_on_first_post_finalize_edit
+                or
+                self._conversation._looks_like_gradebook_refinement(prompt)
+                or self._conversation._extract_formula_from_prompt(prompt) is not None
+            )
+        )
+        if should_mutate_proposal:
+            proposal_before = session.proposal.model_dump()
             # Capture baseline before applying prompt so undo can restore prior state.
             self._push_proposal_history(session)
-            session.proposal = self._proposal_generator.update_from_prompt(session.proposal, prompt)
+            session.proposal = self._proposal_generator.update_from_prompt(
+                session.proposal,
+                prompt,
+                course_activities=session.course_activities,
+            )
+            proposal_changed = session.proposal.model_dump() != proposal_before
             self._push_proposal_history(session)
+        session.extraction["proposal_changed"] = proposal_changed
+
+        if proposal_changed:
+            # Force re-accept/rebuild mapping after edits to avoid stale finalize validation.
+            session.content_mapping = None
+            session.extraction.pop("llm_mapper_chat_id", None)
+
+        # Always update syllabus_sources to reflect current visible resources and session uploads
+        uploaded_docs = list(session.uploaded_document_ids or [])
+        session.extraction["syllabus_sources"] = self._detect_syllabus_sources(session.moodle_resources, uploaded_docs)
+        session.extraction["has_syllabus"] = bool(session.extraction["syllabus_sources"])
 
         await self._save_session(session)
         return session
@@ -425,11 +506,28 @@ class GradebookSessionEngine:
         if session.phase in {"ACCEPTED", "COMPLETED"} and session.content_mapping is not None:
             return session
 
-        session.phase = "ACCEPTED"
-        session.content_mapping = await self._content_mapper.build_mapping(
+        session.extraction = session.extraction or {}
+        mapper_chat_id = str(session.extraction.get("llm_mapper_chat_id") or "").strip() or None
+
+        content_mapping = await self._content_mapper.build_mapping(
             course_activities=session.course_activities,
             proposal=session.proposal,
+            mapper_chat_id=mapper_chat_id,
         )
+
+        latest_mapper_chat_id = str((content_mapping or {}).get("llm_mapper_chat_id") or "").strip()
+        if latest_mapper_chat_id:
+            session.extraction["llm_mapper_chat_id"] = latest_mapper_chat_id
+
+        validation = self._pre_accept_validation(session, content_mapping)
+        content_mapping["validation"] = validation
+        session.content_mapping = content_mapping
+
+        # Keep session in refinement when hard validation errors exist.
+        if validation.get("can_proceed"):
+            session.phase = "ACCEPTED"
+        else:
+            session.phase = "REFINEMENT"
 
         await self._save_session(session)
 
@@ -457,6 +555,46 @@ class GradebookSessionEngine:
                     )
 
         return session
+
+    def _pre_accept_validation(self, session: GradebookSessionRecord, content_mapping: dict) -> Dict[str, Any]:
+        """Validate proposal/mapping consistency before locking an accepted mapping."""
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        proposal = session.proposal
+        if proposal is None:
+            return {
+                "errors": ["No proposal is available to accept."],
+                "warnings": warnings,
+                "can_proceed": False,
+            }
+
+        # Formula validation: unresolved references should block accept.
+        for category in proposal.categories:
+            unresolved = list(getattr(category, "formula_unresolved_refs", []) or [])
+            if unresolved:
+                refs = ", ".join(f"[{ref}]" for ref in unresolved)
+                errors.append(f"Formula in '{category.name}' has unresolved references: {refs}.")
+
+        # Mapping validation: stale/non-existent categories should block accept.
+        for issue in list((content_mapping or {}).get("validation_errors") or []):
+            activity_name = str(issue.get("activity_name") or "Unknown activity")
+            missing_category = str(issue.get("missing_category") or "Unknown category")
+            errors.append(
+                f"Activity '{activity_name}' points to missing category '{missing_category}'."
+            )
+
+        # Empty categories are warnings (non-blocking) so instructors can intentionally keep them.
+        for category in proposal.categories:
+            item_count = len(category.items or [])
+            if item_count == 0:
+                warnings.append(f"Category '{category.name}' has zero items.")
+
+        return {
+            "errors": errors,
+            "warnings": warnings,
+            "can_proceed": len(errors) == 0,
+        }
 
     async def reset(self, session_id: str, keep_extraction: bool = True) -> GradebookSessionRecord:
         session = self._active_sessions.get(session_id) or await self.get(session_id)
@@ -487,6 +625,11 @@ class GradebookSessionEngine:
     async def delete(self, session_id: str) -> dict:
         """Delete a gradebook session from memory, cache, and database.
         
+        Cleans up:
+        - Session record
+        - Uploaded documents (only those uploaded in this specific session)
+        - History and cache entries
+        
         Returns:
             dict with keys:
             - 'success': bool indicating if deletion occurred
@@ -495,6 +638,11 @@ class GradebookSessionEngine:
         """
         session = self._active_sessions.pop(session_id, None)
         existed = session is not None
+        
+        # Collect document IDs to delete (uploaded in this session)
+        docs_to_delete = []
+        if session and hasattr(session, 'uploaded_document_ids'):
+            docs_to_delete = list(session.uploaded_document_ids or [])
 
         # Cache cleanup
         if self._gradebook_cache:
@@ -510,15 +658,47 @@ class GradebookSessionEngine:
             session_db = await self._gradebook_db.sessions.retrieve(session_id)
             if session_db:
                 existed = True
+                if not docs_to_delete:
+                    docs_to_delete = self._hydrate_uploaded_docs_from_extraction(session_db.extraction_json)
                 await self._gradebook_db.results.delete_by_session(session_db.id)
             deleted_db = await self._gradebook_db.sessions.delete_session(session_id)
 
+        # Document cleanup - delete documents uploaded in this session
+        docs_deleted = 0
+        docs_failed: List[str] = []
+        if docs_to_delete and session:
+            from criabot.bot.bot import Bot
+
+            group_name = Bot.bot_group_name(session.bot_name, "DOCUMENT")
+            try:
+                for doc_id in docs_to_delete:
+                    try:
+                        if self._criadex is not None:
+                            await self._criadex.content.delete(
+                                group_name=group_name,
+                                document_name=doc_id,
+                            )
+                        docs_deleted += 1
+                    except Exception as exc:
+                        docs_failed.append(str(doc_id))
+                        logger.warning("Gradebook session document cleanup failed for %s: %s", doc_id, exc)
+            except Exception as exc:
+                logger.warning("Gradebook session cleanup failed for %s: %s", session_id, exc)
+
         success = deleted_db or session is not None
+        
+        msg = f"Session {session_id} deleted."
+        if docs_deleted > 0:
+            msg += f" Cleaned up {docs_deleted} uploaded document(s)."
+        if docs_failed:
+            msg += f" {len(docs_failed)} document(s) could not be removed."
         
         return {
             'success': success,
             'existed': existed,
-            'message': f"Session {session_id} deleted." if success else f"Session {session_id} not found."
+            'message': msg if success else f"Session {session_id} not found.",
+            'docs_deleted': docs_deleted,
+            'docs_failed': docs_failed,
         }
 
 
@@ -533,6 +713,18 @@ class GradebookSessionEngine:
 
         if session.content_mapping is None:
             session = await self.accept(session_id)
+
+        current_validation = dict((session.content_mapping or {}).get("validation") or {})
+        if not current_validation:
+            current_validation = self._pre_accept_validation(session, session.content_mapping or {})
+            if session.content_mapping is None:
+                session.content_mapping = {}
+            session.content_mapping["validation"] = current_validation
+
+        if not bool(current_validation.get("can_proceed", True)):
+            session.phase = "REFINEMENT"
+            await self._save_session(session)
+            return session
 
         graded_activities = list((session.content_mapping or {}).get("graded_activities", []))
         activity_by_cmid = {

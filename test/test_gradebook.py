@@ -7,8 +7,9 @@ from criabot.gradebook.analyzer import SyllabusAnalyzer
 from criabot.gradebook.content_mapper import ContentMapper
 from criabot.gradebook.conversation import ConversationManager
 from criabot.gradebook.formula_parser import FormulaParser
-from criabot.gradebook.proposal import ProposalGenerator
-from criabot.gradebook.schemas import CourseActivity, GradebookCategory, GradebookProposal, GradebookSessionRecord, MoodleResource
+from criabot.gradebook.formula_resolver import FormulaResolver
+from criabot.gradebook.proposal import ProposalGenerator, validate_proposal_weights
+from criabot.gradebook.schemas import CourseActivity, GradebookCategory, GradebookProposal, GradebookSessionRecord, MoodleResource, GradebookSubcategory
 from criabot.gradebook.session import GradebookSessionEngine
 
 
@@ -220,6 +221,152 @@ async def test_gradebook_finalize_marks_confirmed_mapping_and_completes():
 
 
 @pytest.mark.asyncio
+async def test_post_finalize_edit_prompt_returns_to_refinement_with_updated_proposal_reply():
+    engine = GradebookSessionEngine()
+    conversation = ConversationManager()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 30%, Final 45%")],
+        course_activities=[
+            CourseActivity(name="Assignment 1", module="assign", cmid=901),
+            CourseActivity(name="Midterm", module="quiz", cmid=902),
+            CourseActivity(name="Final", module="quiz", cmid=903),
+        ],
+    )
+
+    accepted = await engine.accept(session.session_id)
+    assert accepted.phase == "ACCEPTED"
+
+    finalized = await engine.finalize(
+        session.session_id,
+        confirmed_mapping=[
+            {"moodle_cmid": 901, "category": "Assignments"},
+            {"moodle_cmid": 902, "category": "Midterm"},
+            {"moodle_cmid": 903, "category": "Final Exam"},
+        ],
+    )
+    assert finalized.phase == "COMPLETED"
+
+    prompt = "Actually, change midterm to 30%"
+    edited = await engine.chat(session.session_id, prompt)
+    reply = conversation.make_reply(session=edited, proposal=edited.proposal, prompt=prompt).lower()
+
+    assert edited.phase == "REFINEMENT"
+    assert "gradebook finalized successfully" not in reply
+    assert "updated proposal" in reply
+
+
+@pytest.mark.asyncio
+async def test_post_finalize_first_edit_add_quizzes_is_applied_immediately():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 30%, Final 45%")],
+        course_activities=[
+            CourseActivity(name="Assignment 1", module="assign", cmid=901),
+            CourseActivity(name="Midterm", module="quiz", cmid=902),
+            CourseActivity(name="Final", module="quiz", cmid=903),
+        ],
+    )
+
+    session = await engine.chat(session.session_id, "remove quizzes and assign it to final exam")
+    assert all(cat.name != "Quizzes" for cat in (session.proposal.categories or []))
+
+    accepted = await engine.accept(session.session_id)
+    assert accepted.phase == "ACCEPTED"
+
+    finalized = await engine.finalize(
+        session.session_id,
+        confirmed_mapping=[
+            {"moodle_cmid": 901, "category": "Assignments"},
+            {"moodle_cmid": 902, "category": "Midterm"},
+            {"moodle_cmid": 903, "category": "Final Exam"},
+        ],
+    )
+    assert finalized.phase == "COMPLETED"
+
+    edited = await engine.chat(session.session_id, "added quizzes")
+    categories = {cat.name: cat for cat in (edited.proposal.categories or [])}
+
+    assert edited.phase == "REFINEMENT"
+    assert bool((edited.extraction or {}).get("proposal_changed")) is True
+    assert "Quizzes" in categories
+    assert categories["Quizzes"].weight == 0.0
+
+
+@pytest.mark.asyncio
+async def test_post_finalize_first_edit_aggregation_phrase_is_applied_immediately():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 30%, Final 45%")],
+        course_activities=[
+            CourseActivity(name="Assignment 1", module="assign", cmid=901),
+            CourseActivity(name="Midterm", module="quiz", cmid=902),
+            CourseActivity(name="Final", module="quiz", cmid=903),
+        ],
+    )
+
+    accepted = await engine.accept(session.session_id)
+    assert accepted.phase == "ACCEPTED"
+
+    finalized = await engine.finalize(
+        session.session_id,
+        confirmed_mapping=[
+            {"moodle_cmid": 901, "category": "Assignments"},
+            {"moodle_cmid": 902, "category": "Midterm"},
+            {"moodle_cmid": 903, "category": "Final Exam"},
+        ],
+    )
+    assert finalized.phase == "COMPLETED"
+    assert finalized.proposal.aggregation_method == 13
+
+    edited = await engine.chat(
+        session.session_id,
+        "Keep your default categories but set the aggregation method to Weighted mean of grades.",
+    )
+
+    assert edited.phase == "REFINEMENT"
+    assert bool((edited.extraction or {}).get("proposal_changed")) is True
+    assert edited.proposal.aggregation_method == 10
+    assert any(
+        "Aggregation method set to Weighted mean of grades" in note
+        for note in (edited.proposal.notes or [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_refinement_edit_invalidates_stale_content_mapping():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof-a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 30%, Final 45%")],
+        course_activities=[
+            CourseActivity(name="Assignment 1", module="assign", cmid=901),
+            CourseActivity(name="Midterm", module="quiz", cmid=902),
+            CourseActivity(name="Final", module="quiz", cmid=903),
+        ],
+    )
+
+    accepted = await engine.accept(session.session_id)
+    assert accepted.content_mapping is not None
+
+    edited = await engine.chat(session.session_id, "make quizzes 10")
+
+    assert edited.phase == "REFINEMENT"
+    assert bool((edited.extraction or {}).get("proposal_changed")) is True
+    assert edited.content_mapping is None
+
+
+@pytest.mark.asyncio
 async def test_gradebook_reset_clears_mapping_and_restores_proposal_phase():
     engine = GradebookSessionEngine()
     session = await engine.start(
@@ -258,6 +405,104 @@ async def test_gradebook_delete_removes_session_from_engine():
 
     loaded = await engine.get(session.session_id)
     assert loaded is None
+
+
+def _make_category(
+    name,
+    weight,
+    *,
+    extra_credit=False,
+    subcategories=None,
+):
+    return GradebookCategory(
+        name=name,
+        weight=weight,
+        items=[],
+        subcategories=subcategories or [],
+        extra_credit=extra_credit,
+    )
+
+
+def _make_subcategory(name, weight):
+    return GradebookSubcategory(name=name, weight=weight)
+
+
+def test_weight_validation_weighted_mean():
+    proposal = GradebookProposal(
+        categories=[
+            _make_category("Assignments", 60.0),
+            _make_category("Final Exam", 40.0),
+        ],
+        aggregation_method=10,
+    )
+    assert validate_proposal_weights(proposal) == []
+
+    proposal.categories[0].weight = 70.0
+    errors = validate_proposal_weights(proposal)
+    assert errors
+    assert errors[0]["aggregation_method"] == 10
+
+
+def test_weight_validation_simple_weighted_mean_is_enforced():
+    proposal = GradebookProposal(
+        categories=[
+            _make_category("Assignments", 99.0),
+            _make_category("Final Exam", 1.0),
+        ],
+        aggregation_method=11,
+    )
+    assert validate_proposal_weights(proposal) == []
+
+    proposal.categories[0].weight = 90.0
+    errors = validate_proposal_weights(proposal)
+    assert errors
+    assert errors[0]["aggregation_method"] == 11
+
+
+def test_weight_validation_mean_with_extra_credit_enforces_non_extra_total():
+    proposal = GradebookProposal(
+        categories=[
+            _make_category("Assignments", 100.0),
+            _make_category("Bonus", 20.0, extra_credit=True),
+        ],
+        aggregation_method=12,
+    )
+    assert validate_proposal_weights(proposal) == []
+
+    proposal.categories[0].weight = 80.0
+    errors = validate_proposal_weights(proposal)
+    assert errors
+    assert errors[0]["aggregation_method"] == 12
+
+
+def test_weight_validation_mean_and_natural_not_enforced():
+    for method in (0, 13):
+        proposal = GradebookProposal(
+            categories=[
+                _make_category("Assignments", 99.0),
+                _make_category("Final Exam", 1.0),
+            ],
+            aggregation_method=method,
+        )
+        assert validate_proposal_weights(proposal) == []
+
+
+def test_weight_validation_ignores_subcategory_split_consistency_rules():
+    proposal = GradebookProposal(
+        categories=[
+            _make_category(
+                "Assignments",
+                50.0,
+                subcategories=[
+                    _make_subcategory("Homework", 60.0),
+                    _make_subcategory("Projects", 40.0),
+                ],
+            ),
+            _make_category("Final Exam", 50.0),
+        ],
+        aggregation_method=10,
+    )
+    assert validate_proposal_weights(proposal) == []
 
 
 @pytest.mark.asyncio
@@ -349,6 +594,55 @@ async def test_gradebook_proposal_supports_no_percent_multi_updates():
     assert normalized["Final Exam"].weight == 36.0
 
 
+def test_remove_nonexistent_category_adds_note():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Homework 1", module="assign"),
+        CourseActivity(name="Lab 1", module="lab"),
+    ])
+    updated = generator.update_from_prompt(base, "remove GhostCategory")
+    assert any("not found" in n.lower() for n in (updated.notes or []))
+    assert all(cat.name != "GhostCategory" for cat in updated.categories)
+
+
+def test_remove_nonexistent_category_with_punctuation_adds_note():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Homework 1", module="assign"),
+        CourseActivity(name="Lab 1", module="lab"),
+    ])
+    updated = generator.update_from_prompt(
+        base,
+        "Remove a category that does not exist: drop GhostCategory.",
+    )
+    notes = [str(n).lower() for n in (updated.notes or [])]
+    assert any("not found" in n and "ghostcategory" in n for n in notes)
+    assert all(cat.name != "GhostCategory" for cat in updated.categories)
+
+
+def test_split_overwrites_previous_subcategories_and_notes():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Homework 1", module="assign"),
+    ])
+    # First split
+    updated1 = generator.update_from_prompt(base, "In Assignments, split into Homework 10%, Projects 15%")
+    assert len(updated1.categories[0].subcategories) == 2
+    # Overwrite split
+    updated2 = generator.update_from_prompt(
+        updated1,
+        "Keep top-level weights unchanged. In Assignments (25%), split into Homework 5%, Projects 10%, Reflection 10%.",
+    )
+    subs = updated2.categories[0].subcategories
+    names = [s.name for s in subs]
+    weights = [s.weight for s in subs]
+    assert names == ["Homework", "Projects", "Reflection"]
+    assert weights == [5.0, 10.0, 10.0]
+    # Only one effect/note for split
+    split_notes = [n for n in (updated2.notes or []) if "split into" in n]
+    assert len(split_notes) == 1
+
+
 def test_effect_topic_override_keeps_latest_split_for_same_category():
     generator = ProposalGenerator()
     base = generator.generate_initial([])
@@ -362,6 +656,20 @@ def test_effect_topic_override_keeps_latest_split_for_same_category():
     assert len(split_effects) == 1
     assert "Lab Reports 5.0%" in split_effects[0]
     assert "Pre-Lab 5.0%" in split_effects[0]
+
+
+def test_formula_effect_topic_override_handles_quoted_category_labels():
+    generator = ProposalGenerator()
+    proposal = generator.generate_initial([])
+
+    # Simulate historical quoted stored effect text format.
+    generator._append_effect_note(proposal, "Stored formula for 'Labs' (unresolved refs: [lab1])")
+    generator._append_effect_note(proposal, "Cleared formula from Labs")
+
+    effects = [n for n in (proposal.notes or []) if str(n).startswith("Effect:")]
+    labs_effects = [e for e in effects if "formula" in e.lower() and "labs" in e.lower()]
+    assert len(labs_effects) == 1
+    assert "Cleared formula from Labs" in labs_effects[0]
 
 
 @pytest.mark.asyncio
@@ -383,21 +691,92 @@ async def test_gradebook_proposal_regex_alias_phrases_map_to_existing_categories
 
 
 @pytest.mark.asyncio
+async def test_gradebook_proposal_remove_category_frees_weight_by_default():
+    """Mode 1: bare remove/drop frees weight; total decreases."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    # Assignments starts at 25%
+    assignments_weight = next(c.weight for c in base.categories if c.name == "Assignments")
+
+    updated = generator.update_from_prompt(base, "remove assignments")
+
+    names = {cat.name for cat in updated.categories}
+    assert "Assignments" not in names
+    expected_total = sum(c.weight for c in base.categories) - assignments_weight
+    assert sum(cat.weight for cat in updated.categories) == pytest.approx(expected_total)
+    assert any("freed" in n.lower() for n in (updated.notes or []))
+
+
+@pytest.mark.asyncio
+async def test_gradebook_proposal_remove_category_distributes_evenly():
+    """Mode 2: 'remove X evenly' redistributes freed weight to remaining categories."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    assignments_weight = next(c.weight for c in base.categories if c.name == "Assignments")
+    original_total = sum(c.weight for c in base.categories)
+
+    updated = generator.update_from_prompt(base, "remove assignments evenly")
+
+    names = {cat.name for cat in updated.categories}
+    assert "Assignments" not in names
+    assert sum(cat.weight for cat in updated.categories) == pytest.approx(original_total)
+    assert any("evenly" in n.lower() for n in (updated.notes or []))
+
+
+@pytest.mark.asyncio
+async def test_gradebook_proposal_remove_category_assigns_weight_to_target():
+    """Mode 3: 'remove X and give to Y' transfers freed weight to Y."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    assignments_weight = next(c.weight for c in base.categories if c.name == "Assignments")
+    labs_weight_before = next(c.weight for c in base.categories if c.name == "Labs")
+
+    updated = generator.update_from_prompt(base, "remove assignments and give weight to labs")
+
+    names = {cat.name: cat for cat in updated.categories}
+    assert "Assignments" not in names
+    assert names["Labs"].weight == pytest.approx(labs_weight_before + assignments_weight)
+    assert any("labs" in n.lower() for n in (updated.notes or []))
+
+
+@pytest.mark.asyncio
+async def test_gradebook_proposal_remove_and_assign_to_multiple_targets():
+    """Mode 3: weight split evenly across two specified targets."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    assignments_weight = next(c.weight for c in base.categories if c.name == "Assignments")
+    labs_before = next(c.weight for c in base.categories if c.name == "Labs")
+    midterm_before = next(c.weight for c in base.categories if c.name == "Midterm")
+
+    updated = generator.update_from_prompt(
+        base,
+        "remove assignments and give weight to labs and midterm",
+    )
+
+    names = {cat.name: cat for cat in updated.categories}
+    assert "Assignments" not in names
+    share = assignments_weight / 2
+    assert names["Labs"].weight == pytest.approx(labs_before + share)
+    assert names["Midterm"].weight == pytest.approx(midterm_before + share)
+
+
+@pytest.mark.asyncio
 async def test_gradebook_proposal_remove_category_rebalances_weights():
+    """Legacy test kept: bare remove still works (mode 1 — frees weight)."""
     generator = ProposalGenerator()
     base_proposal = generator.generate_initial([
         CourseActivity(name="Homework 1", module="assign"),
         CourseActivity(name="Lab 1", module="lab"),
     ])
+    assignments_weight = next(c.weight for c in base_proposal.categories if c.name == "Assignments")
+    original_total = sum(c.weight for c in base_proposal.categories)
 
-    updated = generator.update_from_prompt(
-        base_proposal,
-        "remove assignments",
-    )
+    updated = generator.update_from_prompt(base_proposal, "remove assignments")
 
     names = {cat.name for cat in updated.categories}
     assert "Assignments" not in names
-    assert sum(cat.weight for cat in updated.categories) == pytest.approx(100.0)
+    # Mode 1: weight freed, total decreases
+    assert sum(cat.weight for cat in updated.categories) == pytest.approx(original_total - assignments_weight)
 
 
 @pytest.mark.asyncio
@@ -423,6 +802,69 @@ async def test_gradebook_chat_updates_proposal_from_prompt():
     assert "Homework" not in normalized
     assert "Projects" not in normalized
     assert any("internal allocation" in note.lower() for note in (chat.proposal.notes or []))
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_help_prompt_does_not_mutate_proposal():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1001",
+        professor_id="prof_help",
+        bot_name="eecs-help-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    session.phase = "REFINEMENT"
+    await engine._save_session(session)
+
+    before = session.proposal.model_dump() if session.proposal else None
+    updated = await engine.chat(session.session_id, "help")
+
+    assert updated.proposal is not None
+    assert updated.proposal.model_dump() == before
+    assert bool((updated.extraction or {}).get("proposal_changed")) is False
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_question_prompt_does_not_mutate_proposal():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1002",
+        professor_id="prof_q",
+        bot_name="eecs-q-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    session.phase = "REFINEMENT"
+    await engine._save_session(session)
+
+    before = session.proposal.model_dump() if session.proposal else None
+    updated = await engine.chat(session.session_id, "what aggregation method we support?")
+
+    assert updated.proposal is not None
+    assert updated.proposal.model_dump() == before
+    assert bool((updated.extraction or {}).get("proposal_changed")) is False
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_unsupported_prompt_does_not_mutate_proposal():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1003",
+        professor_id="prof_offtopic",
+        bot_name="eecs-offtopic-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+    session.phase = "REFINEMENT"
+    await engine._save_session(session)
+
+    before = session.proposal.model_dump() if session.proposal else None
+    updated = await engine.chat(session.session_id, "fafavc")
+
+    assert updated.proposal is not None
+    assert updated.proposal.model_dump() == before
+    assert bool((updated.extraction or {}).get("proposal_changed")) is False
 
 
 @pytest.mark.asyncio
@@ -477,6 +919,7 @@ async def test_gradebook_proposal_supports_env_alias_json(monkeypatch):
 def test_notes_do_not_accumulate_across_turns():
     generator = ProposalGenerator()
     base = generator.generate_initial([])
+    base.aggregation_method = 10
 
     p1 = generator.update_from_prompt(base, "set Assignments to 40% and Final Exam to 40%")
     weight_notes_p1 = [n for n in p1.notes if n.lower().startswith("weight check:")]
@@ -485,6 +928,101 @@ def test_notes_do_not_accumulate_across_turns():
     p2 = generator.update_from_prompt(p1, "set Assignments to 35%")
     weight_notes_p2 = [n for n in p2.notes if n.lower().startswith("weight check:")]
     assert len(weight_notes_p2) == 1, "Second update must not accumulate old weight-check notes"
+
+
+def test_weight_warning_for_weighted_mean_when_total_not_100():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    base.aggregation_method = 10
+
+    updated = generator.update_from_prompt(base, "set Assignments to 40% and Final Exam to 40%")
+    weight_notes = [n for n in (updated.notes or []) if str(n).lower().startswith("weight check:")]
+    assert len(weight_notes) == 1
+
+
+def test_no_weight_warning_for_weighted_mean_when_total_is_100():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    base.aggregation_method = 10
+
+    updated = generator.update_from_prompt(
+        base,
+        "set Assignments to 25%, Labs to 15%, Midterm to 30%, Final Exam to 30%",
+    )
+    weight_notes = [n for n in (updated.notes or []) if str(n).lower().startswith("weight check:")]
+    assert not weight_notes
+
+
+def test_no_weight_warning_for_natural_method_when_total_not_100():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    base.aggregation_method = 13
+
+    updated = generator.update_from_prompt(base, "set Assignments to 40% and Final Exam to 40%")
+    weight_notes = [n for n in (updated.notes or []) if str(n).lower().startswith("weight check:")]
+    assert not weight_notes
+
+
+def test_weight_warning_for_simple_weighted_mean_when_total_not_100():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    base.aggregation_method = 11
+
+    updated = generator.update_from_prompt(base, "set Assignments to 40% and Final Exam to 40%")
+    weight_notes = [n for n in (updated.notes or []) if str(n).lower().startswith("weight check:")]
+    assert len(weight_notes) == 1
+
+
+def test_no_weight_warning_for_mean_with_extra_credits_when_non_extra_total_is_100():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            _make_category("Assignments", 100.0),
+            _make_category("Bonus", 20.0, extra_credit=True),
+        ],
+        aggregation_method=12,
+    )
+
+    updated = generator.update_from_prompt(base, "show proposal")
+    weight_notes = [n for n in (updated.notes or []) if str(n).lower().startswith("weight check:")]
+    assert not weight_notes
+
+
+def test_weight_warning_for_mean_with_extra_credits_when_non_extra_total_not_100():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    base.aggregation_method = 12
+
+    updated = generator.update_from_prompt(base, "set Assignments to 40% and Final Exam to 40%")
+    weight_notes = [n for n in (updated.notes or []) if str(n).lower().startswith("weight check:")]
+    assert len(weight_notes) == 1
+
+
+def test_conversation_zero_weight_category_is_not_marked_invalid():
+    cm = ConversationManager()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=100.0),
+            GradebookCategory(name="Quizzes", weight=0.0),
+        ],
+        aggregation_method=13,
+    )
+    issues = cm.validate_weights(proposal)
+    assert not any("invalid weight" in issue.lower() for issue in issues)
+
+
+def test_add_category_without_explicit_weight_defaults_to_zero():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Midterm Exam", module="quiz"),
+        CourseActivity(name="Final Exam", module="quiz"),
+    ])
+
+    step = generator.update_from_prompt(base, "added quizzes")
+
+    by_name = {cat.name: cat for cat in step.categories}
+    assert "Quizzes" in by_name
+    assert abs(by_name["Quizzes"].weight - 0.0) < 1e-6
 
 
 # --- Aggregation Method Tests ---
@@ -590,6 +1128,21 @@ def test_proposal_drop_lowest_parsed_from_prompt():
     assert by_name["Assignments"].drop_lowest == 2
 
 
+def test_generate_initial_adds_quizzes_category_for_quiz_activities():
+    generator = ProposalGenerator()
+
+    proposal = generator.generate_initial([
+        CourseActivity(name="Knowledge Check 1", module="quiz"),
+        CourseActivity(name="Quiz 2", module="quiz"),
+    ])
+
+    by_name = {c.name: c for c in proposal.categories}
+
+    assert "Quizzes" in by_name
+    assert by_name["Quizzes"].weight == 0.0
+    assert by_name["Quizzes"].items == ["Knowledge Check 1", "Quiz 2"]
+
+
 def test_proposal_drop_lowest_per_category():
     generator = ProposalGenerator()
     base = generator.generate_initial([])
@@ -692,6 +1245,258 @@ def test_invalid_formula_adds_validation_note():
     )
 
     assert any("Formula ignored:" in note for note in (updated.notes or []))
+
+
+def test_formula_resolver_direct_match_uses_grade_item_id():
+    activities = [
+        CourseActivity(name="Homework 1", module="assign", cmid=10, grade_item_id=334),
+        CourseActivity(name="Homework 2", module="assign", cmid=11, grade_item_id=335),
+    ]
+
+    resolved, unresolved, suggestions = FormulaResolver.resolve_formula(
+        formula="=average([[hw1]],[[hw2]])",
+        activities=activities,
+    )
+
+    assert unresolved == []
+    assert suggestions == {}
+    assert resolved == "=average([[334]],[[335]])"
+
+
+def test_formula_resolver_returns_unresolved_with_suggestions():
+    activities = [
+        CourseActivity(name="Homework 1", module="assign", cmid=10, grade_item_id=334),
+        CourseActivity(name="Final Exam", module="quiz", cmid=12, grade_item_id=501),
+    ]
+
+    resolved, unresolved, suggestions = FormulaResolver.resolve_formula(
+        formula="=average([[ghost_hw]],[[final]])",
+        activities=activities,
+    )
+
+    assert "ghost_hw" in unresolved
+    assert "final" not in unresolved
+    assert "[[501]]" in resolved
+    assert suggestions.get("ghost_hw") is not None
+
+
+def test_formula_resolver_maps_hw_alias_to_assignment_numbered_item():
+    activities = [
+        CourseActivity(name="Assignment1", module="assign", cmid=20, grade_item_id=420),
+    ]
+
+    resolved, unresolved, suggestions = FormulaResolver.resolve_formula(
+        formula="=round([[hw1]],2)",
+        activities=activities,
+    )
+
+    assert unresolved == []
+    assert suggestions == {}
+    assert "[[420]]" in resolved
+
+
+def test_formula_resolver_supports_activity_and_manual_grade_items():
+    activities = [
+        CourseActivity(name="Homework 1", module="assign", cmid=10, grade_item_id=334, itemtype="mod"),
+        CourseActivity(name="Participation Bonus", module=None, cmid=None, grade_item_id=777, itemtype="manual"),
+    ]
+
+    resolved, unresolved, suggestions = FormulaResolver.resolve_formula(
+        formula="=round(([[hw1]]*0.9)+([[participationbonus]]*0.1),2)",
+        activities=activities,
+    )
+
+    assert unresolved == []
+    assert suggestions == {}
+    assert "[[334]]" in resolved
+    assert "[[777]]" in resolved
+
+
+def test_formula_resolver_accepts_category_name_refs_when_activity_ids_missing():
+    activities = [
+        CourseActivity(name="Homework 1", module="assign", cmid=10, grade_item_id=334),
+    ]
+
+    resolved, unresolved, suggestions = FormulaResolver.resolve_formula(
+        formula="=if([[midterm]]>[[final]],[[midterm]],[[final]])",
+        activities=activities,
+        category_names=["Assignments", "Labs", "Midterm", "Final Exam"],
+    )
+
+    assert unresolved == []
+    assert suggestions == {}
+    assert "[[midterm]]" in resolved
+    assert "[[final]]" in resolved
+
+
+@pytest.mark.asyncio
+async def test_proposal_formula_midterm_final_refs_are_not_marked_unresolved():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_formula_category_refs",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 30%, Final 30%")],
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign", cmid=101, grade_item_id=334),
+        ],
+    )
+
+    updated = await engine.chat(
+        session.session_id,
+        "=if([[midterm]]>[[final]],[[midterm]],[[final]])",
+    )
+    by_name = {cat.name: cat for cat in (updated.proposal.categories if updated.proposal else [])}
+
+    assert "Midterm" in by_name
+    assert by_name["Midterm"].formula_unresolved_refs == []
+    assert not any("unresolved formula refs [midterm], [final]" in str(n).lower() for n in (updated.proposal.notes or []))
+
+
+def test_formula_error_reply_ignores_stale_unresolved_refs_when_parse_fails():
+    cm = ConversationManager()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=25.0, items=[]),
+            GradebookCategory(name="Labs", weight=25.0, items=[], formula_unresolved_refs=["lab1", "lab2"]),
+        ],
+        notes=[
+            "Effect: Stored formula for 'Labs' (unresolved refs: [lab1], [lab2]).",
+            "Formula ignored: Unsupported function 'vlookup'. Supported functions include: sum, average, max, min, if, round, mod, pi, power.",
+        ],
+    )
+
+    reply = cm._formula_error_reply(proposal)
+    assert "unsupported function 'vlookup'" in reply.lower()
+    assert "labs: unresolved formula refs" not in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_proposal_formula_tracks_unresolved_references():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_formula",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign", cmid=101, grade_item_id=334),
+        ],
+    )
+
+    updated = await engine.chat(session.session_id, "Set Assignments formula to =average([[hw1]],[[ghost]])")
+    by_name = {cat.name: cat for cat in (updated.proposal.categories if updated.proposal else [])}
+
+    assert "Assignments" in by_name
+    assert by_name["Assignments"].formula_unresolved_refs == ["ghost"]
+    assert any("unresolved references" in str(n).lower() for n in (updated.proposal.notes or []))
+    assert any("Stored formula for 'Assignments'" in str(n) for n in (updated.proposal.notes or []))
+
+
+@pytest.mark.asyncio
+async def test_accept_blocks_when_formula_has_unresolved_refs():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_accept",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign", cmid=101, grade_item_id=334),
+        ],
+    )
+
+    await engine.chat(session.session_id, "Set Assignments formula to =average([[unknown_ref]],[[hw1]])")
+    accepted = await engine.accept(session.session_id)
+
+    assert accepted.phase == "REFINEMENT"
+    validation = (accepted.content_mapping or {}).get("validation") or {}
+    assert validation.get("can_proceed") is False
+    assert any("unresolved" in err.lower() for err in (validation.get("errors") or []))
+
+
+@pytest.mark.asyncio
+async def test_finalize_stays_in_refinement_when_formula_refs_are_unresolved():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_finalize_guard",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign", cmid=101, grade_item_id=334),
+        ],
+    )
+
+    await engine.chat(session.session_id, "Set Assignments formula to =average([[unknown_ref]],[[hw1]])")
+    finalized = await engine.finalize(
+        session.session_id,
+        confirmed_mapping=[{"moodle_cmid": 101, "category": "Assignments"}],
+    )
+
+    assert finalized.phase == "REFINEMENT"
+    validation = (finalized.content_mapping or {}).get("validation") or {}
+    assert validation.get("can_proceed") is False
+    assert any("unresolved" in err.lower() for err in (validation.get("errors") or []))
+
+
+@pytest.mark.asyncio
+async def test_accept_warns_for_empty_categories_without_blocking():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_empty",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+
+    accepted = await engine.accept(session.session_id)
+    validation = (accepted.content_mapping or {}).get("validation") or {}
+
+    assert accepted.phase == "ACCEPTED"
+    assert validation.get("can_proceed") is True
+    assert any("zero items" in w.lower() for w in (validation.get("warnings") or []))
+
+
+def test_content_mapper_validate_mapping_detects_stale_categories():
+    mapper = ContentMapper()
+    proposal = GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)])
+    mapping_rows = [
+        {
+            "moodle_cmid": 10,
+            "activity_name": "Quiz 1",
+            "suggested_category": "Quizzes",
+            "confirmed_category": "Quizzes",
+        }
+    ]
+
+    issues = mapper.validate_mapping(mapping_rows, proposal)
+
+    assert len(issues) == 1
+    assert issues[0]["missing_category"] == "Quizzes"
+
+
+def test_formula_error_reply_deduplicates_unresolved_warning_lines():
+    cm = ConversationManager()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=100.0,
+                calculation_formula="=average([[ghost]],[[hw1]])",
+                formula_item_refs=["ghost", "hw1"],
+                formula_unresolved_refs=["ghost"],
+            )
+        ],
+        notes=[
+            "Formula warning: unresolved references [ghost].",
+            "Formula warning: unresolved references [ghost].",
+        ],
+    )
+
+    text = cm._formula_error_reply(proposal)
+    assert text.lower().count("unresolved formula refs") == 1
 
 
 def test_format_categories_includes_formula_setting():
@@ -849,6 +1654,7 @@ def test_conversation_formula_error_returns_friendly_warning_instead_of_proposal
         professor_id="p1",
         bot_name="b1",
         phase="REFINEMENT",
+        extraction={"proposal_changed": True},
         proposal=GradebookProposal(
             categories=[GradebookCategory(name="Midterm", weight=100.0)],
             notes=["Formula ignored: Missing closing parenthesis in formula."],
@@ -866,6 +1672,57 @@ def test_conversation_formula_error_returns_friendly_warning_instead_of_proposal
     assert "retry" in reply.lower()
     assert "lthelp.yorku.ca/gradebook/creating-a-custom-formula" in reply.lower()
     assert "support.microsoft.com/excel" in reply.lower()
+
+
+def test_conversation_does_not_repeat_formula_error_when_prompt_is_unrelated():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s5c",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        extraction={"proposal_changed": False},
+        proposal=GradebookProposal(
+            categories=[GradebookCategory(name="Assignments", weight=100.0, formula_unresolved_refs=["project"])],
+            notes=["Formula warning: unresolved references [project]."],
+        ),
+    )
+
+    reply = cm.make_reply(
+        session,
+        session.proposal,
+        prompt="give me a proposal",
+    )
+
+    assert "saved the formula" not in reply.lower()
+    assert "please fix these references to fully apply it" not in reply.lower()
+    assert "updated proposal" in reply.lower()
+
+
+def test_conversation_does_not_repeat_formula_error_when_formula_unchanged():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s5d",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        extraction={"proposal_changed": False},
+        proposal=GradebookProposal(
+            categories=[GradebookCategory(name="Assignments", weight=100.0, formula_unresolved_refs=["project"])],
+            notes=["Formula warning: unresolved references [project]."],
+        ),
+    )
+
+    reply = cm.make_reply(
+        session,
+        session.proposal,
+        prompt="Use this formula for grade calculation: =average([[hw1]],[[project]])",
+    )
+
+    assert "saved the formula" not in reply.lower()
+    assert "updated proposal" in reply.lower()
 
 
 def test_formula_if_expression_is_parsed_without_truncation():
@@ -898,6 +1755,23 @@ def test_clear_formula_from_category_removes_formula_settings():
     assert by_name["Labs"].calculation_formula is None
     assert by_name["Labs"].formula_item_refs == []
     assert any("Cleared formula from Labs" in n for n in (cleared.notes or []))
+
+
+def test_clear_named_category_formula_phrase_only_clears_that_category():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    with_final = generator.update_from_prompt(base, "Set Final Exam formula to =average([[final_theory]],[[final_practical]])")
+    with_both = generator.update_from_prompt(with_final, "Set Midterm formula to =if([[midterm]]>[[final]],[[midterm]],[[final]])")
+    cleared = generator.update_from_prompt(with_both, "clear final exam formula")
+
+    by_name = {c.name: c for c in cleared.categories}
+    assert by_name["Final Exam"].calculation_formula is None
+    assert by_name["Midterm"].calculation_formula is not None
+
+    effects = [n for n in (cleared.notes or []) if str(n).startswith("Effect:")]
+    assert any("Cleared formula from Final Exam" in n for n in effects)
+    assert not any("Cleared formula from Midterm" in n for n in effects)
 
 
 def test_formula_effects_properly_deduplicate_on_clear():
@@ -1483,6 +2357,210 @@ async def test_content_mapper_falls_back_when_llm_fails():
 
 
 @pytest.mark.asyncio
+async def test_content_mapper_llm_call_includes_chat_id():
+    """Ensure ensure_dialog is called before chat, and chat receives the required chat_id."""
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(return_value={
+        "agent_response": {
+            "chat_response": {
+                "message": {
+                    "content": '[{"moodle_cmid": 301, "category": "Quizzes", "confidence": 0.9, "reasoning": "quiz module"}]'
+                }
+            }
+        }
+    })
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    proposal = ProposalGenerator().generate_initial([])
+    await mapper.build_mapping(
+        course_activities=[
+            CourseActivity(name="Knowledge Check 1", module="quiz", cmid=301),
+        ],
+        proposal=proposal,
+    )
+
+    sdk.agents.azure.chat.assert_called_once()
+    sdk.agents.azure.ensure_dialog.assert_called_once()
+    ensure_dialog_kwargs = sdk.agents.azure.ensure_dialog.call_args[1]
+    ensured_chat_id = ensure_dialog_kwargs.get("chat_id")
+    assert isinstance(ensured_chat_id, str)
+    assert ensured_chat_id.startswith("gradebook-mapper-")
+    _, call_kwargs = sdk.agents.azure.chat.call_args
+    agent_config = call_kwargs.get("agent_config") or sdk.agents.azure.chat.call_args[1].get("agent_config")
+    assert "chat_id" in agent_config, "agent_config must include chat_id"
+    assert agent_config["chat_id"] == ensured_chat_id
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_retries_with_new_chat_id_on_chat_ownership_conflict():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(side_effect=[
+        RuntimeError("Ragflow API validation error: You don't own the chat gradebook-mapper-deadbeef"),
+        {
+            "agent_response": {
+                "chat_response": {
+                    "message": {
+                        "content": '[{"moodle_cmid": 301, "category": "Assignments", "confidence": 0.9, "reasoning": "name match"}]'
+                    }
+                }
+            }
+        },
+    ])
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    result = await mapper._llm_assignments(
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=301)],
+        category_names=["Assignments"],
+    )
+
+    assert result[301]["category"] == "Assignments"
+    assert sdk.agents.azure.chat.await_count == 2
+    assert sdk.agents.azure.ensure_dialog.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_keeps_chat_id_on_all_retries_after_ownership_conflict():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(side_effect=[
+        RuntimeError("Ragflow API validation error: You don't own the chat gradebook-mapper-deadbeef"),
+        RuntimeError("Ragflow API validation error: You don't own the chat gradebook-mapper-badf00d"),
+        {
+            "agent_response": {
+                "chat_response": {
+                    "message": {
+                        "content": '[{"moodle_cmid": 301, "category": "Assignments", "confidence": 0.9, "reasoning": "name match"}]'
+                    }
+                }
+            }
+        },
+    ])
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    result = await mapper._llm_assignments(
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=301)],
+        category_names=["Assignments"],
+    )
+
+    assert result[301]["category"] == "Assignments"
+    assert sdk.agents.azure.chat.await_count == 3
+    assert sdk.agents.azure.ensure_dialog.await_count == 3
+
+    for call in sdk.agents.azure.chat.await_args_list:
+        agent_config = call.kwargs.get("agent_config") or {}
+        assert "chat_id" in agent_config
+        assert isinstance(agent_config.get("chat_id"), str)
+        assert agent_config.get("chat_id").startswith("gradebook-mapper-")
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_reuses_preferred_chat_id_on_first_attempt():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(return_value={
+        "agent_response": {
+            "chat_response": {
+                "message": {
+                    "content": '[{"moodle_cmid": 301, "category": "Assignments", "confidence": 0.9, "reasoning": "name match"}]'
+                }
+            }
+        }
+    })
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    result, resolved_chat_id = await mapper._llm_assignments(
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=301)],
+        category_names=["Assignments"],
+        preferred_chat_id="gradebook-mapper-session123",
+        return_chat_id=True,
+    )
+
+    assert result[301]["category"] == "Assignments"
+    assert resolved_chat_id == "gradebook-mapper-session123"
+
+    ensure_call_kwargs = sdk.agents.azure.ensure_dialog.await_args_list[0].kwargs
+    assert ensure_call_kwargs.get("chat_id") == "gradebook-mapper-session123"
+
+    chat_call_kwargs = sdk.agents.azure.chat.await_args_list[0].kwargs
+    assert (chat_call_kwargs.get("agent_config") or {}).get("chat_id") == "gradebook-mapper-session123"
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_rotates_chat_id_after_ownership_conflict_when_preferred_used():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(side_effect=[
+        RuntimeError("Ragflow API validation error: You don't own the chat gradebook-mapper-session123"),
+        {
+            "agent_response": {
+                "chat_response": {
+                    "message": {
+                        "content": '[{"moodle_cmid": 301, "category": "Assignments", "confidence": 0.9, "reasoning": "name match"}]'
+                    }
+                }
+            }
+        },
+    ])
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    result, resolved_chat_id = await mapper._llm_assignments(
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=301)],
+        category_names=["Assignments"],
+        preferred_chat_id="gradebook-mapper-session123",
+        return_chat_id=True,
+    )
+
+    assert result[301]["category"] == "Assignments"
+    assert isinstance(resolved_chat_id, str)
+    assert resolved_chat_id.startswith("gradebook-mapper-")
+    assert resolved_chat_id != "gradebook-mapper-session123"
+
+
+@pytest.mark.asyncio
+async def test_accept_persists_mapper_chat_id_in_session_extraction():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(return_value={
+        "agent_response": {
+            "chat_response": {
+                "message": {
+                    "content": '[{"moodle_cmid": 501, "category": "Assignments", "confidence": 0.9, "reasoning": "assign module"}]'
+                }
+            }
+        }
+    })
+
+    engine = GradebookSessionEngine(criadex=sdk, mapping_llm_model_id="gpt-3.5-turbo")
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Unknown Item", module="other", cmid=501)],
+    )
+
+    accepted = await engine.accept(session.session_id)
+    persisted_chat_id = str((accepted.extraction or {}).get("llm_mapper_chat_id") or "")
+
+    assert accepted.phase in {"ACCEPTED", "REFINEMENT"}
+    assert persisted_chat_id.startswith("gradebook-mapper-")
+
+
+@pytest.mark.asyncio
 async def test_gradebook_get_returns_none_for_expired_active_session():
     engine = GradebookSessionEngine()
     engine._session_expire_seconds = 1
@@ -1993,3 +3071,332 @@ async def test_mapper_ignores_assignment_only_proposal_items_bias():
     assert graded[0]["suggested_category"] == "Assignments"
     assert graded[1]["suggested_category"] != "Assignments"
     assert graded[2]["suggested_category"] != "Assignments"
+
+def test_delete_category_basic():
+    """Test basic delete without explicit target - should redistribute equally."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    
+    updated = generator.update_from_prompt(base, "delete labs and give weight to midterm")
+    by_name = {c.name: c for c in updated.categories}
+    
+    # Midterm should have gained the labs weight
+    assert "Labs" not in by_name, "Labs category should be deleted"
+    assert by_name["Midterm"].weight == 30.0 + 15.0, "Midterm should have gained Labs' weight"
+
+
+def test_delete_category_redistribute_equally():
+    """Test delete with no explicit targets - weight is freed (mode 1, total decreases)."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    final_weight = next(c.weight for c in base.categories if c.name == "Final Exam")
+    original_total = sum(c.weight for c in base.categories)
+
+    updated = generator.update_from_prompt(base, "remove Final Exam")
+    by_name = {c.name: c for c in updated.categories}
+
+    assert "Final Exam" not in by_name, "Final Exam should be deleted"
+    # Mode 1: freed weight — total decreases by the removed category's weight
+    assert abs(sum(c.weight for c in updated.categories) - (original_total - final_weight)) < 0.1
+
+
+def test_delete_category_single_target():
+    """Test delete with single explicit target."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    
+    updated = generator.update_from_prompt(base, "drop labs and give weight to assignments")
+    by_name = {c.name: c for c in updated.categories}
+    
+    assert "Labs" not in by_name, "Labs should be deleted"
+    assert by_name["Assignments"].weight == 25.0 + 15.0, "Assignments should gain Labs' weight"
+    assert abs(sum(c.weight for c in updated.categories) - 100.0) < 0.1, "Total should still be 100%"
+
+
+def test_delete_category_multiple_targets():
+    """Test delete with multiple explicit targets - should split weight."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    
+    updated = generator.update_from_prompt(
+        base,
+        "remove midterm and split weight among assignments and labs"
+    )
+    by_name = {c.name: c for c in updated.categories}
+    
+    assert "Midterm" not in by_name, "Midterm should be deleted"
+    # 30% of midterm should be split between 2 targets = 15% each
+    assert abs(by_name["Assignments"].weight - (25.0 + 15.0)) < 0.1
+    assert abs(by_name["Labs"].weight - (15.0 + 15.0)) < 0.1
+    assert abs(sum(c.weight for c in updated.categories) - 100.0) < 0.1
+
+
+def test_delete_category_pattern_variations():
+    """Test various natural language patterns for deletion."""
+    generator = ProposalGenerator()
+    patterns = [
+        "remove quiz",
+        "delete quiz",
+        "drop quiz",
+        "remove the quiz",
+        "delete the quiz",
+        "drop the Quizzes category",
+    ]
+    
+    for pattern in patterns:
+        base = generator.generate_initial([])
+        updated = generator.update_from_prompt(base, pattern)
+        by_name = {c.name: c for c in updated.categories}
+        assert "Quizzes" not in by_name, f"Pattern '{pattern}' should delete Quizzes"
+
+
+def test_delete_category_with_redistribution_syntax():
+    """Test various patterns for specifying redistribution targets (mode 3)."""
+    generator = ProposalGenerator()
+    patterns = [
+        "remove labs and give weight to assignments",
+        "delete labs and redistribute to assignments",
+        "drop labs and split among assignments",
+        "remove labs and split weight among assignments and midterm",
+    ]
+    
+    for pattern in patterns:
+        base = generator.generate_initial([])
+        updated = generator.update_from_prompt(base, pattern)
+        by_name = {c.name: c for c in updated.categories}
+        assert "Labs" not in by_name, f"Pattern '{pattern}' should delete Labs"
+        # At least one target should have gained weight
+        assert by_name["Assignments"].weight > 25.0 or by_name["Midterm"].weight > 30.0
+
+
+def test_delete_non_existent_category():
+    """Test that deleting non-existent category doesn't break proposal."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    original_count = len(base.categories)
+    
+    updated = generator.update_from_prompt(base, "delete NonExistentCategory")
+    
+    # Should not change anything
+    assert len(updated.categories) == original_count, "Non-existent category delete should be ignored"
+    assert abs(sum(c.weight for c in updated.categories) - 100.0) < 0.1, "Total should remain 100%"
+
+
+def test_delete_preserves_other_settings():
+    """Test that delete doesn't affect category settings (formulas, hidden, etc)."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    
+    # Set some properties on assignments
+    with_props = generator.update_from_prompt(base, "set Assignments formula to =average([[hw1]],[[hw2]])")
+    with_props = generator.update_from_prompt(with_props, "hide midterm")
+    
+    # Now delete final exam
+    updated = generator.update_from_prompt(with_props, "drop final exam")
+    by_name = {c.name: c for c in updated.categories}
+    
+    # Check properties are preserved
+    assert by_name["Assignments"].calculation_formula is not None, "Formula should be preserved"
+    assert by_name["Midterm"].hidden is True, "Hidden property should be preserved"
+
+
+def test_delete_creates_effect_note():
+    """Test that delete operation creates effect note in proposal."""
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    
+    updated = generator.update_from_prompt(base, "drop labs and give weight to assignments")
+    
+    effect_notes = [n for n in (updated.notes or []) if "Removed" in n or "distributed" in n.lower()]
+    assert len(effect_notes) > 0, "Delete should create effect note"
+
+@pytest.mark.asyncio
+async def test_session_tracks_uploaded_documents():
+    """Test that session tracks document IDs uploaded in it."""
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="DOC-TEST-001",
+        professor_id="prof_doc",
+        bot_name="doc-test-bot",
+        moodle_resources=[MoodleResource(name="Syllabus.pdf", content_preview="Course info")],
+        course_activities=[CourseActivity(name="Quiz 1", module="quiz")],
+    )
+    
+    # Session should have empty uploaded_document_ids initially
+    assert hasattr(session, 'uploaded_document_ids'), "Session should have uploaded_document_ids field"
+    assert isinstance(session.uploaded_document_ids, list), "uploaded_document_ids should be a list"
+    assert len(session.uploaded_document_ids) == 0, "Should start empty"
+
+
+@pytest.mark.asyncio
+async def test_session_delete_cleans_uploaded_documents():
+    """Test that deleting session also cleans up tracked documents."""
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="DOC-TEST-002",
+        professor_id="prof_doc",
+        bot_name="doc-test-bot-2",
+        moodle_resources=[MoodleResource(name="Syllabus.pdf", content_preview="Course info")],
+        course_activities=[CourseActivity(name="Quiz 1", module="quiz")],
+    )
+    
+    session_id = session.session_id
+    
+    # Simulate document upload by adding document IDs to the session
+    session.uploaded_document_ids = ["doc-uploaded-session-1", "doc-uploaded-session-2"]
+    
+    # Delete the session
+    result = await engine.delete(session_id)
+    
+    assert result['success'] is True, "Session deletion should succeed"
+    assert "message" in result, "Response should have message"
+
+
+@pytest.mark.asyncio
+async def test_session_delete_gracefully_handles_missing_documents():
+    """Test that session deletion doesn't fail if documents can't be deleted."""
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="DOC-TEST-003",
+        professor_id="prof_doc",
+        bot_name="doc-test-bot-3",
+        moodle_resources=[MoodleResource(name="Syllabus.pdf")],
+        course_activities=[],
+    )
+    
+    session_id = session.session_id
+    
+    # Add non-existent document IDs
+    session.uploaded_document_ids = ["non-existent-doc-123"]
+    
+    # Delete should still succeed even if documents don't exist
+    result = await engine.delete(session_id)
+    
+    assert result['success'] is True, "Session deletion should succeed even with missing documents"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_delete_in_conversation_flow():
+    """Test delete/redistribute commands in full gradebook conversation."""
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="DELETE-FLOW-001",
+        professor_id="prof_delete",
+        bot_name="delete-bot",
+        moodle_resources=[MoodleResource(name="Syllabus.pdf", content_preview="Assignments 25%, Quiz 15%")],
+        course_activities=[
+            CourseActivity(name="Homework", module="assign"),
+            CourseActivity(name="Quiz", module="quiz"),
+            CourseActivity(name="Midterm", module="quiz"),
+        ],
+    )
+    
+    # Initial proposal should have default categories
+    updated = await engine.chat(session.session_id, "create proposal")
+    by_name = {c.name: c for c in (updated.proposal.categories if updated.proposal else [])}
+    initial_cat_count = len(by_name)
+    
+    # Delete a category and redistribute
+    updated = await engine.chat(session.session_id, "remove Labs and give weight to Assignments")
+    by_name = {c.name: c for c in (updated.proposal.categories if updated.proposal else [])}
+    
+    assert "Labs" not in by_name, "Labs should be deleted"
+    assert len(by_name) < initial_cat_count, "Category count should decrease"
+    assert abs(sum(c.weight for c in updated.proposal.categories) - 100.0) < 0.1
+
+
+@pytest.mark.asyncio
+async def test_delete_multiple_times_in_session():
+    """Test multiple delete operations in same session."""
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="MULTI-DELETE-001",
+        professor_id="prof_multi",
+        bot_name="multi-delete-bot",
+        moodle_resources=[MoodleResource(name="Syllabus.pdf")],
+        course_activities=[],
+    )
+    
+    # First delete
+    updated = await engine.chat(session.session_id, "drop quizzes")
+    by_name = {c.name: c for c in (updated.proposal.categories if updated.proposal else [])}
+    assert "Quizzes" not in by_name
+    
+    # Second delete
+    updated = await engine.chat(session.session_id, "and also remove labs")
+    by_name = {c.name: c for c in (updated.proposal.categories if updated.proposal else [])}
+    assert "Labs" not in by_name
+    # Mode 1 (default): each bare delete frees weight — total is below 100%
+    assert sum(c.weight for c in updated.proposal.categories) < 100.0
+
+
+def test_task1_subcategory_can_override_aggregation_method():
+    proposal = GradebookProposal(
+        aggregation_method=10,
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=70.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=60.0, aggregation_method=0),
+                    GradebookSubcategory(name="Projects", weight=40.0, aggregation_method=11),
+                ],
+            ),
+            GradebookCategory(name="Final Exam", weight=30.0),
+        ],
+    )
+
+    payload = proposal.model_dump()
+    subcats = payload["categories"][0]["subcategories"]
+    assert subcats[0]["aggregation_method"] == 0
+    assert subcats[1]["aggregation_method"] == 11
+
+
+def test_task4_drop_lowest_quiz_weight_to_final_exam_phrase():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Quiz 1", module="quiz"),
+        CourseActivity(name="Quiz 2", module="quiz"),
+    ])
+
+    # Seed quiz category weight to emulate a realistic course setup.
+    for category in base.categories:
+        if category.name == "Quizzes":
+            category.weight = 20.0
+        elif category.name == "Labs":
+            category.weight = 0.0
+        elif category.name == "Assignments":
+            category.weight = 20.0
+
+    updated = generator.update_from_prompt(
+        base,
+        "Drop the lowest quiz and give its weight to the final exam",
+    )
+    by_name = {c.name: c for c in updated.categories}
+
+    assert "Quizzes" not in by_name
+    assert abs(by_name["Final Exam"].weight - 50.0) < 0.1
+    assert abs(sum(c.weight for c in updated.categories) - 100.0) < 0.1
+
+
+@pytest.mark.asyncio
+async def test_session_delete_calls_criadex_content_delete_for_uploaded_docs():
+    criadex = MagicMock()
+    criadex.content = MagicMock()
+    criadex.content.delete = AsyncMock(return_value={"success": True})
+
+    engine = GradebookSessionEngine(criadex=criadex)
+    session = await engine.start(
+        course_id="DOC-CLEANUP-001",
+        professor_id="prof_cleanup",
+        bot_name="cleanup-bot",
+        moodle_resources=[MoodleResource(name="Syllabus.pdf")],
+        course_activities=[CourseActivity(name="Quiz 1", module="quiz")],
+    )
+
+    session.uploaded_document_ids = ["doc-a", "doc-b"]
+    result = await engine.delete(session.session_id)
+
+    assert result["success"] is True
+    assert result["docs_deleted"] == 2
+    assert criadex.content.delete.await_count == 2

@@ -347,6 +347,39 @@ async def test_gradebook_session_flow(criabot_instance):
 
 
 @pytest.mark.asyncio
+async def test_gradebook_chat_reports_proposal_changed_only_for_real_updates(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-4321-W2027",
+        professor_id="prof_changeflag",
+        bot_name="eecs-4321-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    help_chat = await criabot_instance.gradebook_chat(session_id=session_id, prompt="help")
+    assert help_chat["proposal"] is not None
+    assert help_chat["proposal_changed"] is False
+
+    refined = await criabot_instance.gradebook_chat(session_id=session_id, prompt="Set Assignments 40%")
+    assert refined["proposal"] is not None
+    assert refined["proposal_changed"] is True
+
+
+def test_gradebook_bool_normalization_in_criabot_response():
+    assert Criabot._normalize_bool_flag(True) is True
+    assert Criabot._normalize_bool_flag(False) is False
+    assert Criabot._normalize_bool_flag("true") is True
+    assert Criabot._normalize_bool_flag("false") is False
+    assert Criabot._normalize_bool_flag("1") is True
+    assert Criabot._normalize_bool_flag("0") is False
+    assert Criabot._normalize_bool_flag(1) is True
+    assert Criabot._normalize_bool_flag(0) is False
+    assert Criabot._normalize_bool_flag("yes") is True
+    assert Criabot._normalize_bool_flag("off") is False
+
+
+@pytest.mark.asyncio
 async def test_gradebook_status_missing_session_raises(criabot_instance):
     with pytest.raises(KeyError):
         await criabot_instance.gradebook_status(session_id="missing-session")

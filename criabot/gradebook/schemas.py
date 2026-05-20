@@ -51,6 +51,10 @@ GRADE_DISPLAY_TYPE_NAMES = {
 class GradebookSubcategory(BaseModel):
     name: str
     weight: float
+    aggregation_method: Optional[int] = Field(
+        default=None,
+        description="Optional Moodle aggregation method override for this subcategory.",
+    )
 
 
 class GradebookCategory(BaseModel):
@@ -86,6 +90,10 @@ class GradebookCategory(BaseModel):
         default_factory=list,
         description="Referenced item names/IDs extracted from calculation_formula.",
     )
+    formula_unresolved_refs: List[str] = Field(
+        default_factory=list,
+        description="Formula references that could not be resolved to grade item identifiers.",
+    )
 
 
 class GradebookProposal(BaseModel):
@@ -106,3 +114,4 @@ class GradebookSessionRecord(BaseModel):
     proposal: Optional[GradebookProposal] = None
     content_mapping: Optional[dict] = None
     last_touched_at: Optional[int] = None
+    uploaded_document_ids: List[str] = Field(default_factory=list, description="Document IDs uploaded in this session")
