@@ -18,8 +18,14 @@ from .formula_resolver import FormulaResolver
 
 
 def validate_proposal_weights(proposal: GradebookProposal) -> List[Dict[str, object]]:
-    """Validate proposal weights only for aggregation methods that require it."""
+    """Validate proposal weights for aggregation methods that require strict 100% total.
+    
+    - Methods 10, 11 (weighted means): MUST total exactly 100%
+    - Methods 12 (mean+extra): MUST total 100% (excluding extra-credit categories)
+    - Methods 0, 13: Allow any total (validation/warning handled elsewhere)
+    """
     method = int(getattr(proposal, "aggregation_method", 13))
+    # Only strict validation for weighted/mean methods
     if method not in {10, 11, 12}:
         return []
 
@@ -41,8 +47,8 @@ def validate_proposal_weights(proposal: GradebookProposal) -> List[Dict[str, obj
                 "total_weight": total_weight,
                 "expected": 100.0,
                 "details": (
-                    f"Weight sum for proposal categories is {total_weight}, expected 100.0 "
-                    f"for aggregation method {method}."
+                    f"Weight sum for proposal categories is {total_weight:.1f}%, expected 100.0% "
+                    f"for aggregation method {method}. Please adjust category weights to total 100%."
                 ),
             }
         )
@@ -345,10 +351,17 @@ class ProposalGenerator:
 
         normalized = validation.normalized_formula or raw_formula.lstrip("=").strip()
         if course_activities:
+            category_context_names = []
+            for c in (proposal.categories or []):
+                if getattr(c, "name", None):
+                    category_context_names.append(c.name)
+                for sub in (getattr(c, "subcategories", None) or []):
+                    if getattr(sub, "name", None):
+                        category_context_names.append(sub.name)
             resolved_formula, unresolved_refs, suggestions = FormulaResolver.resolve_formula(
                 formula=f"={normalized}",
                 activities=course_activities,
-                category_names=[c.name for c in (proposal.categories or [])],
+                category_names=category_context_names,
             )
         else:
             # Backward-compatible behavior: when activity context is unavailable,

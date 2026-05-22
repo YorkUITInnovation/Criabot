@@ -20,6 +20,7 @@ class GradebookChatResponse(APIResponse):
     phase: Optional[str] = None
     reply: Optional[str] = None
     proposal: Optional[dict] = None
+    chat_history: Optional[list] = None
 
 
 @cbv(view)
@@ -52,6 +53,7 @@ class GradebookChatRoute(CriaRoute):
             phase=result.get("phase"),
             reply=result.get("reply"),
             proposal=result.get("proposal"),
+            chat_history=result.get("chat_history"),
         )
 
 

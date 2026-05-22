@@ -366,6 +366,59 @@ async def test_gradebook_chat_reports_proposal_changed_only_for_real_updates(cri
     assert refined["proposal_changed"] is True
 
 
+@pytest.mark.asyncio
+async def test_gradebook_status_includes_latest_chat_history_after_post_finalize_edit(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-9999-F2026",
+        professor_id="prof_history",
+        bot_name="eecs-9999-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    await criabot_instance.gradebook_chat(session_id=session_id, prompt="Please generate proposal")
+    await criabot_instance.gradebook_accept(session_id=session_id)
+    await criabot_instance.gradebook_finalize(
+        session_id=session_id,
+        confirmed_mapping=[{"moodle_cmid": 1, "category": "Assignments"}],
+    )
+
+    chat = await criabot_instance.gradebook_chat(session_id=session_id, prompt="Change Assignments weight by 5%")
+    assert isinstance(chat.get("chat_history"), list)
+    assert len(chat.get("chat_history") or []) >= 2
+
+    status = await criabot_instance.gradebook_status(session_id=session_id)
+    history = status.get("chat_history") or []
+    assert isinstance(history, list)
+    assert any((entry.get("role") == "human" and "Change Assignments weight by 5%" in str(entry.get("text") or "")) for entry in history)
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_history_fifo_trims_oldest_messages(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-8888-F2026",
+        professor_id="prof_fifo",
+        bot_name="eecs-8888-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    criabot_instance._gradebook._chat_history_max_messages = 4
+    criabot_instance._gradebook._chat_history_max_chars = 100000
+
+    await criabot_instance.gradebook_chat(session_id=session_id, prompt="first change")
+    await criabot_instance.gradebook_chat(session_id=session_id, prompt="second change")
+    await criabot_instance.gradebook_chat(session_id=session_id, prompt="third change")
+
+    status = await criabot_instance.gradebook_status(session_id=session_id)
+    history = status.get("chat_history") or []
+    assert len(history) <= 4
+    assert any(entry.get("role") == "human" and "third change" in str(entry.get("text") or "") for entry in history)
+    assert not any(entry.get("role") == "human" and "first change" in str(entry.get("text") or "") for entry in history)
+
+
 def test_gradebook_bool_normalization_in_criabot_response():
     assert Criabot._normalize_bool_flag(True) is True
     assert Criabot._normalize_bool_flag(False) is False

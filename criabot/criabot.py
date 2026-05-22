@@ -1578,7 +1578,9 @@ class Criabot:
         session = await self._gradebook.get(session_id)
         if session is None:
             raise KeyError("gradebook session not found")
-        return session.model_dump()
+        payload = session.model_dump()
+        payload["chat_history"] = self._gradebook.get_chat_history(session)
+        return payload
 
     @staticmethod
     def _normalize_bool_flag(value: object) -> bool:
@@ -1597,12 +1599,14 @@ class Criabot:
     async def gradebook_chat(self, session_id: str, prompt: str) -> dict:
         session = await self._gradebook.chat(session_id=session_id, prompt=prompt)
         reply_message = self._gradebook_conversation.make_reply(session=session, proposal=session.proposal, prompt=prompt)
+        persisted_history = await self._gradebook.persist_chat_turn(session.session_id, prompt, reply_message)
         return {
             "session_id": session.session_id,
             "phase": session.phase,
             "reply": reply_message,
             "proposal": session.proposal.model_dump() if session.proposal else None,
             "proposal_changed": self._normalize_bool_flag((session.extraction or {}).get("proposal_changed", False)),
+            "chat_history": persisted_history,
         }
 
     @staticmethod

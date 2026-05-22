@@ -1329,6 +1329,40 @@ def test_formula_resolver_accepts_category_name_refs_when_activity_ids_missing()
     assert "[[final]]" in resolved
 
 
+def test_formula_resolver_accepts_singular_ref_for_plural_category_name():
+    activities = [
+        CourseActivity(name="Homework 1", module="assign", cmid=10, grade_item_id=334),
+    ]
+
+    resolved, unresolved, suggestions = FormulaResolver.resolve_formula(
+        formula="=round([[project]],2)",
+        activities=activities,
+        category_names=["Projects"],
+    )
+
+    assert unresolved == []
+    assert suggestions == {}
+    assert "[[project]]" in resolved
+
+
+def test_proposal_formula_accepts_subcategory_reference_aliases():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Homework 1", module="assign", cmid=10, grade_item_id=334),
+    ])
+
+    split = generator.update_from_prompt(base, "In Assignments, add subcategories: Homework 10%, Projects 15%")
+    updated = generator.update_from_prompt(
+        split,
+        "Set the Assignments category formula to: =round(([[hw1]]*0.6)+([[project]]*0.4),2)",
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10, grade_item_id=334)],
+    )
+
+    assignments = next(c for c in (updated.categories or []) if c.name == "Assignments")
+    assert assignments.calculation_formula is not None
+    assert assignments.formula_unresolved_refs == []
+
+
 @pytest.mark.asyncio
 async def test_proposal_formula_midterm_final_refs_are_not_marked_unresolved():
     engine = GradebookSessionEngine()
@@ -1457,6 +1491,59 @@ async def test_accept_warns_for_empty_categories_without_blocking():
     assert accepted.phase == "ACCEPTED"
     assert validation.get("can_proceed") is True
     assert any("zero items" in w.lower() for w in (validation.get("warnings") or []))
+
+
+@pytest.mark.asyncio
+async def test_accept_blocks_when_weighted_mean_total_is_not_100():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_weight_guard_accept",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+
+    session.proposal.aggregation_method = 10
+    session.proposal.categories = [
+        GradebookCategory(name="Assignments", weight=70.0),
+        GradebookCategory(name="Exams", weight=40.0),
+    ]
+
+    accepted = await engine.accept(session.session_id)
+    validation = (accepted.content_mapping or {}).get("validation") or {}
+
+    assert accepted.phase == "REFINEMENT"
+    assert validation.get("can_proceed") is False
+    assert any("expected 100.0" in err.lower() for err in (validation.get("errors") or []))
+
+
+@pytest.mark.asyncio
+async def test_finalize_stays_in_refinement_when_weighted_mean_total_is_not_100():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_weight_guard_finalize",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+
+    session.proposal.aggregation_method = 10
+    session.proposal.categories = [
+        GradebookCategory(name="Assignments", weight=70.0),
+        GradebookCategory(name="Exams", weight=40.0),
+    ]
+
+    finalized = await engine.finalize(
+        session.session_id,
+        confirmed_mapping=[{"moodle_cmid": 10, "category": "Assignments"}],
+    )
+    validation = (finalized.content_mapping or {}).get("validation") or {}
+
+    assert finalized.phase == "REFINEMENT"
+    assert validation.get("can_proceed") is False
+    assert any("expected 100.0" in err.lower() for err in (validation.get("errors") or []))
 
 
 def test_content_mapper_validate_mapping_detects_stale_categories():

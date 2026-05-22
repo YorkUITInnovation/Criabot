@@ -9,6 +9,27 @@ from .proposal import ProposalGenerator, validate_proposal_weights
 from .formula_parser import FormulaParser
 
 
+def check_weight_warnings(proposal: GradebookProposal) -> List[str]:
+    """Check for weight warnings (non-blocking) based on aggregation method.
+    
+    - Method 13 (Natural): Warn if total > 100% or < 50% (suggests incomplete setup)
+    - Other methods: No warnings (errors are handled by validate_proposal_weights)
+    """
+    warnings = []
+    method = int(getattr(proposal, "aggregation_method", 13))
+    
+    if method == 13:  # Natural aggregation
+        total_weight = sum(float(getattr(cat, "weight", 0.0)) for cat in (proposal.categories or []))
+        if total_weight > 100.1:
+            warnings.append(
+                f"⚠️ Total weight is {total_weight:.1f}%, which exceeds 100%. "
+                f"This can cause unexpected behavior in some gradebook configurations. "
+                f"Consider adjusting weights to 100% if possible."
+            )
+    
+    return warnings
+
+
 class ConversationManager:
     @staticmethod
     def _contains_phrase(text: str, phrases: tuple[str, ...]) -> bool:
@@ -479,6 +500,7 @@ class ConversationManager:
             
             proposal_errors = validate_proposal_weights(proposal)
             has_weight_error = any(err.get("path") == ["proposal"] for err in proposal_errors)
+            weight_warnings = check_weight_warnings(proposal)
 
             if has_weight_error:
                 return (
@@ -488,9 +510,11 @@ class ConversationManager:
                 )
             else:
                 aggregation_msg = f"\n\n**Grade Aggregation Method**: {aggregation_name}\n(I'll use '{aggregation_name}' when creating your gradebook. If you prefer a different method, let me know.)"
+                weight_msg = f"\n{weight_warnings[0]}" if weight_warnings else ""
                 return (
                     f"Here is the gradebook structure based on what I found:\n\n"
                     f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}"
+                    f"{weight_msg}"
                     f"{aggregation_msg}\n\n"
                     "Does this look right? If you'd like to adjust any weights, categories, or the grade aggregation method, let me know and I'll refine it."
                 )
@@ -511,6 +535,7 @@ class ConversationManager:
                 aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
                 proposal_errors = validate_proposal_weights(proposal)
                 has_weight_error = any(err.get("path") == ["proposal"] for err in proposal_errors)
+                weight_warnings = check_weight_warnings(proposal)
                 if has_weight_error:
                     return (
                         f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n\n"
@@ -518,8 +543,10 @@ class ConversationManager:
                         "⚠ Total weight is still not 100%. Please adjust to proceed."
                     )
                 else:
+                    weight_msg = f"\n{weight_warnings[0]}" if weight_warnings else ""
                     return (
-                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n\n"
+                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n"
+                        f"{weight_msg}\n"
                         f"**Grade Aggregation Method**: {aggregation_name}\n\n"
                         "What else would you like to adjust? I can modify weights, add/remove categories, or rename items."
                     )

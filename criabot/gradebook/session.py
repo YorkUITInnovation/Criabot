@@ -9,7 +9,7 @@ from typing import Dict, List, TYPE_CHECKING, Any
 
 from .conversation import ConversationManager
 from .content_mapper import ContentMapper
-from .proposal import ProposalGenerator
+from .proposal import ProposalGenerator, validate_proposal_weights
 from .schemas import CourseActivity, GradebookSessionRecord, MoodleResource
 from criabot.cache.objects.gradebooks import _parse_time_to_seconds
 
@@ -41,6 +41,8 @@ class GradebookSessionEngine:
         self._active_sessions: Dict[str, GradebookSessionRecord] = {}
         self._proposal_history: Dict[str, List[dict]] = {}
         self._proposal_history_index: Dict[str, int] = {}
+        self._chat_history_max_messages = max(int(os.environ.get("GRADEBOOK_CHAT_HISTORY_MAX_MESSAGES", "400")), 20)
+        self._chat_history_max_chars = max(int(os.environ.get("GRADEBOOK_CHAT_HISTORY_MAX_CHARS", "160000")), 2000)
 
     @staticmethod
     def _uploaded_documents_extraction_key() -> str:
@@ -78,6 +80,64 @@ class GradebookSessionEngine:
     @staticmethod
     def _history_index_key() -> str:
         return "_proposal_history_index"
+
+    @staticmethod
+    def _chat_history_key() -> str:
+        return "_chat_history"
+
+    def _normalize_chat_history(self, raw_history: object) -> List[dict]:
+        if not isinstance(raw_history, list):
+            return []
+        cleaned: List[dict] = []
+        for entry in raw_history:
+            if not isinstance(entry, dict):
+                continue
+            role = str(entry.get("role") or "").strip().lower()
+            text = str(entry.get("text") or "")
+            if role not in {"human", "bot"} or text == "":
+                continue
+            cleaned.append({"role": role, "text": text})
+        return cleaned
+
+    def _trim_chat_history_fifo(self, history: List[dict]) -> List[dict]:
+        trimmed = list(history)
+        if len(trimmed) > self._chat_history_max_messages:
+            trimmed = trimmed[-self._chat_history_max_messages:]
+
+        total_chars = sum(len(str(item.get("text") or "")) for item in trimmed)
+        while trimmed and total_chars > self._chat_history_max_chars:
+            removed = trimmed.pop(0)
+            total_chars -= len(str(removed.get("text") or ""))
+
+        return trimmed
+
+    def get_chat_history(self, session: GradebookSessionRecord) -> List[dict]:
+        extraction = session.extraction or {}
+        return self._normalize_chat_history(extraction.get(self._chat_history_key()))
+
+    def _append_chat_history(self, session: GradebookSessionRecord, prompt: str, reply: str) -> List[dict]:
+        session.extraction = session.extraction or {}
+        history = self.get_chat_history(session)
+
+        prompt_text = str(prompt or "").strip()
+        if prompt_text:
+            history.append({"role": "human", "text": prompt_text})
+
+        reply_text = str(reply or "").strip()
+        if reply_text:
+            history.append({"role": "bot", "text": reply_text})
+
+        history = self._trim_chat_history_fifo(history)
+        session.extraction[self._chat_history_key()] = history
+        return history
+
+    async def persist_chat_turn(self, session_id: str, prompt: str, reply: str) -> List[dict]:
+        session = self._active_sessions.get(session_id) or await self.get(session_id)
+        if session is None:
+            return []
+        history = self._append_chat_history(session, prompt, reply)
+        await self._save_session(session)
+        return history
 
     def _load_history_from_session(self, session: GradebookSessionRecord) -> None:
         """Hydrate in-memory history from persisted session extraction when available."""
@@ -575,6 +635,13 @@ class GradebookSessionEngine:
             if unresolved:
                 refs = ", ".join(f"[{ref}]" for ref in unresolved)
                 errors.append(f"Formula in '{category.name}' has unresolved references: {refs}.")
+
+        # Weight validation: strict aggregation modes must total 100.
+        weight_errors = validate_proposal_weights(proposal)
+        for issue in weight_errors:
+            details = str(issue.get("details") or "").strip()
+            if details:
+                errors.append(details)
 
         # Mapping validation: stale/non-existent categories should block accept.
         for issue in list((content_mapping or {}).get("validation_errors") or []):

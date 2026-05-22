@@ -146,6 +146,13 @@ class FormulaResolver:
                 norm = cls._normalize(token)
                 if norm:
                     aliases.add(norm)
+                    # Accept common singular/plural variants (project/projects, quiz/quizzes, etc.).
+                    if norm.endswith("s") and len(norm) > 3:
+                        aliases.add(norm[:-1])
+                    if norm.endswith("ies") and len(norm) > 4:
+                        aliases.add(norm[:-3] + "y")
+                    if not norm.endswith("s") and len(norm) > 3:
+                        aliases.add(norm + "s")
 
             # Common category shorthands.
             if "midterm" in lower or "mid term" in lower or "mid-term" in lower:
@@ -160,6 +167,8 @@ class FormulaResolver:
                 aliases.update({"labs", "lab"})
             if "quiz" in lower:
                 aliases.update({"quizzes", "quiz", "q"})
+            if "project" in lower:
+                aliases.update({"projects", "project", "proj"})
 
             for alias in aliases:
                 mapping.setdefault(alias, canonical)
