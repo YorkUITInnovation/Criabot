@@ -7,7 +7,9 @@ from criabot.bot.chat.context import ContextRetriever
 
 
 def expected_empty_search_calls(group_count: int) -> int:
-    return (4 * group_count) + (3 * group_count)
+    # Empty document groups: base + broad + keyword + probe = 4 calls.
+    # Empty question groups: base only by default (expansions opt-in).
+    return (4 * group_count) + (1 * group_count)
 
 
 @pytest.fixture

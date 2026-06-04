@@ -17,8 +17,11 @@ class FormulaResolver:
 
     @staticmethod
     def _identifier_for_activity(activity: CourseActivity) -> Optional[str]:
-        # Prefer grade_item_id when available; fallback to cmid for environments
-        # where dedicated grade item ids are not provided in activity payloads.
+        # Prefer stable item labels for Moodle formula resolution. Numeric grade_item_id
+        # values from session/baseline mapping are often stale by finalize time.
+        name = (activity.name or "").strip()
+        if name:
+            return name
         if activity.grade_item_id is not None:
             return str(activity.grade_item_id)
         if activity.cmid is not None:

@@ -54,6 +54,7 @@ class Chat:
         self._llm_model_id = llm_model_id
         self._rerank_model_id = rerank_model_id
         self.chat_reply_metadata = {}
+        self._related_prompts_enabled = True
 
         # Build the context retriever
         self._retriever = ContextRetriever(
@@ -152,7 +153,7 @@ class Chat:
         response_message: ChatMessage = reply_history[-1]
 
         related_prompts = response.context.related_prompts if response.context else []
-        if self._bot_parameters.llm_generate_related_prompts and not related_prompts:
+        if self._bot_parameters.llm_generate_related_prompts and self._related_prompts_enabled and not related_prompts:
             try:
                 related_prompts_response = await self._criadex.agents.azure.related_prompts(
                     model_id=self._llm_model_id,
@@ -170,9 +171,18 @@ class Chat:
                         token_usage.extend([CompletionUsage(**u) for u in usage_from_related_prompts])
                     else:
                         token_usage.extend(usage_from_related_prompts)
-            except:
-                # Don't want this to actually cause issues if the agent fails because the LLM sucks
-                logging.error("Failed to generate related prompts! " + traceback.format_exc())
+            except Exception as exc:
+                # Related prompts are optional. If network/DNS is flaky, avoid repeated retries/log spam for this chat.
+                message = str(exc)
+                if "Name or service not known" in message or "Network error after" in message:
+                    self._related_prompts_enabled = False
+                    logging.warning(
+                        "Related prompts disabled for chat_id=%s due to transient network/DNS error: %s",
+                        self._chat_id,
+                        message,
+                    )
+                else:
+                    logging.error("Failed to generate related prompts! " + traceback.format_exc())
 
         # Return reply
         return ChatReply(

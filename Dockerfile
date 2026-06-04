@@ -32,6 +32,7 @@ FROM        with_packages AS final
 
 COPY        --chown=cria:cria ./app ./app
 COPY        --chown=cria:cria ./criabot ./criabot
+COPY        --chown=cria:cria ./migrations ./migrations
 
 #           START SERVER
 

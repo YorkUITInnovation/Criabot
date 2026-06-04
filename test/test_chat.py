@@ -241,3 +241,18 @@ async def test_send_explicit_summary_prompt_uses_summary_fast_path(chat, bot_moc
 
     assert reply.content.content.startswith("Summary:\n")
     bot_mock.criadex.agents.azure.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_related_prompts_dns_failure_disables_further_attempts(chat, bot_mock, bot_parameters):
+    bot_parameters.llm_generate_related_prompts = True
+    bot_mock.criadex.agents.azure.related_prompts = AsyncMock(
+        side_effect=Exception("Network error after 3 attempts: [Errno -2] Name or service not known")
+    )
+
+    first = await chat.send(prompt="hello one", metadata_filter=None, extra_bots=[])
+    second = await chat.send(prompt="hello two", metadata_filter=None, extra_bots=[])
+
+    assert first.content.content == "assistant reply"
+    assert second.content.content == "assistant reply"
+    assert bot_mock.criadex.agents.azure.related_prompts.await_count == 1

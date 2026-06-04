@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 from typing import List
 
 import httpx
 
 from CriadexSDK.ragflow_schemas import TextNodeWithScore
+
+
+logger = logging.getLogger(__name__)
 
 
 _FRENCH_MARKER_RE = re.compile(
@@ -49,10 +54,19 @@ def infer_search_language(query: str, default: str = "en-US") -> str:
 
 
 class WebSearchClient:
-    def __init__(self, base_url: str, timeout_seconds: float = 8.0, max_results: int = 5) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: float = 8.0,
+        max_results: int = 5,
+        retry_attempts: int = 2,
+        retry_backoff_seconds: float = 0.35,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._max_results = max_results
+        self._retry_attempts = max(0, int(retry_attempts))
+        self._retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
 
     @staticmethod
     def _candidate_queries(query: str) -> List[str]:
@@ -91,16 +105,45 @@ class WebSearchClient:
             "X-Real-IP": "127.0.0.1",
         }
 
+        max_attempts = self._retry_attempts + 1
+        last_error: Exception | None = None
+
         async with httpx.AsyncClient(timeout=self._timeout_seconds, follow_redirects=True) as client:
-            response = await client.get(f"{self._base_url}/search", params=params, headers=headers)
-            response.raise_for_status()
-            payload = response.json()
+            for attempt in range(max_attempts):
+                try:
+                    response = await client.get(f"{self._base_url}/search", params=params, headers=headers)
 
-        results = payload.get("results", [])
-        if not isinstance(results, list):
-            return []
+                    if response.status_code == 429 or response.status_code >= 500:
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(self._retry_backoff_seconds * (2 ** attempt))
+                            continue
+                        response.raise_for_status()
 
-        return results[:self._max_results]
+                    # Non-retriable client errors should not fail chat fallback flow.
+                    if response.status_code >= 400:
+                        return []
+
+                    payload = response.json()
+                    results = payload.get("results", [])
+                    if not isinstance(results, list):
+                        return []
+
+                    return results[:self._max_results]
+                except httpx.RequestError as exc:
+                    last_error = exc
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(self._retry_backoff_seconds * (2 ** attempt))
+                        continue
+                except ValueError as exc:
+                    last_error = exc
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(self._retry_backoff_seconds * (2 ** attempt))
+                        continue
+
+        if last_error is not None:
+            logger.warning("Web search request failed after retries: %s", last_error)
+            raise last_error
+        return []
 
     async def search(self, query: str, language: str | None = None) -> List[dict]:
         if not query.strip():

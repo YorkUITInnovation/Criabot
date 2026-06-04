@@ -15,6 +15,7 @@ from .schemas import (
 )
 from .formula_parser import FormulaParser
 from .formula_resolver import FormulaResolver
+from .naming_utils import activity_name_matches_lab, is_syllabus_like_name
 
 
 def validate_proposal_weights(proposal: GradebookProposal) -> List[Dict[str, object]]:
@@ -56,6 +57,192 @@ def validate_proposal_weights(proposal: GradebookProposal) -> List[Dict[str, obj
     return errors
 
 
+NOT_GRADED_MAPPING_CATEGORIES = frozenset({"__not_graded__", "not graded", ""})
+
+
+def sync_proposal_items_from_mapping(
+    proposal: GradebookProposal | None,
+    confirmed_mapping: List[dict] | None,
+    course_activities: List[CourseActivity] | None = None,
+) -> bool:
+    """Merge mapped grade items into proposal categories. Returns True when proposal changed."""
+    if proposal is None or not confirmed_mapping:
+        return False
+
+    activity_by_gid: Dict[int, CourseActivity] = {}
+    for activity in course_activities or []:
+        grade_item_id = getattr(activity, "grade_item_id", None)
+        if grade_item_id is not None and str(grade_item_id).strip() != "":
+            try:
+                activity_by_gid[int(grade_item_id)] = activity
+            except (TypeError, ValueError):
+                continue
+
+    categories_by_key = {
+        str(category.name).strip().lower(): category
+        for category in (proposal.categories or [])
+        if str(category.name).strip()
+    }
+
+    changed = False
+    for row in confirmed_mapping:
+        if not isinstance(row, dict):
+            continue
+
+        category_name = str(row.get("category") or row.get("confirmed_category") or "").strip()
+        if not category_name or category_name.lower() in NOT_GRADED_MAPPING_CATEGORIES:
+            continue
+
+        target = categories_by_key.get(category_name.lower())
+        if target is None:
+            continue
+
+        item_name = str(row.get("activity_name") or row.get("grade_item_name") or "").strip()
+        grade_item_id = row.get("grade_item_id")
+        if not item_name and grade_item_id is not None and str(grade_item_id).strip() != "":
+            try:
+                activity = activity_by_gid.get(int(grade_item_id))
+            except (TypeError, ValueError):
+                activity = None
+            if activity is not None and getattr(activity, "name", None):
+                item_name = str(activity.name).strip()
+
+        if not item_name:
+            continue
+
+        if target.items is None:
+            target.items = []
+
+        existing = {str(item).strip().lower() for item in target.items}
+        if item_name.strip().lower() not in existing:
+            target.items.append(item_name)
+            changed = True
+
+    return changed
+
+
+def sync_mapping_from_proposal_manual_items(
+    proposal: GradebookProposal | None,
+    content_mapping: dict | None,
+    course_activities: List[CourseActivity] | None = None,
+) -> bool:
+    """Add proposal-only manual grade items to graded_activities for mapping/finalize."""
+    if proposal is None:
+        return False
+
+    mapping_payload = content_mapping if isinstance(content_mapping, dict) else {}
+    graded_activities = list(mapping_payload.get("graded_activities") or [])
+    if mapping_payload is not content_mapping:
+        mapping_payload = dict(mapping_payload)
+
+    canonical_names: set[str] = set()
+    for row in graded_activities:
+        if not isinstance(row, dict):
+            continue
+        name_key = str(row.get("activity_name") or row.get("grade_item_name") or "").strip().lower()
+        if not name_key:
+            continue
+        source = str(row.get("item_source") or "").strip().lower()
+        itemtype = str(row.get("itemtype") or "").strip().lower()
+        has_cmid = row.get("moodle_cmid") not in (None, "", 0)
+        has_module = bool(str(row.get("module_type") or row.get("module") or "").strip())
+        if source not in {"proposal_manual", "proposal"} and (itemtype == "mod" or has_cmid or has_module):
+            canonical_names.add(name_key)
+
+    if canonical_names:
+        filtered: List[dict] = []
+        for row in graded_activities:
+            if not isinstance(row, dict):
+                continue
+            name_key = str(row.get("activity_name") or row.get("grade_item_name") or "").strip().lower()
+            source = str(row.get("item_source") or "").strip().lower()
+            if name_key and name_key in canonical_names and source in {"proposal_manual", "proposal"}:
+                continue
+            filtered.append(row)
+        if len(filtered) != len(graded_activities):
+            graded_activities = filtered
+            mapping_payload["graded_activities"] = graded_activities
+            if content_mapping is not None:
+                content_mapping["graded_activities"] = graded_activities
+
+    activity_by_gid: Dict[int, CourseActivity] = {}
+    activity_by_name: Dict[str, CourseActivity] = {}
+    for activity in course_activities or []:
+        grade_item_id = getattr(activity, "grade_item_id", None)
+        if grade_item_id is not None and str(grade_item_id).strip() != "":
+            try:
+                activity_by_gid[int(grade_item_id)] = activity
+            except (TypeError, ValueError):
+                pass
+        name_key = str(getattr(activity, "name", "") or "").strip().lower()
+        if name_key and name_key not in activity_by_name:
+            activity_by_name[name_key] = activity
+
+    existing_names = {
+        str(row.get("activity_name") or row.get("grade_item_name") or "").strip().lower()
+        for row in graded_activities
+        if isinstance(row, dict) and str(row.get("activity_name") or row.get("grade_item_name") or "").strip()
+    }
+
+    changed = False
+    for category in proposal.categories or []:
+        category_name = str(category.name or "").strip()
+        if not category_name:
+            continue
+
+        for raw_item in category.items or []:
+            item_name = str(raw_item or "").strip()
+            if not item_name:
+                continue
+
+            item_key = item_name.lower()
+            if item_key in existing_names:
+                continue
+
+            matched_activity = activity_by_name.get(item_key)
+            if matched_activity is not None:
+                # Name already belongs to a Moodle activity (assign/quiz/etc.) — not a proposal-only manual.
+                module = str(getattr(matched_activity, "module", None) or "").strip()
+                cmid = getattr(matched_activity, "cmid", None)
+                if module or (cmid is not None and str(cmid).strip() not in {"", "0"}):
+                    continue
+
+            grade_item_id = None
+            moodle_cmid = None
+            module = None
+            if matched_activity is not None:
+                grade_item_id = getattr(matched_activity, "grade_item_id", None)
+                moodle_cmid = getattr(matched_activity, "cmid", None)
+                module = getattr(matched_activity, "module", None)
+
+            graded_activities.append(
+                {
+                    "moodle_cmid": moodle_cmid,
+                    "grade_item_id": grade_item_id,
+                    "module_type": module,
+                    "itemtype": "manual",
+                    "activity_name": item_name,
+                    "activity_key": f"proposal-manual:{category_name.lower()}:{item_key}",
+                    "item_source": "proposal_manual",
+                    "suggested_category": category_name,
+                    "confirmed_category": category_name,
+                    "finalized": False,
+                    "confidence": 1.0,
+                    "reasoning": "Manual grade item from proposal (conversation or mapping).",
+                    "mapping_method": "proposal_manual",
+                }
+            )
+            existing_names.add(item_key)
+            changed = True
+
+    if changed:
+        mapping_payload["graded_activities"] = graded_activities
+        if content_mapping is not None:
+            content_mapping["graded_activities"] = graded_activities
+
+    return changed
+
+
 class ProposalGenerator:
     DEFAULT_CATEGORIES = [
         ("Assignments", 25.0),
@@ -94,6 +281,503 @@ class ProposalGenerator:
         self._category_alias_patterns = list(self.CATEGORY_ALIAS_PATTERNS)
         self._load_aliases_from_env()
 
+    @staticmethod
+    def _iter_tree_children(node: object) -> List[dict]:
+        if not isinstance(node, dict):
+            return []
+        children = node.get("children")
+        if isinstance(children, dict):
+            def _child_sort_key(entry: tuple[object, object]) -> tuple[int, object]:
+                raw_key = entry[0]
+                try:
+                    return (0, int(raw_key))
+                except (TypeError, ValueError):
+                    return (1, str(raw_key))
+
+            return [child for _, child in sorted(children.items(), key=_child_sort_key) if isinstance(child, dict)]
+        if isinstance(children, list):
+            return [child for child in children if isinstance(child, dict)]
+        return []
+
+    @staticmethod
+    def _to_float(value: object) -> Optional[float]:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _to_int(value: object) -> Optional[int]:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_baseline_weight_percent(self, node: dict, aggregation_method: int) -> float:
+        coef = node.get("aggregationcoef")
+        coef2 = node.get("aggregationcoef2")
+        weight_override = bool(node.get("weightoverride"))
+
+        try:
+            coef = float(coef) if coef is not None else None
+        except (TypeError, ValueError):
+            coef = None
+
+        try:
+            coef2 = float(coef2) if coef2 is not None else None
+        except (TypeError, ValueError):
+            coef2 = None
+
+        if aggregation_method in {10, 11} and coef is not None:
+            return max(0.0, min(100.0, coef))
+
+        if aggregation_method == 13:
+            if coef2 is not None and (weight_override or coef2 > 0.0):
+                return max(0.0, min(100.0, coef2 * 100.0))
+            if coef is not None:
+                if 0.0 <= coef <= 1.0:
+                    return max(0.0, min(100.0, coef * 100.0))
+                return max(0.0, min(100.0, coef))
+
+        # Some Moodle baselines place category weights on the synthetic
+        # category-total item (itemtype='category') rather than the category node.
+        total_item = self._find_baseline_category_total_item(node)
+        if isinstance(total_item, dict):
+            item_pct = self._extract_baseline_item_weight_percent(total_item, aggregation_method)
+            if item_pct is not None:
+                return max(0.0, min(100.0, float(item_pct)))
+
+        return 0.0
+
+    def _collect_baseline_item_names(self, node: dict) -> List[str]:
+        names: List[str] = []
+        for child in self._iter_tree_children(node):
+            child_type = str(child.get("type") or "").strip().lower()
+            if child_type == "category":
+                names.extend(self._collect_baseline_item_names(child))
+                continue
+
+            # Skip synthetic category-total rows; only keep real gradable items.
+            child_item_type = str(child.get("itemtype") or "").strip().lower()
+            if child_item_type == "category":
+                continue
+
+            name = str(child.get("name") or "").strip()
+            if name:
+                names.append(name)
+        # Preserve order and drop duplicates.
+        return list(dict.fromkeys(names))
+
+    def _extract_baseline_category_grade_max(self, node: dict) -> Optional[float]:
+        direct = self._to_float(node.get("grademax"))
+        if direct is not None and direct > 0.0:
+            return direct
+
+        # Moodle often stores category-total point maxima on the synthetic child item.
+        for child in self._iter_tree_children(node):
+            child_item_type = str(child.get("itemtype") or "").strip().lower()
+            if child_item_type != "category":
+                continue
+            child_max = self._to_float(child.get("grademax"))
+            if child_max is not None and child_max > 0.0:
+                return child_max
+        return None
+
+    def _find_baseline_category_total_item(self, node: dict) -> Optional[dict]:
+        for child in self._iter_tree_children(node):
+            if str(child.get("itemtype") or "").strip().lower() == "category":
+                return child
+        return None
+
+    def _extract_baseline_item_weight_percent(self, item_node: dict, aggregation_method: int) -> Optional[float]:
+        coef = self._to_float(item_node.get("aggregationcoef"))
+        coef2 = self._to_float(item_node.get("aggregationcoef2"))
+        weight_override = bool(item_node.get("weightoverride"))
+
+        if aggregation_method in {10, 11}:
+            if coef is None:
+                return None
+            if 0.0 <= coef <= 1.0:
+                return max(0.0, min(100.0, coef * 100.0))
+            return max(0.0, min(100.0, coef))
+
+        if aggregation_method == 13:
+            if coef2 is not None and (weight_override or coef2 > 0.0):
+                return max(0.0, min(100.0, coef2 * 100.0))
+            if coef is not None:
+                if 0.0 <= coef <= 1.0:
+                    return max(0.0, min(100.0, coef * 100.0))
+                return max(0.0, min(100.0, coef))
+
+        return None
+
+    def _collect_baseline_item_weights(self, node: dict, aggregation_method: int) -> Dict[str, float]:
+        weights: Dict[str, float] = {}
+        for child in self._iter_tree_children(node):
+            child_type = str(child.get("type") or "").strip().lower()
+            if child_type == "category":
+                # Item weights belong to their immediate parent category;
+                # do not roll up nested subcategory item weights here.
+                continue
+
+            child_item_type = str(child.get("itemtype") or "").strip().lower()
+            if child_item_type == "category":
+                continue
+
+            name = str(child.get("name") or "").strip()
+            if not name:
+                continue
+
+            pct = self._extract_baseline_item_weight_percent(child, aggregation_method)
+            if pct is None or pct <= 0.0:
+                continue
+            weights[name] = round(float(pct), 2)
+
+        return weights
+
+    def _category_setting(self, node: dict, key: str, default: object = None) -> object:
+        if key in node and node.get(key) is not None:
+            return node.get(key)
+        return default
+
+    def _category_total_setting(self, node: dict, key: str, default: object = None) -> object:
+        if key in node and node.get(key) is not None:
+            return node.get(key)
+        total_item = self._find_baseline_category_total_item(node)
+        if isinstance(total_item, dict) and key in total_item and total_item.get(key) is not None:
+            return total_item.get(key)
+        return default
+
+    def _collect_direct_real_item_children(self, node: dict) -> List[dict]:
+        items: List[dict] = []
+        for child in self._iter_tree_children(node):
+            child_type = str(child.get("type") or "").strip().lower()
+            if child_type == "category":
+                continue
+            child_item_type = str(child.get("itemtype") or "").strip().lower()
+            if child_item_type == "category":
+                continue
+            items.append(child)
+        return items
+
+    def _iter_descendant_category_nodes(self, node: dict):
+        for child in self._iter_tree_children(node):
+            if str(child.get("type") or "").strip().lower() != "category":
+                continue
+            yield child
+            yield from self._iter_descendant_category_nodes(child)
+
+    def _infer_category_for_item(self, item_name: str, item_module: str = "") -> Optional[str]:
+        name_l = (item_name or "").strip().lower()
+        module_l = (item_module or "").strip().lower()
+
+        if module_l == "quiz" or any(k in name_l for k in ("quiz", "knowledge check", "test")):
+            return "Quizzes"
+        if activity_name_matches_lab(name_l):
+            return "Labs"
+        if "midterm" in name_l or "mid term" in name_l:
+            return "Midterm"
+        if "final" in name_l or "exam" in name_l:
+            return "Final Exam"
+        if any(k in name_l for k in ("assign", "homework", "hw", "submission")):
+            return "Assignments"
+        return None
+
+    def _reroute_root_items_to_matching_categories(
+        self,
+        categories: List[GradebookCategory],
+        root_uncategorized_items: List[dict],
+    ) -> List[dict]:
+        by_name = {self._normalize_name(cat.name): cat for cat in categories if self._normalize_name(cat.name)}
+        leftovers: List[dict] = []
+
+        for item in root_uncategorized_items:
+            item_name = str(item.get("name") or "").strip()
+            if not item_name:
+                leftovers.append(item)
+                continue
+
+            inferred = self._infer_category_for_item(item_name, str(item.get("itemmodule") or ""))
+            if not inferred:
+                leftovers.append(item)
+                continue
+
+            resolved = self._normalize_name(inferred)
+            target = by_name.get(resolved)
+            if target is None:
+                leftovers.append(item)
+                continue
+
+            if item_name not in target.items:
+                target.items.append(item_name)
+
+        return leftovers
+
+    def _apply_inferred_category_default_weights(self, categories: List[GradebookCategory]) -> None:
+        inferred = [cat for cat in categories if float(getattr(cat, "weight", 0.0)) <= 0.001 and bool(cat.items)]
+        if not inferred:
+            return
+
+        for cat in inferred:
+            desired = 15.0 if self._normalize_name(cat.name) == "quizzes" else 10.0
+            if desired <= 0.0:
+                continue
+
+            donor = next((c for c in categories if self._normalize_name(c.name) == "assignments" and c is not cat), None)
+            if donor is None or float(getattr(donor, "weight", 0.0)) <= 0.001:
+                donor = max((c for c in categories if c is not cat and float(getattr(c, "weight", 0.0)) > 0.001), key=lambda c: float(c.weight), default=None)
+            if donor is None:
+                continue
+
+            transfer = min(desired, max(0.0, float(donor.weight)))
+            if transfer <= 0.0:
+                continue
+
+            donor.weight = round(float(donor.weight) - transfer, 2)
+            cat.weight = round(float(cat.weight) + transfer, 2)
+
+    def generate_from_baseline_snapshot(
+        self,
+        baseline_snapshot: object,
+        activities: List[CourseActivity],
+    ) -> GradebookProposal:
+        if not isinstance(baseline_snapshot, dict):
+            return self.generate_initial(activities)
+
+        if not bool(baseline_snapshot.get("available")):
+            return self.generate_initial(activities)
+
+        root = baseline_snapshot.get("tree")
+        root_children = self._iter_tree_children(root)
+        root_category = baseline_snapshot.get("root_category") if isinstance(baseline_snapshot.get("root_category"), dict) else {}
+        root_aggregation_method = int(root_category.get("aggregation") or 13)
+
+        categories: List[GradebookCategory] = []
+        category_nodes: List[dict] = []
+        top_level_aggregations: List[int] = []
+        root_uncategorized_items: List[dict] = []
+
+        for root_child in root_children:
+            root_child_type = str(root_child.get("type") or "").strip().lower()
+            if root_child_type == "category":
+                continue
+            if root_child_type == "courseitem":
+                continue
+            root_item_type = str(root_child.get("itemtype") or "").strip().lower()
+            if root_item_type == "category":
+                continue
+            if root_item_type == "course":
+                continue
+            root_uncategorized_items.append(root_child)
+
+        for node in root_children:
+            if str(node.get("type") or "").strip().lower() != "category":
+                continue
+
+            name = str(node.get("name") or "").strip()
+            if not name:
+                continue
+
+            node_aggregation_raw = self._to_int(node.get("aggregation"))
+            if node_aggregation_raw is not None:
+                top_level_aggregations.append(node_aggregation_raw)
+
+            real_item_children = self._collect_direct_real_item_children(node)
+
+            grade_max = self._extract_baseline_category_grade_max(node)
+            drop_lowest = max(0, int(self._category_setting(node, "droplow", root_category.get("droplow") or 0) or 0))
+            keep_highest = max(0, int(self._category_setting(node, "keephigh", root_category.get("keephigh") or 0) or 0))
+            aggregate_only_graded = bool(self._category_setting(node, "aggregateonlygraded", root_category.get("aggregateonlygraded", True)))
+            aggregate_outcomes = bool(self._category_setting(node, "aggregateoutcomes", root_category.get("aggregateoutcomes", False)))
+            hidden_value = self._category_total_setting(node, "hidden", node.get("hidden") or 0)
+            hidden_until_raw = self._category_total_setting(node, "hiddenuntil", node.get("hiddenuntil"))
+            lock_time_raw = self._category_total_setting(node, "locktime", node.get("locktime"))
+            locked_value = self._category_total_setting(node, "locked", node.get("locked") is True)
+            display_type_raw = self._category_total_setting(node, "display", node.get("display"))
+            decimals_raw = self._category_total_setting(node, "decimals", node.get("decimals"))
+            grade_min_raw = self._category_total_setting(node, "grademin", node.get("grademin"))
+            grade_pass_raw = self._category_total_setting(node, "gradepass", node.get("gradepass"))
+
+            hidden_until_val = self._to_int(hidden_until_raw)
+            lock_time_val = self._to_int(lock_time_raw)
+            display_type_val = self._to_int(display_type_raw)
+            decimals_val = self._to_int(decimals_raw)
+
+            # Preserve important item-level visibility/locking semantics in baseline view.
+            item_hidden = any(int(self._to_int(child.get("hidden")) or 0) != 0 for child in real_item_children)
+            item_hidden_until_candidates = [
+                int(v) for v in (self._to_int(child.get("hiddenuntil")) for child in real_item_children)
+                if v is not None and int(v) > 0
+            ]
+            item_locked = any(bool(child.get("locked")) for child in real_item_children)
+            item_locktime_candidates = [
+                int(v) for v in (self._to_int(child.get("locktime")) for child in real_item_children)
+                if v is not None and int(v) > 0
+            ]
+
+            hidden_until = hidden_until_val if hidden_until_val is not None and hidden_until_val > 0 else (max(item_hidden_until_candidates) if item_hidden_until_candidates else None)
+            lock_time = lock_time_val if lock_time_val is not None and lock_time_val > 0 else (max(item_locktime_candidates) if item_locktime_candidates else None)
+            display_type = display_type_val if display_type_val is not None else 0
+            # Do not surface Moodle defaults as explicit formatting settings.
+            decimals = decimals_val if (decimals_val is not None and decimals_val > 0) else -1
+            grade_min_val = float(grade_min_raw) if grade_min_raw is not None else None
+            if grade_min_val is not None and abs(grade_min_val) < 1e-9:
+                grade_min_val = None
+            grade_pass_val = float(grade_pass_raw) if grade_pass_raw is not None else None
+            if grade_pass_val is not None and grade_pass_val <= 0.0:
+                grade_pass_val = None
+            category = GradebookCategory(
+                name=name,
+                weight=self._extract_baseline_weight_percent(node, root_aggregation_method),
+                items=self._collect_baseline_item_names(node),
+                item_weights=self._collect_baseline_item_weights(
+                    node,
+                    int(node.get("aggregation") or root_aggregation_method),
+                ),
+                subcategories=[],
+                drop_lowest=drop_lowest,
+                keep_highest=keep_highest,
+                aggregate_only_graded=aggregate_only_graded,
+                aggregate_outcomes=aggregate_outcomes,
+                hidden=bool(int(hidden_value or 0) != 0) or (hidden_until is not None) or item_hidden,
+                hidden_until=hidden_until,
+                locked=bool(locked_value) or item_locked or (lock_time is not None),
+                lock_time=lock_time,
+                display_type=display_type,
+                decimals=decimals,
+                calculation_formula=str(node.get("calculation") or "").strip() or None,
+                grade_min=grade_min_val,
+                grade_max=grade_max if grade_max is not None else 100.0,
+                grade_pass=grade_pass_val,
+            )
+
+            subcategories: List[GradebookSubcategory] = []
+            seen_subcategories: set[str] = set()
+            for child in self._iter_descendant_category_nodes(node):
+                sub_name = str(child.get("name") or "").strip()
+                if not sub_name:
+                    continue
+                sub_key = sub_name.lower()
+                if sub_key in seen_subcategories:
+                    continue
+                seen_subcategories.add(sub_key)
+                subcategories.append(
+                    GradebookSubcategory(
+                        name=sub_name,
+                        weight=self._extract_baseline_weight_percent(child, root_aggregation_method),
+                        aggregation_method=int(child.get("aggregation")) if child.get("aggregation") is not None else None,
+                    )
+                )
+
+            if subcategories:
+                category.subcategories = subcategories
+
+            categories.append(category)
+            category_nodes.append(node)
+
+        if root_uncategorized_items:
+            root_uncategorized_items = self._reroute_root_items_to_matching_categories(
+                categories,
+                root_uncategorized_items,
+            )
+
+        if root_uncategorized_items:
+            uncategorized_node = {
+                "children": root_uncategorized_items,
+            }
+            uncategorized_names = []
+            for item in root_uncategorized_items:
+                item_name = str(item.get("name") or "").strip()
+                if item_name:
+                    uncategorized_names.append(item_name)
+            uncategorized_names = list(dict.fromkeys(uncategorized_names))
+            if uncategorized_names:
+                categories.append(
+                    GradebookCategory(
+                        name="Uncategorized",
+                        weight=0.0,
+                        items=uncategorized_names,
+                        item_weights=self._collect_baseline_item_weights(
+                            uncategorized_node,
+                            root_aggregation_method,
+                        ),
+                        subcategories=[],
+                        drop_lowest=0,
+                        keep_highest=0,
+                        aggregate_only_graded=True,
+                        aggregate_outcomes=False,
+                        hidden=False,
+                        hidden_until=None,
+                        locked=False,
+                        lock_time=None,
+                        display_type=0,
+                        decimals=-1,
+                        calculation_formula=None,
+                        grade_min=None,
+                        grade_max=100.0,
+                        grade_pass=None,
+                    )
+                )
+
+        if not categories:
+            return self.generate_initial(activities)
+
+        # In Natural aggregation, explicit weight overrides can be absent. In that case,
+        # derive display weights from category point maxima to avoid showing all categories at 0%.
+        total_weight = sum(max(0.0, float(getattr(cat, "weight", 0.0))) for cat in categories)
+        if total_weight <= 0.01:
+            fallback_maxima: List[float] = []
+            for node in category_nodes:
+                max_points = self._extract_baseline_category_grade_max(node)
+                fallback_maxima.append(max_points if (max_points is not None and max_points > 0.0) else 0.0)
+
+            total_points = sum(fallback_maxima)
+            if total_points > 0.0:
+                for idx, max_points in enumerate(fallback_maxima):
+                    categories[idx].weight = (max_points / total_points) * 100.0
+
+        has_imported_rules = any(
+            (cat.drop_lowest > 0)
+            or (cat.keep_highest > 0)
+            or (not cat.aggregate_only_graded)
+            or bool(cat.aggregate_outcomes)
+            or bool(cat.hidden)
+            or bool(cat.locked)
+            or bool(cat.calculation_formula)
+            or bool(cat.item_weights)
+            or (cat.grade_min is not None)
+            or (cat.grade_max != 100.0)
+            or (cat.grade_pass is not None)
+            or (cat.display_type != 0)
+            or (cat.decimals >= 0)
+            for cat in categories
+        )
+
+        notes = [
+            "Initial proposal mirrors the existing Moodle gradebook baseline.",
+            "Professor can refine category names, weights, and mapping before acceptance.",
+        ]
+        if has_imported_rules:
+            notes.append(
+                "Baseline category rules were imported (drop/keep, visibility/locking, points, and display settings where present)."
+            )
+        if root_uncategorized_items:
+            notes.append(
+                "Baseline root-level activities were imported under an 'Uncategorized' category for mapping review."
+            )
+
+        proposal_aggregation_method = root_aggregation_method
+        if top_level_aggregations:
+            unique_aggs = sorted(set(top_level_aggregations))
+            if len(unique_aggs) == 1:
+                proposal_aggregation_method = unique_aggs[0]
+
+        return GradebookProposal(
+            categories=categories,
+            notes=notes,
+            aggregation_method=proposal_aggregation_method,
+        )
+
     def generate_initial(self, activities: List[CourseActivity]) -> GradebookProposal:
         categories = [GradebookCategory(name=name, weight=weight, items=[]) for name, weight in self.DEFAULT_CATEGORIES]
         by_name = {category.name: category for category in categories}
@@ -111,12 +795,15 @@ class ProposalGenerator:
             return category
 
         for activity in activities:
+            if is_syllabus_like_name(activity.name):
+                continue
+
             activity_name = activity.name.lower()
             module_name = (activity.module or "").lower()
 
             if module_name == "quiz" or any(keyword in activity_name for keyword in ("quiz", "knowledge check", "test")):
                 ensure_category("Quizzes").items.append(activity.name)
-            elif "lab" in activity_name:
+            elif activity_name_matches_lab(activity_name):
                 categories[1].items.append(activity.name)
             elif "midterm" in activity_name:
                 categories[2].items.append(activity.name)
@@ -124,6 +811,8 @@ class ProposalGenerator:
                 categories[3].items.append(activity.name)
             else:
                 categories[0].items.append(activity.name)
+
+        self._apply_inferred_category_default_weights(categories)
 
         return GradebookProposal(
             categories=categories,
@@ -136,8 +825,10 @@ class ProposalGenerator:
     # Notes that are auto-generated (not user-visible descriptive text) get stripped each turn.
     _EPHEMERAL_NOTE_PREFIXES = (
         "weight check:",
+        "item weight check:",
         "auto-normalized",
         "removed category",
+        "split check:",
         "formula ignored:",
         "formula warning:",
         "formula was valid, but no target category was found.",
@@ -147,6 +838,14 @@ class ProposalGenerator:
     def _is_ephemeral_note(note: str) -> bool:
         low = note.lower()
         return any(low.startswith(prefix) for prefix in ProposalGenerator._EPHEMERAL_NOTE_PREFIXES)
+
+    @staticmethod
+    def _is_category_not_found_effect_note(note: str) -> bool:
+        text = str(note or "")
+        if not text.startswith("Effect:"):
+            return False
+        low = text.lower()
+        return "category was not found" in low and "tried to" in low
 
     @staticmethod
     def _append_unique_note(proposal: GradebookProposal, note: str) -> None:
@@ -205,6 +904,23 @@ class ProposalGenerator:
             label = re.sub(r"\s+", " ", m.group(1)).strip()
             return f"hiddenuntil:{label}"
 
+        m = re.match(r"^moved '(.+?)'", low)
+        if m:
+            return f"item_move:{m.group(1).lower()}"
+
+        m = re.match(r"^set item weight for '(.+?)'", low)
+        if m:
+            return f"item_weight:{m.group(1).lower()}"
+
+        m = re.match(r"^removed '(.+?)' from", low)
+        if m:
+            return f"item_remove:{m.group(1).lower()}"
+
+        m = re.match(r"^tried to .+? '(.+?)', but category was not found", low)
+        if m:
+            label = re.sub(r"\s+", " ", m.group(1)).strip().lower()
+            return f"not_found:{label}"
+
         return low
 
     @staticmethod
@@ -240,12 +956,18 @@ class ProposalGenerator:
 
         # Strip ephemeral per-turn notes so they don't accumulate.
         updated.notes = [n for n in (updated.notes or []) if not self._is_ephemeral_note(n)]
+        # Category-not-found effects are per-turn; guard re-adds only for the current prompt.
+        updated.notes = [n for n in (updated.notes or []) if not self._is_category_not_found_effect_note(n)]
 
         # Detect split context early so weight extraction skips subcategory names.
         # Support both:
         # - "split ... into ..."
         # - "add subcategories: ..."
         is_split_prompt = bool(re.search(r"\b(?:split|divide)\b.+\binto\b|\badd\s+subcategories\b", prompt_lower))
+
+        # Apply explicit grade-item remove/rename intents before category removal
+        # so phrases like "remove fina grade item" do not remove a whole category.
+        self._apply_item_remove_rename(updated, prompt)
 
         self._apply_removals(updated, prompt)
 
@@ -284,7 +1006,18 @@ class ProposalGenerator:
         if is_split_prompt:
             self._apply_split_request(updated, prompt)
 
+        self._apply_subcategory_weight_updates(updated, prompt)
+
         self._post_update_checks(updated, prompt)
+        if is_split_prompt:
+            self._apply_split_request(updated, prompt)
+
+        self._apply_subcategory_weight_updates(updated, prompt)
+        self._apply_item_additions(updated, prompt)
+        self._apply_item_operations(updated, prompt)
+
+        self._post_update_checks(updated, prompt)
+        self._guard_scoped_category_intents(updated, prompt)
 
         return updated
 
@@ -371,6 +1104,7 @@ class ProposalGenerator:
             suggestions = {}
 
         target.calculation_formula = resolved_formula
+        target.formula_override = self._prompt_requests_formula_override(prompt)
         target.formula_item_refs = list(validation.item_references or [])
         target.formula_unresolved_refs = list(unresolved_refs or [])
 
@@ -422,9 +1156,18 @@ class ProposalGenerator:
             if not getattr(cat, "calculation_formula", None):
                 continue
             cat.calculation_formula = None
+            cat.formula_override = False
             cat.formula_item_refs = []
             cat.formula_unresolved_refs = []
             self._append_effect_note(proposal, f"Cleared formula from {cat.name}")
+
+    @staticmethod
+    def _prompt_requests_formula_override(prompt: str) -> bool:
+        text_l = (prompt or "").lower()
+        return bool(
+            re.search(r"\b(?:override|replace|force)\b.*\bformula\b", text_l)
+            or re.search(r"\bformula\b.*\b(?:override|replace|force)\b", text_l)
+        )
 
     @staticmethod
     def _parse_aggregation_method(prompt: str) -> Optional[int]:
@@ -567,9 +1310,31 @@ class ProposalGenerator:
                 cat.aggregate_only_graded = False
                 self._append_effect_note(proposal, f"{cat.name} includes empty grades in aggregation")
 
+        # category-first phrasing: "for assignments, include empty grades"
+        for m in re.finditer(
+            r"\bfor\s+([a-zA-Z][a-zA-Z ]{1,30})\s*,?\s*(?:set\s+)?include\s+empty(?:\s+grades?)?\b",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip().rstrip(".,")
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.aggregate_only_graded = False
+                self._append_effect_note(proposal, f"{cat.name} includes empty grades in aggregation")
+
         if re.search(r"\bexclude\s+empty\b", prompt_lower):
             cat_m = re.search(r"\bexclude\s+empty\s+(?:grades?\s+)?(?:for\s+)?([a-zA-Z][a-zA-Z ]{1,30})?", prompt_lower)
             cat_hint = (cat_m.group(1) or "").strip() if cat_m else ""
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.aggregate_only_graded = True
+                self._append_effect_note(proposal, f"{cat.name} aggregates only non-empty grades")
+
+        # category-first phrasing: "for assignments, exclude empty grades"
+        for m in re.finditer(
+            r"\bfor\s+([a-zA-Z][a-zA-Z ]{1,30})\s*,?\s*(?:set\s+)?exclude\s+empty(?:\s+grades?)?\b",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip().rstrip(".,")
             targets = self._resolve_category_targets(proposal, cat_hint)
             for cat in targets:
                 cat.aggregate_only_graded = True
@@ -697,6 +1462,24 @@ class ProposalGenerator:
             ts = self._parse_relative_date_to_timestamp(date_part)
             display_text = date_part
             
+            if ts is None:
+                continue
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            for cat in targets:
+                cat.hidden = True
+                cat.hidden_until = ts
+                self._append_effect_note(proposal, f"{cat.name} hidden until {display_text}")
+
+        # Continuation phrasing after a hide-until directive:
+        # "hide midterm until next week and final until next month"
+        for m in re.finditer(
+            r"\band\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)\s+(?:as\s+)?(?:hidden\s+)?(?:until|untill)\s+"
+            r"([a-zA-Z0-9\- ]{2,40}?)(?=(?:\s+and\s+|\.|,|;|$))",
+            prompt_lower,
+        ):
+            cat_hint = m.group(1).strip()
+            date_part = m.group(2).strip()
+            ts, display_text = self._parse_hide_until_expression(date_part)
             if ts is None:
                 continue
             targets = self._resolve_category_targets(proposal, cat_hint)
@@ -870,6 +1653,13 @@ class ProposalGenerator:
         target = target.replace(hour=0, minute=0, second=0, microsecond=0)
         return int(target.timestamp())
 
+    def _parse_hide_until_expression(self, date_text: str) -> Tuple[Optional[int], str]:
+        """Parse hide-until text that may be ISO or relative date phrasing."""
+        cleaned = (date_text or "").strip().lower()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+            return self._parse_iso_date_to_timestamp(cleaned), cleaned
+        return self._parse_relative_date_to_timestamp(cleaned), cleaned
+
     def _resolve_category_targets(self, proposal: GradebookProposal, hint: str) -> List:
         """Return matching categories for a hint string, or all categories if hint is empty."""
         if not hint:
@@ -1039,11 +1829,356 @@ class ProposalGenerator:
         pieces = re.split(r",| and | & ", match.group(1))
         names = []
         for piece in pieces:
-            part = re.sub(r"\d+(?:\.\d+)?\s*%.*", "", piece).strip()
+            part = re.sub(
+                r"\bwith\s+weight\s+of\s+\d+(?:\.\d+)?\s*%?\b.*",
+                "",
+                piece,
+                flags=re.IGNORECASE,
+            ).strip()
+            part = re.sub(r"\d+(?:\.\d+)?\s*%.*", "", part).strip()
             part = re.sub(r"\b(but|keep|as|the|parent|category)\b", " ", part, flags=re.IGNORECASE).strip()
             if part:
                 names.append(part.lower())
         return names
+
+    @staticmethod
+    def _parse_subcategory_weight_value(raw_weight: str, parent_weight: float) -> Optional[float]:
+        try:
+            value = float(raw_weight)
+        except (TypeError, ValueError):
+            return None
+
+        # Treat fractional values (e.g., 0.4) as a parent-relative share.
+        if 0.0 <= value <= 1.0:
+            return float(parent_weight) * value
+        return value
+
+    def _find_item_in_proposal(
+        self, proposal: GradebookProposal, item_query: str
+    ) -> Tuple[Optional[GradebookCategory], Optional[str]]:
+        """Fuzzy search for a grade item name across all category items lists."""
+        query_lower = item_query.lower().strip()
+        if not query_lower:
+            return None, None
+        best_cat: Optional[GradebookCategory] = None
+        best_item: Optional[str] = None
+        best_score = 0.0
+        for cat in proposal.categories:
+            for item in (cat.items or []):
+                item_lower = item.lower()
+                if query_lower == item_lower:
+                    return cat, item
+                if query_lower in item_lower or item_lower in query_lower:
+                    score = min(len(query_lower), len(item_lower)) / max(len(query_lower), len(item_lower))
+                    if score > best_score:
+                        best_score = score
+                        best_cat = cat
+                        best_item = item
+        return (best_cat, best_item) if best_score >= 0.5 else (None, None)
+
+    def _apply_item_operations(self, proposal: GradebookProposal, prompt: str) -> None:
+        """Handle move / weight-set / remove operations on grade items inside categories."""
+        # --- Move: "move <item> to <category>" / "move <item> from <A> to <B>" --------
+        for m in re.finditer(
+            r"\b(?:move|transfer|reassign|put|place)\s+"
+            r"(.+?)"
+            r"\s+(?:from\s+[a-zA-Z][a-zA-Z ]{0,30}\s+)?(?:to|into|under)\s+"
+            r"([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\s*(?:[.,]|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            target_hint = m.group(2).strip().rstrip("., ")
+            src_cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if not item_name:
+                continue
+            targets = self._resolve_category_targets(proposal, target_hint)
+            if not targets:
+                continue
+            target_cat = targets[0]
+            if src_cat and src_cat.name == target_cat.name:
+                continue
+            if src_cat:
+                src_cat.items = [i for i in src_cat.items if i != item_name]
+                if item_name in (src_cat.item_weights or {}):
+                    target_cat.item_weights[item_name] = src_cat.item_weights.pop(item_name)
+            if target_cat.items is None:
+                target_cat.items = []
+            target_cat.items.append(item_name)
+            from_label = f" from {src_cat.name}" if src_cat else ""
+            self._append_effect_note(proposal, f"Moved '{item_name}'{from_label} to {target_cat.name}")
+
+        # --- Item weight: "set weight of <item> to N" ---------------------------------
+        for m in re.finditer(
+            r"\b(?:set|assign|give)\s+(?:the\s+)?weight\s+(?:of\s+)(.+?)\s+to\s+(\d+(?:\.\d+)?)\s*%?(?:\s|,|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            raw_val = float(m.group(2))
+            cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if not cat or not item_name:
+                continue
+            weight_val = raw_val if raw_val > 1.0 else round(raw_val * 100, 2)
+            self._set_item_weight_with_validation(proposal, cat, item_name, weight_val)
+
+        # --- Item weight: "assign <item> to N" --------------------------------------
+        for m in re.finditer(
+            r"\bassign\s+(.+?)\s+(?:to|=)\s+(\d+(?:\.\d+)?)\s*%?(?:\s|,|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            raw_val = float(m.group(2))
+            # Keep split-style "assign 0.4 to Midterm Quiz" for subcategory handler.
+            # Do not skip item-level weights like "assign quiz 1 to 40".
+            if raw_val <= 1.0 and self._resolve_category_targets(proposal, item_query):
+                continue
+            cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if not cat or not item_name:
+                continue
+            weight_val = raw_val if raw_val > 1.0 else round(raw_val * 100, 2)
+            self._set_item_weight_with_validation(proposal, cat, item_name, weight_val)
+
+        # --- Item weight: "<item> weight N%" -----------------------------------------
+        for m in re.finditer(
+            r"(.+?)\s+weight\s+(\d+(?:\.\d+)?)\s*%",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            raw_val = float(m.group(2))
+            # Skip if item_query matches a category name (let category-weight handler take it)
+            if self._resolve_category_targets(proposal, item_query):
+                continue
+            cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if not cat or not item_name:
+                continue
+            self._set_item_weight_with_validation(proposal, cat, item_name, raw_val)
+
+        # --- Remove item from category: "remove <item> from <category>" ---------------
+        for m in re.finditer(
+            r"\b(?:remove|unassign)\s+(.+?)\s+from\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\s*(?:[.,]|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            cat_hint = m.group(2).strip().rstrip("., ")
+            # Only act when item_query is NOT a top-level category name
+            if self._resolve_category_targets(proposal, item_query):
+                continue
+            cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if not cat or not item_name:
+                continue
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            if targets and cat.name.lower() != targets[0].name.lower():
+                continue
+            cat.items = [i for i in cat.items if i != item_name]
+            cat.item_weights.pop(item_name, None)
+            self._append_effect_note(proposal, f"Removed '{item_name}' from {cat.name}")
+
+    def _apply_item_remove_rename(self, proposal: GradebookProposal, prompt: str) -> None:
+        """Handle explicit grade-item remove/rename commands before category removal logic."""
+        # Remove with explicit category context: "remove X from Final Exam"
+        for m in re.finditer(
+            r"\b(?:remove|delete|unassign)\s+(.+?)\s+from\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\s*(?:[.,]|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            cat_hint = m.group(2).strip().rstrip("., ")
+            if not item_query:
+                continue
+            cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if not cat or not item_name:
+                continue
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            if targets and cat.name.lower() != targets[0].name.lower():
+                continue
+            cat.items = [i for i in (cat.items or []) if i != item_name]
+            cat.item_weights.pop(item_name, None)
+            self._append_effect_note(proposal, f"Removed '{item_name}' from {cat.name}")
+
+        # Remove with prefix phrasing: "remove grade item X"
+        for m in re.finditer(
+            r"\b(?:remove|delete|unassign)\s+(?:the\s+)?(?:(?:manual\s+)?grade\s+item)\s+(.+?)(?:[.,]|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            if not item_query:
+                continue
+            cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if not cat or not item_name:
+                continue
+            cat.items = [i for i in (cat.items or []) if i != item_name]
+            cat.item_weights.pop(item_name, None)
+            self._append_effect_note(proposal, f"Removed '{item_name}' from {cat.name}")
+
+        # Remove without explicit category: "remove fina grade item" / "delete grade item fina"
+        for m in re.finditer(
+            r"\b(?:remove|delete|unassign)\s+(?:the\s+)?(?:(?:manual\s+)?grade\s+item\s+)?(.+?)\s+(?:grade\s+item|item)\b",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            if not item_query:
+                continue
+            cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if not cat or not item_name:
+                continue
+            cat.items = [i for i in (cat.items or []) if i != item_name]
+            cat.item_weights.pop(item_name, None)
+            self._append_effect_note(proposal, f"Removed '{item_name}' from {cat.name}")
+
+        # Rename item: "rename grade item fina to final" / "rename fina item to final"
+        for m in re.finditer(
+            r"\brename\s+(?:the\s+)?(?:(?:manual\s+)?grade\s+item\s+)?(.+?)\s+(?:grade\s+item\s+|item\s+)?to\s+(.+?)(?:[.,]|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            src_query = m.group(1).strip().rstrip("., ")
+            dest_name = m.group(2).strip().rstrip("., ")
+            if not src_query or not dest_name:
+                continue
+
+            # Guard against category rename phrases only when the source text
+            # matches an existing category name directly (not fuzzy aliases).
+            src_norm = self._normalize_name(src_query)
+            if any(self._normalize_name(cat.name) == src_norm for cat in proposal.categories):
+                continue
+
+            cat, item_name = self._find_item_in_proposal(proposal, src_query)
+            if not cat or not item_name:
+                continue
+
+            if any(str(existing).strip().lower() == dest_name.lower() for existing in (cat.items or [])):
+                continue
+
+            cat.items = [dest_name if i == item_name else i for i in (cat.items or [])]
+            if item_name in (cat.item_weights or {}):
+                cat.item_weights[dest_name] = cat.item_weights.pop(item_name)
+            self._append_effect_note(proposal, f"Renamed '{item_name}' to '{dest_name}' in {cat.name}")
+
+    def _apply_item_additions(self, proposal: GradebookProposal, prompt: str) -> None:
+        """Handle direct creation of manual grade items from chat prompts."""
+        for m in re.finditer(
+            r"\b(?:add|create|make|insert)\s+(?:a\s+)?(?:(?:manual\s+)?grade\s+item|manual\s+item|item)\s+"
+            r"(.+?)\s+(?:to|into|under|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\s*(?:[.,]|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_name = m.group(1).strip().rstrip("., ")
+            cat_hint = m.group(2).strip().rstrip("., ")
+            if not item_name:
+                continue
+
+            if any(str(category.name).strip().lower() == item_name.lower() for category in proposal.categories):
+                continue
+
+            targets = self._resolve_category_targets(proposal, cat_hint)
+            if not targets:
+                continue
+
+            target_cat = targets[0]
+            if any(str(existing).strip().lower() == item_name.lower() for existing in (target_cat.items or [])):
+                continue
+
+            if target_cat.items is None:
+                target_cat.items = []
+            target_cat.items.append(item_name)
+            self._append_effect_note(proposal, f"Added manual grade item '{item_name}' to {target_cat.name}")
+
+    def _set_item_weight_with_validation(
+        self,
+        proposal: GradebookProposal,
+        category: GradebookCategory,
+        item_name: str,
+        weight_pct: float,
+    ) -> None:
+        """Set per-item weight with range and category-total validation."""
+        value = round(float(weight_pct), 2)
+        if value < 0.0 or value > 100.0:
+            self._append_unique_note(
+                proposal,
+                f"Item weight check: '{item_name}' in {category.name} must be between 0% and 100%.",
+            )
+            return
+
+        current = float((category.item_weights or {}).get(item_name, 0.0))
+        current_total = sum(float(v or 0.0) for v in (category.item_weights or {}).values())
+        new_total = current_total - current + value
+        if new_total > 100.0 + 0.001:
+            self._append_unique_note(
+                proposal,
+                f"Item weight check: {category.name} item weights would total {new_total:.1f}% (max 100%).",
+            )
+            return
+
+        category.item_weights[item_name] = value
+        self._append_effect_note(proposal, f"Set item weight for '{item_name}' in {category.name} to {value:.1f}%")
+
+    def _apply_subcategory_weight_updates(self, proposal: GradebookProposal, prompt: str) -> None:
+        patterns = (
+            re.compile(
+                r"\b(?:set|assign|update|change|make)\s+weight\s+(?:of\s+)?([a-zA-Z][a-zA-Z\- ]{1,60}?)\s+(?:to|as|=)\s+(\d+(?:\.\d+)?)\s*%?\b",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"\b(?:set|assign|update|change|make)\s+(\d+(?:\.\d+)?)\s*%?\s+(?:to|for)\s+([a-zA-Z][a-zA-Z\- ]{1,60})\b",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"\b([a-zA-Z][a-zA-Z\- ]{1,60})\s+weight\s+(?:is|to|=)\s+(\d+(?:\.\d+)?)\s*%?\b",
+                flags=re.IGNORECASE,
+            ),
+        )
+
+        updates: List[Tuple[str, float]] = []
+        for idx, pattern in enumerate(patterns):
+            for match in pattern.finditer(prompt):
+                if idx == 1:
+                    raw_weight = match.group(1)
+                    raw_name = match.group(2)
+                else:
+                    raw_name = match.group(1)
+                    raw_weight = match.group(2)
+                if not raw_name or not raw_weight:
+                    continue
+                updates.append((raw_name.strip().rstrip(".,;:!?"), float(raw_weight)))
+
+        if not updates:
+            return
+
+        for raw_name, parsed_weight in updates:
+            normalized_target = self._normalize_name(raw_name)
+            if not normalized_target:
+                continue
+
+            matched_parent: Optional[GradebookCategory] = None
+            matched_sub: Optional[GradebookSubcategory] = None
+
+            for category in proposal.categories:
+                for sub in (category.subcategories or []):
+                    if self._normalize_name(sub.name) == normalized_target:
+                        matched_parent = category
+                        matched_sub = sub
+                        break
+                if matched_sub is not None:
+                    break
+
+            if matched_parent is None or matched_sub is None:
+                continue
+
+            resolved_weight = self._parse_subcategory_weight_value(str(parsed_weight), float(matched_parent.weight))
+            if resolved_weight is None:
+                continue
+
+            matched_sub.weight = round(float(resolved_weight), 2)
+            self._append_effect_note(
+                proposal,
+                f"Set {matched_sub.name} split weight in {matched_parent.name} to {matched_sub.weight:.1f}%",
+            )
 
     def _parse_weight_assignments(
         self,
@@ -1051,11 +2186,36 @@ class ProposalGenerator:
         prompt: str,
         skip_split_pieces: bool = False,
     ) -> Dict[str, float]:
+        # Strip item-weight clauses so they don't get misread as category weights.
+        # Example: "set weight of quiz 1 to 40" must not become "Quizzes = 1".
+        item_clause_patterns = (
+            re.compile(
+                r"\b(?:set|assign|give)\s+(?:the\s+)?weight\s+of\s+(.+?)\s+to\s+\d+(?:\.\d+)?\s*%?(?:\s|,|$)",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"\bassign\s+(.+?)\s+(?:to|=)\s+\d+(?:\.\d+)?\s*%?(?:\s|,|$)",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"\b(.+?)\s+weight\s+\d+(?:\.\d+)?\s*%(?:\s|,|$)",
+                flags=re.IGNORECASE,
+            ),
+        )
+        prompt_for_categories = prompt
+        for pattern in item_clause_patterns:
+            def _strip_item_clause(match: re.Match) -> str:
+                item_query = (match.group(1) or "").strip().rstrip(".,;:!?")
+                _, item_name = self._find_item_in_proposal(proposal, item_query)
+                return " " if item_name else match.group(0)
+
+            prompt_for_categories = pattern.sub(_strip_item_clause, prompt_for_categories)
+
         # Handle "from X% to Y%" — only use the destination value Y.
         clean_prompt = re.sub(
             r"(\bfrom\s+\d+(?:\.\d+)?\s*%\s*to\b)",
             "to",
-            prompt,
+            prompt_for_categories,
             flags=re.IGNORECASE,
         )
 
@@ -1205,6 +2365,7 @@ class ProposalGenerator:
                     display_type=getattr(src, "display_type", GRADE_DISPLAY_TYPE_DEFAULT) if src else GRADE_DISPLAY_TYPE_DEFAULT,
                     decimals=getattr(src, "decimals", -1) if src else -1,
                     calculation_formula=getattr(src, "calculation_formula", None) if src else None,
+                    formula_override=bool(getattr(src, "formula_override", False)) if src else False,
                     formula_item_refs=list(getattr(src, "formula_item_refs", []) or []) if src else [],
                     formula_unresolved_refs=list(getattr(src, "formula_unresolved_refs", []) or []) if src else [],
                 )
@@ -1316,37 +2477,188 @@ class ProposalGenerator:
             proposal.categories.append(GradebookCategory(name=name, weight=inferred_weight, items=[]))
             self._append_effect_note(proposal, f"Added '{name}' with weight {inferred_weight:.1f}%")
 
-    def _detect_split_parent(self, proposal: GradebookProposal, prompt: str) -> Optional[str]:
-        # 1) "Split Assignments ... into ..."
-        direct = re.search(r"\b(?:split|divide)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(|\s+into\b)", prompt, flags=re.IGNORECASE)
-        if direct:
-            resolved = self._resolve_category_name(proposal, direct.group(1).strip())
-            if resolved:
-                return resolved
+    _SPLIT_PARENT_LABEL_STOPWORDS = frozenset(
+        {"it", "this", "that", "them", "each", "the", "a", "an", "one", "ones"}
+    )
 
-        # 2) "In Labs, ... split/divide into ..." or "For Labs, ..."
-        scoped = re.search(
-            r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,.*\b(?:split|divide)\b",
-            prompt,
-            flags=re.IGNORECASE,
+    def _extract_split_parent_label(self, prompt: str) -> Optional[str]:
+        """Extract the raw parent category label from a split/subcategory prompt."""
+        # Prefer scoped "In Labs, divide/split ..." before "divide it into ..." pronoun forms.
+        patterns = (
+            re.compile(
+                r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,.*\b(?:split|divide)\b",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,.*\badd\s+subcategories\b",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(r"\b(?:split|divide)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(|\s+into\b)", flags=re.IGNORECASE),
         )
-        if scoped:
-            resolved = self._resolve_category_name(proposal, scoped.group(1).strip())
-            if resolved:
-                return resolved
-
-        # 3) "In Labs, add subcategories:" or "For Labs, add subcategories:"
-        add_subs = re.search(
-            r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,.*\badd\s+subcategories\b",
-            prompt,
-            flags=re.IGNORECASE,
-        )
-        if add_subs:
-            resolved = self._resolve_category_name(proposal, add_subs.group(1).strip())
-            if resolved:
-                return resolved
-
+        for pattern in patterns:
+            match = pattern.search(prompt)
+            if not match:
+                continue
+            label = re.sub(r"\s+", " ", (match.group(1) or "").strip())
+            if not label:
+                continue
+            if self._normalize_name(label) in self._SPLIT_PARENT_LABEL_STOPWORDS:
+                continue
+            return label
         return None
+
+    def _resolve_existing_category_name(self, proposal: GradebookProposal, raw_name: str) -> Optional[str]:
+        """Resolve a category label only when that category exists in the proposal."""
+        resolved = self._resolve_category_name(proposal, raw_name)
+        if not resolved:
+            return None
+        return self._find_existing_name(proposal, resolved)
+
+    def _append_category_not_found_effect(self, proposal: GradebookProposal, raw_name: str, action: str) -> None:
+        clean_name = re.sub(r"\s+", " ", (raw_name or "").strip()) or "category"
+        clean_action = re.sub(r"\s+", " ", (action or "modify").strip()) or "modify"
+        self._append_effect_note(
+            proposal,
+            f"Tried to {clean_action} '{clean_name}', but category was not found. No changes made.",
+        )
+
+    def _has_category_not_found_effect(self, proposal: GradebookProposal, raw_name: str) -> bool:
+        target = self._normalize_name(raw_name)
+        if not target:
+            return False
+        for note in (proposal.notes or []):
+            if not str(note).startswith("Effect:"):
+                continue
+            low = str(note).lower()
+            if "not found" in low and target in self._normalize_name(low):
+                return True
+        return False
+
+    _MISSING_CATEGORY_LABEL_STOP_PHRASES = (
+        "the number of",
+        "in particular",
+        "teaching and learning",
+        "references needed",
+        "number of references",
+    )
+
+    @staticmethod
+    def _prompt_has_scoped_category_modification_intent(prompt: str) -> bool:
+        """True when the user is trying to change a specific category, not narrating syllabus text."""
+        prompt_l = (prompt or "").lower().strip()
+        if not prompt_l:
+            return False
+
+        if re.search(
+            r"\b(?:give me (?:a )?proposal|show proposal|generate proposal|build proposal|create proposal|make proposal)\b",
+            prompt_l,
+        ):
+            return False
+
+        if re.search(
+            r"\b(?:in|for)\s+[a-z][a-z0-9 ]{0,40}?\s*,\s*(?:keep|set|split|divide|drop|hide|show|lock|add|assign|change|adjust|update)\b",
+            prompt_l,
+        ):
+            return True
+        if re.search(r"\b(?:in|for)\s+[a-z][a-z0-9 ]{0,40}?\s+(?:keep|set|split|divide|drop|hide|show|lock|add)\b", prompt_l):
+            return True
+        if re.search(r"\b(?:split|divide)\b.+\binto\b", prompt_l):
+            return True
+        if re.search(
+            r"\b(?:set|assign|change|adjust|update|make)\s+(?:the\s+)?(?:assignments?|labs?|midterm|final|quizzes?|projects?|participation)\b",
+            prompt_l,
+        ):
+            return True
+        return False
+
+    def _is_plausible_missing_category_label(self, label: str) -> bool:
+        clean = re.sub(r"\s+", " ", (label or "").strip().lower())
+        if not clean or len(clean) > 48:
+            return False
+        if len(clean.split()) > 4:
+            return False
+        if self._normalize_name(clean) in self._SPLIT_PARENT_LABEL_STOPWORDS:
+            return False
+        if any(phrase in clean for phrase in self._MISSING_CATEGORY_LABEL_STOP_PHRASES):
+            return False
+        if re.search(r"\b(?:the|and|of|for|in|to|a|an)\b", clean) and not re.search(
+            r"\b(?:assignment|assignments|lab|labs|quiz|quizzes|midterm|final|exam|project|homework|participation)\b",
+            clean,
+        ):
+            return False
+        return True
+
+    def _extract_scoped_category_labels(self, prompt: str) -> List[str]:
+        labels: List[str] = []
+        seen: set[str] = set()
+        patterns = (
+            re.compile(
+                r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,\s*(?:keep|set|split|divide|drop|hide|show|lock|add|assign|change|adjust|update)\b",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)\s+(?:keep|set|split|divide|drop|hide|show|lock|add)\b",
+                flags=re.IGNORECASE,
+            ),
+        )
+        for pattern in patterns:
+            for match in pattern.finditer(prompt):
+                label = re.sub(r"\s+", " ", (match.group(1) or "").strip())
+                key = label.lower()
+                if not label or key in seen:
+                    continue
+                if not self._is_plausible_missing_category_label(label):
+                    continue
+                seen.add(key)
+                labels.append(label)
+        return labels
+
+    def _infer_scoped_category_action(self, prompt: str) -> str:
+        prompt_l = (prompt or "").lower()
+        if re.search(r"\b(?:split|divide)\b.+\binto\b", prompt_l) or re.search(r"\badd\s+subcategories\b", prompt_l):
+            return "split"
+        if re.search(r"\b(?:formula|calculation)\b", prompt_l):
+            return "set a formula for"
+        if re.search(r"\b(?:hide|hidden|show|unhide|lock|unlock)\b", prompt_l):
+            return "change visibility for"
+        if re.search(r"\b(?:drop|keep)\s+(?:lowest|highest|top|best)\b", prompt_l):
+            return "change drop/keep rules for"
+        return "modify"
+
+    def _guard_scoped_category_intents(self, proposal: GradebookProposal, prompt: str) -> None:
+        """Warn when a scoped In/For <category> request targets a missing proposal category."""
+        if not self._prompt_has_scoped_category_modification_intent(prompt):
+            return
+
+        prompt_l = (prompt or "").lower()
+        if re.search(r"\b(?:remove|delete|drop)\s+(?:the\s+)?[a-z]", prompt_l):
+            return
+
+        labels = self._extract_scoped_category_labels(prompt)
+        if not labels:
+            split_label = self._extract_split_parent_label(prompt)
+            if split_label and re.search(r"\b(?:split|divide)\b.+\binto\b", prompt_l):
+                labels = [split_label]
+
+        if not labels:
+            return
+
+        action = self._infer_scoped_category_action(prompt)
+        for raw_label in labels:
+            if self._category_exists_in_proposal(proposal, raw_label):
+                continue
+            if self._has_category_not_found_effect(proposal, raw_label):
+                continue
+            self._append_category_not_found_effect(proposal, raw_label, action)
+
+    def _category_exists_in_proposal(self, proposal: GradebookProposal, raw_name: str) -> bool:
+        return self._resolve_existing_category_name(proposal, raw_name) is not None
+
+    def _detect_split_parent(self, proposal: GradebookProposal, prompt: str) -> Optional[str]:
+        label = self._extract_split_parent_label(prompt)
+        if not label:
+            return None
+        return self._resolve_existing_category_name(proposal, label)
 
     def _parse_split_categories(self, prompt: str) -> List[Tuple[str, Optional[float]]]:
         # Try "split/divide X into Y 10%, Z 15%" pattern
@@ -1370,6 +2682,19 @@ class ProposalGenerator:
             cleaned = piece.strip()
             if not cleaned:
                 continue
+            weighted_with_phrase = re.match(
+                r"([a-zA-Z][a-zA-Z\- ]*?)\s+with\s+weight\s+of\s+(\d+(?:\.\d+)?)\s*%?\b",
+                cleaned,
+                flags=re.IGNORECASE,
+            )
+            if weighted_with_phrase:
+                name = weighted_with_phrase.group(1).strip()
+                name = re.sub(r"^[^a-zA-Z]+", "", name)
+                name = re.sub(r"[^a-zA-Z]+$", "", name)
+                if name:
+                    parsed.append((name.title(), float(weighted_with_phrase.group(2))))
+                continue
+
             weighted = re.match(r"([a-zA-Z][a-zA-Z\- ]*?)\s*(\d+(?:\.\d+)?)\s*%", cleaned, flags=re.IGNORECASE)
             if weighted:
                 name = weighted.group(1).strip()
@@ -1378,7 +2703,13 @@ class ProposalGenerator:
                 if name:
                     parsed.append((name.title(), float(weighted.group(2))))
             elif re.search(r"[a-zA-Z]", cleaned):
-                name = re.sub(r"\d+(?:\.\d+)?\s*%", "", cleaned).strip()
+                name = re.sub(
+                    r"\bwith\s+weight\s+of\s+\d+(?:\.\d+)?\s*%?\b",
+                    "",
+                    cleaned,
+                    flags=re.IGNORECASE,
+                ).strip()
+                name = re.sub(r"\d+(?:\.\d+)?\s*%", "", name).strip()
                 name = re.sub(r"^[^a-zA-Z]+", "", name)
                 name = re.sub(r"[^a-zA-Z]+$", "", name)
                 if name:
@@ -1390,25 +2721,53 @@ class ProposalGenerator:
         return parsed
 
     def _apply_split_request(self, proposal: GradebookProposal, prompt: str) -> None:
-        parent_name = self._detect_split_parent(proposal, prompt)
         split_parts = self._parse_split_categories(prompt)
-        if not parent_name or not split_parts:
+        if not split_parts:
+            return
+
+        parent_name = self._detect_split_parent(proposal, prompt)
+        if not parent_name:
+            raw_parent = self._extract_split_parent_label(prompt)
+            if (
+                raw_parent
+                and self._is_plausible_missing_category_label(raw_parent)
+                and not self._has_category_not_found_effect(proposal, raw_parent)
+            ):
+                self._append_category_not_found_effect(proposal, raw_parent, "split")
             return
 
         parent = next((cat for cat in proposal.categories if cat.name.lower() == parent_name.lower()), None)
         if parent is None:
+            if not self._has_category_not_found_effect(proposal, parent_name):
+                self._append_category_not_found_effect(proposal, parent_name, "split")
             return
 
         # Always overwrite previous subcategories and remove prior split notes for this parent
         parent.subcategories = []
         proposal.notes = [n for n in (proposal.notes or []) if not (str(n).startswith(f"Effect: In {parent.name}, split into") or str(n).startswith(f"{parent.name} split requested"))]
 
+        # Pre-compute parsed weights; distribute remainder evenly among unspecified items.
+        parsed_pairs: List[Tuple[str, Optional[float]]] = []
+        for name, weight in split_parts:
+            if weight is not None:
+                pw = self._parse_subcategory_weight_value(str(weight), float(parent.weight))
+                parsed_pairs.append((name, float(pw) if pw is not None else None))
+            else:
+                parsed_pairs.append((name, None))
+
+        explicit_total = sum(w for _, w in parsed_pairs if w is not None)
+        none_count = sum(1 for _, w in parsed_pairs if w is None)
+        if none_count > 0:
+            default_weight = round(max(0.0, float(parent.weight) - explicit_total) / none_count, 2)
+        else:
+            default_weight = 0.0
+
         subcategories: List[GradebookSubcategory] = []
         labels: List[str] = []
-        for name, weight in split_parts:
-            w = float(weight) if weight is not None else 0.0
-            subcategories.append(GradebookSubcategory(name=name, weight=w))
-            labels.append(f"{name} {w:.1f}%" if weight is not None else name)
+        for name, w in parsed_pairs:
+            actual_w = w if w is not None else default_weight
+            subcategories.append(GradebookSubcategory(name=name, weight=actual_w))
+            labels.append(f"{name} {actual_w:.1f}%")
 
         parent.subcategories = subcategories
         self._append_effect_note(
@@ -1462,14 +2821,18 @@ class ProposalGenerator:
 
         for match in pattern.finditer(prompt):
             raw_category = _clean_phrase(match.group(1) or "")
+
+            # Guard: item-targeted commands are handled by item logic and should
+            # not trigger category deletion fallbacks.
+            if re.search(r"\bfrom\b", raw_category, flags=re.IGNORECASE):
+                continue
+            if re.search(r"\b(?:grade\s+item|item)\b", raw_category, flags=re.IGNORECASE):
+                continue
+
             resolved = self._resolve_category_name(proposal, raw_category)
             if not resolved or resolved in handled:
-                # If not found, acknowledge with a note/effect.
                 if not resolved:
-                    self._append_effect_note(
-                        proposal,
-                        f"Tried to remove '{raw_category}', but category was not found. No changes made.",
-                    )
+                    self._append_category_not_found_effect(proposal, raw_category, "remove")
                 continue
 
             removable = next(
@@ -1477,10 +2840,7 @@ class ProposalGenerator:
                 None,
             )
             if removable is None:
-                self._append_effect_note(
-                    proposal,
-                    f"Tried to remove '{raw_category}', but category was not found. No changes made.",
-                )
+                self._append_category_not_found_effect(proposal, raw_category, "remove")
                 continue
 
             handled.add(resolved)
@@ -1623,9 +2983,41 @@ class ProposalGenerator:
 
     def _find_existing_name(self, proposal: GradebookProposal, target_name: str) -> Optional[str]:
         target = self._normalize_name(target_name)
+
+        def _variants(name: str) -> set[str]:
+            variants = {name}
+            if not name:
+                return variants
+            if name.endswith("ies") and len(name) > 3:
+                variants.add(name[:-3] + "y")
+            if name.endswith("s") and len(name) > 1:
+                variants.add(name[:-1])
+            else:
+                variants.add(name + "s")
+            return {v for v in variants if v}
+
+        target_variants = _variants(target)
         for cat in proposal.categories:
-            if self._normalize_name(cat.name) == target:
+            category_variants = _variants(self._normalize_name(cat.name))
+            if target_variants & category_variants:
                 return cat.name
+
+        # Token-level fallback to handle cases like "Final" vs "Final Exam".
+        def _tokens(name: str) -> set[str]:
+            words = re.findall(r"[a-z0-9]+", name or "")
+            stop = {"exam", "category", "grades", "grade", "total"}
+            return {w for w in words if w and w not in stop}
+
+        target_tokens = _tokens(target)
+        if target_tokens:
+            for cat in proposal.categories:
+                cat_tokens = _tokens(self._normalize_name(cat.name))
+                if not cat_tokens:
+                    continue
+                if target_tokens == cat_tokens:
+                    return cat.name
+                if target_tokens.issubset(cat_tokens) or cat_tokens.issubset(target_tokens):
+                    return cat.name
         return None
 
     # Phrases that ask the agent to auto-normalize weights to sum to 100%.
@@ -1662,9 +3054,49 @@ class ProposalGenerator:
                 break
 
         self._check_split_consistency(proposal)
+        self._check_item_weight_consistency(proposal)
         self._check_rule_effectiveness(proposal)
 
+    def _check_item_weight_consistency(self, proposal: GradebookProposal) -> None:
+        for category in proposal.categories:
+            weights = getattr(category, "item_weights", None) or {}
+            if not isinstance(weights, dict) or not weights:
+                continue
+
+            total = 0.0
+            for item_name, raw in weights.items():
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    self._append_unique_note(
+                        proposal,
+                        f"Item weight check: '{item_name}' in {category.name} has an invalid weight value.",
+                    )
+                    continue
+
+                if value < 0.0 or value > 100.0:
+                    self._append_unique_note(
+                        proposal,
+                        f"Item weight check: '{item_name}' in {category.name} must be between 0% and 100%.",
+                    )
+                total += max(0.0, value)
+
+            if total > 100.0 + 0.001:
+                self._append_unique_note(
+                    proposal,
+                    f"Item weight check: {category.name} item weights total {total:.1f}% (max 100%).",
+                )
+
     def _check_split_consistency(self, proposal: GradebookProposal) -> None:
+        # Replace split-check notes every turn so stale warnings disappear once fixed.
+        proposal.notes = [
+            n for n in (proposal.notes or [])
+            if not (
+                str(n).lower().startswith("split check:")
+                or " internal split totals " in str(n).lower()
+            )
+        ]
+
         for parent in proposal.categories:
             parts = list(getattr(parent, "subcategories", []) or [])
             if not parts:
@@ -1673,7 +3105,7 @@ class ProposalGenerator:
             if abs(split_total - parent.weight) > 0.1:
                 self._append_unique_note(
                     proposal,
-                    f"{parent.name} internal split totals {split_total:.1f}% while parent weight is {parent.weight:.1f}%. "
+                    f"Split check: {parent.name} internal split totals {split_total:.1f}% while parent weight is {parent.weight:.1f}%. "
                     "Please update split weights if you want them to match."
                 )
 

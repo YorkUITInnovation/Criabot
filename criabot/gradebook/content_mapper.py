@@ -103,10 +103,10 @@ class ContentMapper:
                 llm_candidates.append(activity)
 
         # Stage 2: Call LLM only for low-confidence or unmatched items (cost control)
-        llm_by_cmid = {}
+        llm_by_key = {}
         active_mapper_chat_id = mapper_chat_id
         if llm_candidates:
-            llm_by_cmid, active_mapper_chat_id = await self._llm_assignments(
+            llm_by_key, active_mapper_chat_id = await self._llm_assignments(
                 llm_candidates,
                 category_names,
                 preferred_chat_id=mapper_chat_id,
@@ -124,7 +124,9 @@ class ContentMapper:
             item_type = deterministic["item_type"]
 
             # Override with LLM result if available and deterministic was low confidence or uncategorized
-            llm_pick = llm_by_cmid.get(activity.cmid)
+            llm_pick = llm_by_key.get(activity_key)
+            if llm_pick is None and activity.cmid is not None:
+                llm_pick = llm_by_key.get(activity.cmid)
             if llm_pick and (confidence < 0.8 or category_name == self.UNCATEGORIZED):
                 category_name = llm_pick["category"]
                 confidence = float(llm_pick.get("confidence", 0.75))
@@ -137,6 +139,7 @@ class ContentMapper:
                 "module_type": activity.module,
                 "itemtype": activity.itemtype or "mod",
                 "activity_name": activity.name,
+                "activity_key": activity_key,
                 "item_source": item_type,  # "activity" or "manual" grade item
                 "suggested_category": category_name,
                 "confirmed_category": category_name,
@@ -157,15 +160,18 @@ class ContentMapper:
 
         # Normalize invalid category references to uncategorized so downstream
         # handling does not apply stale/deleted categories.
-        invalid_by_cmid = {
-            item.get("moodle_cmid"): item
-            for item in validation_errors
-            if item.get("moodle_cmid") is not None
-        }
-        if invalid_by_cmid:
+        invalid_by_key = {}
+        for item in validation_errors:
+            activity_key = item.get("activity_key")
+            if activity_key:
+                invalid_by_key[activity_key] = item
+            elif item.get("moodle_cmid") is not None:
+                invalid_by_key[item.get("moodle_cmid")] = item
+        if invalid_by_key:
             for item in mapping:
+                activity_key = item.get("activity_key")
                 cmid = item.get("moodle_cmid")
-                if cmid in invalid_by_cmid:
+                if activity_key in invalid_by_key or cmid in invalid_by_key:
                     item["suggested_category"] = self.UNCATEGORIZED
                     item["confirmed_category"] = self.UNCATEGORIZED
                     if item not in uncategorized:
@@ -201,6 +207,7 @@ class ContentMapper:
                 continue
             issues.append(
                 {
+                    "activity_key": row.get("activity_key"),
                     "moodle_cmid": row.get("moodle_cmid"),
                     "activity_name": row.get("activity_name"),
                     "missing_category": suggested,
@@ -315,22 +322,33 @@ class ContentMapper:
         valid_categories[self.UNCATEGORIZED] = self.UNCATEGORIZED
 
         out = {}
-        for row in parsed:
+        for idx, row in enumerate(parsed):
             try:
+                activity_key = str(row.get("activity_key") or "").strip()
                 cmid = row.get("moodle_cmid")
-                if cmid is None:
-                    logger.warning("LLM response row missing 'moodle_cmid'. Skipping row.")
+                if activity_key == "" and cmid is None:
+                    logger.warning("LLM response row missing both 'activity_key' and 'moodle_cmid'. Skipping row.")
                     continue
                 category = str(row.get("category") or "").strip()
                 canonical = valid_categories.get(category.lower())
                 if not canonical:
                     logger.warning(f"Invalid category '{category}' in LLM response. Skipping row.")
                     continue
-                out[cmid] = {
+                key = activity_key
+                if key == "":
+                    activity = course_activities[idx] if idx < len(course_activities) else None
+                    if activity is None:
+                        logger.warning("LLM response row could not be matched to a course activity index. Skipping row.")
+                        continue
+                    key = self._activity_key(activity, idx)
+                value = {
                     "category": canonical,
                     "confidence": float(row.get("confidence", 0.75)),
                     "reasoning": str(row.get("reasoning") or "Mapped using LLM category classification."),
                 }
+                out[key] = value
+                if cmid is not None:
+                    out[cmid] = value
             except Exception as e:
                 logger.exception(f"Error processing LLM response row: {e}")
                 continue
@@ -342,7 +360,9 @@ class ContentMapper:
         for activity in course_activities:
             item_source = "Activity Module" if (activity.cmid and activity.module) else "Manual Grade Item"
             activity_rows.append({
+                "activity_key": self._activity_key(activity, len(activity_rows)),
                 "moodle_cmid": activity.cmid,
+                "grade_item_id": activity.grade_item_id,
                 "module": activity.module or "N/A",
                 "activity_name": activity.name,
                 "item_source": item_source,
@@ -399,7 +419,7 @@ class ContentMapper:
                 f"If an item genuinely doesn't fit any category, use '{self.UNCATEGORIZED}' so professor can manually review.",
                 f"Use '{self.NOT_GRADED}' ONLY for administrative items (announcements, resources, links) with zero grade points.",
                 "DO NOT default everything to 'Assignments' — be precise and use keyword matching.",
-                "Return ONLY a JSON array with objects: {moodle_cmid (int), category (string), confidence (0.5-1.0), reasoning (string)}.",
+                "Return ONLY a JSON array with objects: {activity_key (string), moodle_cmid (int|null), category (string), confidence (0.5-1.0), reasoning (string)}.",
                 "Reasoning must explain WHY you chose this category (e.g., 'Matched keyword Quiz in name' or 'Quiz module type').",
             ],
         }

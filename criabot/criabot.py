@@ -44,7 +44,7 @@ from .faq.crawler import FAQCrawler
 from .faq.indexer import FAQDocument, FAQIndexer
 from .gradebook.analyzer import SyllabusAnalyzer
 from .gradebook.conversation import ConversationManager
-from .gradebook.schemas import CourseActivity, MoodleResource
+from .gradebook.schemas import BaselineSnapshotV1, CourseActivity, MoodleResource
 from .gradebook.session import GradebookSessionEngine
 from .schemas import InitializedAlreadyError
 
@@ -1534,22 +1534,41 @@ class Criabot:
         bot_name: str,
         moodle_resources: List[dict],
         course_activities: List[dict],
+        baseline_snapshot: dict | None = None,
+        import_mode: str | None = None,
     ) -> dict:
         resources = [MoodleResource(**resource) for resource in moodle_resources]
         activities = [CourseActivity(**activity) for activity in course_activities]
+        normalized_snapshot = baseline_snapshot
+        if isinstance(baseline_snapshot, BaselineSnapshotV1):
+            normalized_snapshot = baseline_snapshot.model_dump()
         session = await self._gradebook.start(
             course_id=course_id,
             professor_id=professor_id,
             bot_name=bot_name,
             moodle_resources=resources,
             course_activities=activities,
+            baseline_snapshot=normalized_snapshot,
+            import_mode=import_mode,
         )
 
         initial_message = (
             "I've found syllabus-like content and started analysis."
             if session.phase == "ANALYSIS"
-            else "I couldn't find a syllabus yet. Please provide syllabus details to continue."
+            else (
+                "An existing gradebook layout was detected and captured as the baseline. "
+                "Say 'show proposal' to continue with baseline mode or 'start fresh' to regenerate from syllabus."
+                if session.phase == "BASELINE_READY"
+                else (
+                "An existing gradebook layout was detected and captured as the baseline."
+                if (session.extraction or {}).get("baseline_available")
+                else "I couldn't find a syllabus yet. Please provide syllabus details to continue."
+                )
+            )
         )
+
+        if (session.extraction or {}).get("baseline_available") and session.phase == "ANALYSIS":
+            initial_message = "I've found syllabus-like content and captured the existing gradebook as a baseline."
 
         if session.phase == "ANALYSIS" and self._gradebook_syllabus_group_name:
             try:
@@ -1572,6 +1591,10 @@ class Criabot:
             "session_id": session.session_id,
             "phase": session.phase,
             "initial_message": initial_message,
+            "baseline_available": bool((session.extraction or {}).get("baseline_available")),
+            "baseline_snapshot": (session.extraction or {}).get("baseline_snapshot"),
+            "import_mode": (session.extraction or {}).get("import_mode"),
+            "context_source": (session.extraction or {}).get("context_source"),
         }
 
     async def gradebook_status(self, session_id: str) -> dict:
@@ -1732,8 +1755,16 @@ class Criabot:
                 )
                 await self._gradebook.register_uploaded_document(session.session_id, uploaded_document_name)
             except Exception as exc:
-                logger.warning("Gradebook chat upload indexing failed for %s: %s", filename, exc)
-                uploaded_document_name = None
+                if FAQIndexer._is_duplicate_upload_error(exc):
+                    logger.info(
+                        "Gradebook chat upload for %s already exists in index; preserving tracked document %s",
+                        filename,
+                        uploaded_document_name,
+                    )
+                    await self._gradebook.register_uploaded_document(session.session_id, uploaded_document_name)
+                else:
+                    logger.warning("Gradebook chat upload indexing failed for %s: %s", filename, exc)
+                    uploaded_document_name = None
 
         extraction = session.extraction or {}
         if not isinstance(extraction, dict):
@@ -1809,6 +1840,23 @@ class Criabot:
             "phase": session.phase,
             "proposal": session.proposal.model_dump() if session.proposal else None,
             "content_mapping": session.content_mapping,
+        }
+
+    async def gradebook_sync_moodle_context(
+        self,
+        session_id: str,
+        course_activities: list | None = None,
+        confirmed_mapping: list | None = None,
+    ) -> dict:
+        session = await self._gradebook.sync_moodle_context(
+            session_id=session_id,
+            course_activities=course_activities,
+            confirmed_mapping=confirmed_mapping,
+        )
+        return {
+            "session_id": session.session_id,
+            "phase": session.phase,
+            "proposal": session.proposal.model_dump() if session.proposal else None,
         }
 
     async def gradebook_finalize(

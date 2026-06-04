@@ -1,4 +1,5 @@
 import pytest
+import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 from criabot.bot.chat.context import ContextRetriever, TextContext, QuestionContext, ContextRetrieverResponse
 from criabot.bot.chat.web_search import WebSearchClient, infer_search_language
@@ -25,8 +26,8 @@ def make_group_search_side_effect(group_to_nodes):
 
 def expected_empty_search_calls(group_count: int) -> int:
     # Empty document groups use: base + broad + keyword + probe = 4 calls
-    # Empty question groups use: base + broad + keyword = 3 calls
-    return (4 * group_count) + (3 * group_count)
+    # Empty question groups use base query only by default (expansions are opt-in).
+    return (4 * group_count) + (1 * group_count)
 
 @pytest.fixture
 def criadex_api():
@@ -192,6 +193,24 @@ async def test_search_groups_with_parent_bots(retriever, bot_mock):
         )
     )
 
+
+@pytest.mark.asyncio
+async def test_question_index_uses_single_pass_by_default(retriever):
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {
+            "child-document-index": [],
+            "child-question-index": [],
+        }
+    )
+
+    await retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=[])
+
+    question_calls = [
+        c for c in retriever._criadex.content.search.call_args_list
+        if c.kwargs.get("group_name") == "child-question-index"
+    ]
+    assert len(question_calls) == 1
+
 @pytest.mark.asyncio
 async def test_hybrid_rerank(retriever, criadex_api):
     nodes = [create_text_node("text 1")]
@@ -252,7 +271,7 @@ def test_build_retrieval_prompts_for_direct_question_adds_focused_variant():
 
 
 @pytest.mark.asyncio
-async def test_retrieve_limits_direct_question_context_to_top_three_nodes(retriever):
+async def test_retrieve_limits_direct_question_context_to_adaptive_budget(retriever):
     nodes = [
         create_text_node("top result", metadata={"group_name": "child-document-index"}, score=0.95),
         create_text_node("second result", metadata={"group_name": "parent1-document-index"}, score=0.85),
@@ -274,7 +293,25 @@ async def test_retrieve_limits_direct_question_context_to_top_three_nodes(retrie
         "top result",
         "second result",
         "third result",
+        "fourth result",
     ]
+
+
+@pytest.mark.asyncio
+async def test_search_groups_queries_configured_extra_index_suffixes(retriever, monkeypatch):
+    monkeypatch.setenv("RETRIEVAL_EXTRA_INDEX_SUFFIXES", "-outcome-index")
+    retriever._bot.name = "child"
+    retriever._extra_index_suffixes = retriever._normalized_suffixes(
+        retriever._parse_suffixes("-outcome-index")
+    )
+    retriever._criadex.content.search.return_value = make_group_search_payload(nodes=[])
+
+    await retriever.search_groups(prompt="hello", metadata_filter=None, extra_bots=[])
+
+    assert any(
+        call.kwargs.get("group_name") == "child-outcome-index"
+        for call in retriever._criadex.content.search.call_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -585,10 +622,12 @@ def test_infer_search_language_french_and_english():
 @pytest.mark.asyncio
 async def test_web_search_client_retries_with_cleaned_explicit_query():
     empty_response = MagicMock()
+    empty_response.status_code = 200
     empty_response.raise_for_status.return_value = None
     empty_response.json.return_value = {"results": []}
 
     hit_response = MagicMock()
+    hit_response.status_code = 200
     hit_response.raise_for_status.return_value = None
     hit_response.json.return_value = {
         "results": [{"title": "Python Release Notes", "url": "https://example.com/python", "content": "Latest release notes."}],
@@ -613,3 +652,60 @@ async def test_web_search_client_retries_with_cleaned_explicit_query():
     assert first_params["q"] == "search the web for the latest Python release notes"
     assert second_params["q"] == "the latest Python release notes"
     assert second_params["language"] == "en-US"
+
+
+@pytest.mark.asyncio
+async def test_web_search_client_retries_on_transient_request_error():
+    success_response = MagicMock()
+    success_response.status_code = 200
+    success_response.json.return_value = {
+        "results": [
+            {
+                "title": "NIST PQC Update",
+                "url": "https://example.com/pqc",
+                "content": "Latest post-quantum cryptography update.",
+            }
+        ]
+    }
+
+    client = AsyncMock()
+    client.get = AsyncMock(side_effect=[httpx.ConnectError("network down"), success_response])
+
+    client_context = AsyncMock()
+    client_context.__aenter__.return_value = client
+    client_context.__aexit__.return_value = None
+
+    with patch("criabot.bot.chat.web_search.httpx.AsyncClient", return_value=client_context):
+        with patch("criabot.bot.chat.web_search.asyncio.sleep", new=AsyncMock()):
+            results = await WebSearchClient(base_url="http://example.test", retry_attempts=2).search(
+                "latest post-quantum cryptography standards",
+                language="en-US",
+            )
+
+    assert len(results) == 1
+    assert client.get.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_web_search_client_returns_empty_for_non_retriable_http_4xx():
+    client_error_response = MagicMock()
+    client_error_response.status_code = 400
+
+    client = AsyncMock()
+    client.get = AsyncMock(return_value=client_error_response)
+
+    client_context = AsyncMock()
+    client_context.__aenter__.return_value = client
+    client_context.__aexit__.return_value = None
+
+    with patch("criabot.bot.chat.web_search.httpx.AsyncClient", return_value=client_context):
+        mocked_sleep = AsyncMock()
+        with patch("criabot.bot.chat.web_search.asyncio.sleep", new=mocked_sleep):
+            results = await WebSearchClient(base_url="http://example.test", retry_attempts=2).search(
+                "plain query",
+                language="en-US",
+            )
+
+    assert results == []
+    # Non-retriable 4xx should not trigger backoff retry sleeps.
+    mocked_sleep.assert_not_awaited()

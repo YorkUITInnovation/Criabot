@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -61,6 +61,10 @@ class GradebookCategory(BaseModel):
     name: str
     weight: float
     items: List[str] = Field(default_factory=list)
+    item_weights: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-item weight overrides stored as percentage values (e.g. 30.0 = 30%)",
+    )
     subcategories: List[GradebookSubcategory] = Field(default_factory=list)
 
     # Aggregation / drop-keep settings
@@ -86,6 +90,10 @@ class GradebookCategory(BaseModel):
         default=None,
         description="Excel-style formula used to compute the category total (e.g. =([midterm]*0.4)+([final]*0.6))",
     )
+    formula_override: bool = Field(
+        default=False,
+        description="When true, allows replacing an existing formula-backed category calculation during apply.",
+    )
     formula_item_refs: List[str] = Field(
         default_factory=list,
         description="Referenced item names/IDs extracted from calculation_formula.",
@@ -94,6 +102,71 @@ class GradebookCategory(BaseModel):
         default_factory=list,
         description="Formula references that could not be resolved to grade item identifiers.",
     )
+
+
+ImportMode = Literal["fresh", "baseline"]
+
+
+class BaselineRootCategory(BaseModel):
+    id: int
+    name: str
+    aggregation: int
+    keephigh: int
+    droplow: int
+    aggregateonlygraded: bool
+    aggregateoutcomes: bool
+
+
+class BaselineTreeNode(BaseModel):
+    type: str
+    depth: int
+    name: Optional[str] = None
+    id: Optional[int] = None
+    itemtype: Optional[str] = None
+    itemmodule: Optional[str] = None
+    iteminstance: Optional[int] = None
+    itemnumber: Optional[int] = None
+    aggregation: Optional[int] = None
+    keephigh: Optional[int] = None
+    droplow: Optional[int] = None
+    aggregateonlygraded: Optional[bool] = None
+    aggregateoutcomes: Optional[bool] = None
+    aggregationcoef: Optional[float] = None
+    aggregationcoef2: Optional[float] = None
+    weightoverride: Optional[bool] = None
+    hidden: Optional[int] = None
+    hiddenuntil: Optional[int] = None
+    locked: Optional[bool] = None
+    locktime: Optional[int] = None
+    calculation: Optional[str] = None
+    display: Optional[int] = None
+    decimals: Optional[int] = None
+    grademin: Optional[float] = None
+    grademax: Optional[float] = None
+    gradepass: Optional[float] = None
+    children: Dict[int, "BaselineTreeNode"] = Field(default_factory=dict)
+
+
+class BaselineStats(BaseModel):
+    category_count: int = 0
+    item_count: int = 0
+    max_depth: int = 0
+    has_formula: bool = False
+    has_locked_items: bool = False
+    has_hidden_items: bool = False
+    item_types: Dict[str, int] = Field(default_factory=dict)
+
+
+class BaselineSnapshotV1(BaseModel):
+    contract_name: Literal["baseline_gradebook_v1"] = "baseline_gradebook_v1"
+    schema_version: Literal[1] = 1
+    available: bool = False
+    courseid: str
+    root_category: Optional[BaselineRootCategory] = None
+    tree: Optional[BaselineTreeNode] = None
+    stats: Optional[BaselineStats] = None
+    error: Optional[str] = None
+    extra: Dict[str, Any] = Field(default_factory=dict)
 
 
 class GradebookProposal(BaseModel):

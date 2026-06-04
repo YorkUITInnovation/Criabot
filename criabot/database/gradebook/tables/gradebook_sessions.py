@@ -36,7 +36,7 @@ class GradebookSessionsTable(BaseTable):
     professor_id: Mapped[str] = mapped_column(String(128), nullable=False)
     bot_name: Mapped[str] = mapped_column(String(128), nullable=False)
     phase: Mapped[str] = mapped_column(
-        Enum('INTAKE', 'ANALYSIS', 'PROPOSAL', 'REFINEMENT', 'ACCEPTED', 'CATEGORIZING', 'COMPLETED', 'FAILED'),
+        Enum('INTAKE', 'ANALYSIS', 'BASELINE_READY', 'PROPOSAL', 'REFINEMENT', 'ACCEPTED', 'CATEGORIZING', 'COMPLETED', 'FAILED'),
         nullable=False,
         default='INTAKE'
     )

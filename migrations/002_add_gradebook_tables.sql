@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS `GradebookSessions` (
     `course_id` VARCHAR(128) NOT NULL COMMENT 'Moodle course ID',
     `professor_id` VARCHAR(128) NOT NULL COMMENT 'Moodle user ID',
     `bot_name` VARCHAR(128) NOT NULL COMMENT 'Associated Cria bot',
-    `phase` ENUM('INTAKE', 'ANALYSIS', 'PROPOSAL', 'REFINEMENT', 'ACCEPTED', 'CATEGORIZING', 'COMPLETED', 'FAILED')
+    `phase` ENUM('INTAKE', 'ANALYSIS', 'BASELINE_READY', 'PROPOSAL', 'REFINEMENT', 'ACCEPTED', 'CATEGORIZING', 'COMPLETED', 'FAILED')
            NOT NULL DEFAULT 'INTAKE' COMMENT 'Current session phase',
     `moodle_resources_json` JSON NULL COMMENT 'Captured Moodle resources for the session',
     `course_activities_json` JSON NULL COMMENT 'Captured Moodle course activities for the session',

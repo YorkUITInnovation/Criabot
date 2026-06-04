@@ -58,6 +58,9 @@ class ConversationManager:
             "final exam",
             "weights",
             "category",
+            "grade item",
+            "manual grade item",
+            "activity",
         )
         return any(keyword in text for keyword in keywords)
 
@@ -123,7 +126,11 @@ class ConversationManager:
     def _looks_like_proposal_request(text: str) -> bool:
         request_markers = (
             "give me a proposal",
+            "give me proposal",
             "give proposal",
+            "proposal based on what you know",
+            "give me proposal based on what you know",
+            "give me a proposal based on what you know",
             "show proposal",
             "generate proposal",
             "build proposal",
@@ -134,6 +141,20 @@ class ConversationManager:
         )
         text_l = text.lower()
         return any(marker in text_l for marker in request_markers)
+
+    @staticmethod
+    def _looks_like_fresh_generation_request(text: str) -> bool:
+        text_l = text.lower()
+        markers = (
+            "start fresh",
+            "fresh generation",
+            "generate from syllabus",
+            "ignore baseline",
+            "do not use baseline",
+            "dont use baseline",
+            "use syllabus only",
+        )
+        return any(marker in text_l for marker in markers)
 
     @staticmethod
     def _detect_aggregation_method(text: str) -> int | None:
@@ -173,9 +194,12 @@ class ConversationManager:
         if self._looks_like_help_request(text):
             return session.phase
 
+        if self._looks_like_listing_request(text):
+            return session.phase
+
         # Explicit proposal requests should not be interpreted as acceptance.
         if self._looks_like_proposal_request(text):
-            if session.phase in {"INTAKE", "ANALYSIS", "PROPOSAL", "REFINEMENT", "ACCEPTED", "COMPLETED"}:
+            if session.phase in {"INTAKE", "ANALYSIS", "BASELINE_READY", "PROPOSAL", "REFINEMENT", "ACCEPTED", "COMPLETED"}:
                 return "PROPOSAL"
 
         # Check for acceptance keywords
@@ -221,6 +245,15 @@ class ConversationManager:
         if session.phase == "ANALYSIS":
             return "PROPOSAL"
 
+        if session.phase == "BASELINE_READY":
+            if self._looks_like_fresh_generation_request(text):
+                return "ANALYSIS" if has_syllabus else "INTAKE"
+            if self._looks_like_gradebook_refinement(text) or self._looks_like_gradebook_instruction(text):
+                return "PROPOSAL"
+            if self._looks_like_affirmation(text) or self._looks_like_proposal_request(text):
+                return "PROPOSAL"
+            return "BASELINE_READY"
+
         if session.phase == "REFINEMENT":
             return "REFINEMENT"
 
@@ -257,12 +290,16 @@ class ConversationManager:
             return True
         if re.search(r"\b(?:clear|remove|delete|unset)\b.*\bformula\b", t):
             return True
+        if re.search(r"\b(?:include|exclude)\s+empty\b", t):
+            return True
+        if re.search(r"\b(?:include|exclude|ignore|aggregate)\s+outcomes?\b", t):
+            return True
         # Action verbs must be accompanied by gradebook context or numeric targets
         # to avoid false positives like "make me a pizza".
         if re.search(r"\b(?:set|make|change|adjust|update|increase|decrease|give|assign|replace|apply|use)\b", t):
             has_numeric_target = bool(re.search(r"\b\d+(?:\.\d+)?\s*%?\b", t))
             has_gradebook_context = bool(re.search(
-                r"\b(?:assignments?|labs?|midterm|final(?:\s+exam)?|quizzes?|projects?|participation|category|categories|weight|weights|aggregation|method|formula|gradebook|drop|keep|hide|show|rename|split|subcategor(?:y|ies))\b",
+                r"\b(?:assignments?|labs?|midterm|final(?:\s+exam)?|quizzes?|projects?|participation|category|categories|weight|weights|aggregation|method|formula|gradebook|grade\s+item|manual\s+grade\s+item|activity|activities|drop|keep|hide|show|rename|split|subcategor(?:y|ies))\b",
                 t,
             ))
             if has_numeric_target or has_gradebook_context:
@@ -273,7 +310,7 @@ class ConversationManager:
             "hide", "hidden", "show", "unhide", "reveal", "lock", "unlock",
             "drop", "keep", "extra credit", "aggregat", "method", "weighted",
             "natural", "mean", "weight", "rebalance", "redistribute", "proportion",
-            "normalize", "swap", "move", "to category",
+            "normalize", "swap", "move", "to category", "grade item", "manual grade item",
         )
         for kw in refinement_keywords:
             if kw in t:
@@ -329,6 +366,47 @@ class ConversationManager:
         return any(re.search(p, t) for p in patterns)
 
     @staticmethod
+    def _looks_like_listing_request(text: str) -> bool:
+        """Detect requests to show grade items, activities, or both."""
+        t = text.lower().strip()
+        if not t:
+            return False
+
+        # Allow optional quantifiers/articles between verb and noun: 'show all', 'list all', 'show the'
+        patterns = (
+            r"\b(?:show|list|display)\s+(?:(?:all|the|my|full)\s+)*(?:grade\s+items?|manual\s+grade\s+items?|activities?|activity\s+and\s+grade\s+item|grade\s+item\s+and\s+activity)\b",
+        )
+        return any(re.search(pattern, t) for pattern in patterns)
+
+    @staticmethod
+    def _parse_listing_request_options(text: str) -> Optional[Dict[str, bool]]:
+        """Parse listing scope/fullness options from a listing-style prompt."""
+        t = text.lower().strip()
+        if not t or not ConversationManager._looks_like_listing_request(t):
+            return None
+
+        wants_grade_items = bool(re.search(r"\b(?:manual\s+)?grade\s+items?\b", t))
+        wants_activities = bool(re.search(r"\bactivities?\b", t))
+        show_all = bool(
+            re.search(r"\b(?:show|list|display)\s+all\b", t)
+            or re.search(r"\bfull\s+list\b", t)
+            or re.search(r"\bshow\s+more\b", t)
+        )
+
+        include_grade_items = wants_grade_items or not wants_activities
+        include_activities = wants_activities or not wants_grade_items
+
+        # "show grade items" should return full category item lists by default.
+        if wants_grade_items and not wants_activities:
+            show_all = True
+
+        return {
+            "include_activities": include_activities,
+            "include_grade_items": include_grade_items,
+            "show_all": show_all,
+        }
+
+    @staticmethod
     def _extract_formula_from_prompt(text: str) -> Optional[Dict]:
         """
         Extract formula from user prompt if present.
@@ -346,11 +424,17 @@ class ConversationManager:
             "- Add category: 'Add Quizzes' or 'Added Quizzes'\n"
             "- Add category with weight: 'Add Quizzes 10%'\n"
             "- Aggregation: 'Use weighted mean' or 'Use mean'\n"
-            "- Splits: 'In Labs, split into Lab Reports 10%, In-Lab 5%'\n"
+            "- Split categories: 'In Labs, split into Lab Reports 10%, In-Lab 5%'\n"
+            "- Even split: 'Split Quizzes into Midterm Quiz and Final Quiz' — weights are divided evenly by default\n"
+            "- Subcategory share: 'Assign 0.4 to Midterm Quiz' — 0.4 = 40% of the parent category\n"
             "- Formula: 'Set Assignments formula to =average([[hw1]],[[hw2]])'\n"
-            "- Visibility/rules: 'Hide Midterm until 2026-05-19' or 'Drop lowest 1 from Assignments'\n"
+            "- Rules/visibility: 'Hide Midterm until 2026-05-19' or 'Drop lowest 1 from Assignments'\n"
+            "- Grade items: 'Add grade item X to Final Exam'\n"
+            "- Listing: 'Show grade items', 'Show activities', 'Show activities and grade items', 'Show all activities', 'Show all grade items'\n"
+            "- Grade item edits: 'remove grade item X' or 'rename grade item X to Y'\n"
             "- Finalize: 'Accept proposal and generate mapping'\n"
-            "- Undo/Redo: 'undo' or 'redo'\n\n"
+            "- Mapping fix: 'Add a manual grade item for Final Exam in mapping'\n"
+            "- Undo/redo: 'undo' or 'redo'\n\n"
             "Tip: type 'help' to see the full supported instruction list."
         )
 
@@ -369,13 +453,22 @@ class ConversationManager:
             "- 'Add Quizzes' — creates the category at 0% so you can rebalance later\n"
             "- 'Add Projects 15%' — creates the category with that weight immediately\n"
             "- 'Added Quizzes' — shorthand phrasing also works\n\n"
+            "**Grade items and activities**\n"
+            "- 'Add grade item X to Final Exam' — creates a manual grade item inside a category\n"
+            "- 'Show grade items' — lists proposal items inside each category\n"
+            "- 'Show activities' — lists Moodle activities only\n"
+            "- 'Show activities and grade items' — lists Moodle activities alongside proposal items\n"
+            "- 'Show all activities' — lists the complete Moodle activity list without truncation\n"
+            "- 'Show all grade items' — lists all proposal grade items without truncation\n"
+            "- 'remove grade item X' or 'remove X from Final Exam' — removes a grade item\n"
+            "- 'rename grade item X to Y' — renames a grade item in place\n\n"
             "**Remove / drop a category**\n"
             "- 'Remove Quizzes' — frees the weight (total decreases; you can reallocate later)\n"
             "- 'Drop Labs evenly' — removes Labs and spreads its weight equally across remaining categories\n"
             "- 'Delete Midterm and give weight to Final Exam' — removes Midterm and adds its weight to Final Exam\n"
             "- 'Remove Assignments and split weight among Labs and Midterm' — removes Assignments and splits weight equally between the two targets\n\n"
             "**Aggregation method**\n"
-            "- 'Use Weighted mean of grades'\n"
+            "- 'Use weighted mean of grades'\n"
             "- 'Switch to Natural'\n"
             "- 'Show aggregation methods'\n\n"
             "**Excel-style formulas**\n"
@@ -387,13 +480,28 @@ class ConversationManager:
             "If a formula is invalid, I'll return a direct warning and ask you to retry.\n"
             "Formula help: [YorkU custom formula guide](https://lthelp.yorku.ca/gradebook/creating-a-custom-formula)\n"
             "Excel help: [Excel formula reference](https://support.microsoft.com/excel)\n\n"
+            "**Split subcategories**\n"
+            "- 'In Quizzes, split into Midterm Quiz and Final Quiz' — weights divided evenly (e.g. 12.5% each if parent is 25%)\n"
+            "- 'Split Quizzes into Midterm Quiz with weight 0.4 and Final Quiz with weight 0.6' — 0.4/0.6 are fractions of parent weight\n"
+            "- 'Assign 0.4 to Midterm Quiz' — updates a subcategory share (0.4 × parent weight = 10% when parent is 25%)\n"
+            "- 'Assign 0.6 to Final Quiz' — once all shares sum to 1.0, the split warning clears\n\n"
+            "**Grade items (activities)**\n"
+            "- 'Move quiz 1 to Final Exam' — reassigns a grade item to a different category\n"
+            "- 'Move quiz 2 from Quizzes to Assignments' — explicit source and target\n"
+            "- 'Set weight of quiz 1 to 30%' — overrides an item's weight within its category\n"
+            "- 'quiz 1 weight 30%' — shorthand weight update\n"
+            "- 'Remove quiz 1 from Assignments' — unassigns an item from its category\n"
+            "Note: item changes affect mapping suggestions at accept time.\n\n"
             "**Rules and visibility**\n"
             "- 'Drop lowest 1 from Assignments'\n"
             "- 'Keep highest 2 from Labs'\n"
-            "- 'Hide Midterm until 2026-05-19'\n\n"
+            "- 'Hide Midterm until 2026-05-19'\n"
+            "- 'For Assignments, exclude empty grades' or 'Include empty grades for Labs'\n\n"
             "**Finalize flow**\n"
             "- 'Accept proposal and generate mapping'\n"
             "- 'Show mapping rows before finalize'\n"
+            "- 'Add a manual grade item for Midterm in mapping'\n"
+            "- If a category has no activity row, map an existing activity, remove the category, or add a manual grade item in the mapping UI\n"
             "- 'Finalize now'"
         )
 
@@ -420,6 +528,11 @@ class ConversationManager:
         if text and self._looks_like_help_request(text):
             return self._supported_instructions_help_text()
 
+        if text:
+            listing_options = self._parse_listing_request_options(text)
+            if listing_options:
+                return self._format_activity_and_grade_item_summary(session, proposal, **listing_options)
+
         # Handle questions: answer them without forcing phase transitions
         if text and self._looks_like_question(text):
             answer = self._answer_question(session, text, proposal)
@@ -427,7 +540,7 @@ class ConversationManager:
                 return answer
 
         # Uploaded/attached context should trigger analysis guidance, not unsupported warnings.
-        if text and self._looks_like_upload_signal(text):
+        if text and self._looks_like_upload_signal(text) and not self._looks_like_proposal_request(text):
             return (
                 "Thanks, I received your syllabus/supporting document. "
                 "I'll analyze it and use it to improve your gradebook proposal. "
@@ -481,6 +594,12 @@ class ConversationManager:
                 "I'm processing this information..."
             )
 
+        if session.phase == "BASELINE_READY":
+            return (
+                "I captured your existing Moodle gradebook as the baseline and it is ready for refinement. "
+                "Say 'show proposal' to continue with this baseline, or 'start fresh' to regenerate from syllabus context."
+            )
+
         if session.phase == "PROPOSAL" and proposal:
             # For formula parsing failures, return a focused warning instead of re-rendering full proposal.
             formula_requested = self._extract_formula_from_prompt(prompt) is not None
@@ -494,6 +613,7 @@ class ConversationManager:
             total_weight = sum(cat.weight for cat in proposal.categories)
             effects_text = self._format_effects(proposal)
             notes_text = self._format_notes(session, proposal)
+            item_weight_warning_text = self._format_item_weight_warning(proposal)
             findings_text = self._format_findings(session)
 
             aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
@@ -513,7 +633,7 @@ class ConversationManager:
                 weight_msg = f"\n{weight_warnings[0]}" if weight_warnings else ""
                 return (
                     f"Here is the gradebook structure based on what I found:\n\n"
-                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}"
+                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}{item_weight_warning_text}"
                     f"{weight_msg}"
                     f"{aggregation_msg}\n\n"
                     "Does this look right? If you'd like to adjust any weights, categories, or the grade aggregation method, let me know and I'll refine it."
@@ -532,6 +652,7 @@ class ConversationManager:
                 total_weight = sum(cat.weight for cat in proposal.categories)
                 effects_text = self._format_effects(proposal)
                 notes_text = self._format_notes(session, proposal)
+                item_weight_warning_text = self._format_item_weight_warning(proposal)
                 aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
                 proposal_errors = validate_proposal_weights(proposal)
                 has_weight_error = any(err.get("path") == ["proposal"] for err in proposal_errors)
@@ -545,7 +666,7 @@ class ConversationManager:
                 else:
                     weight_msg = f"\n{weight_warnings[0]}" if weight_warnings else ""
                     return (
-                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n"
+                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}{item_weight_warning_text}\n"
                         f"{weight_msg}\n"
                         f"**Grade Aggregation Method**: {aggregation_name}\n\n"
                         "What else would you like to adjust? I can modify weights, add/remove categories, or rename items."
@@ -557,10 +678,22 @@ class ConversationManager:
                 )
 
         if session.phase == "ACCEPTED":
+            if text:
+                is_mapping_action = bool(
+                    self._looks_like_gradebook_refinement(text)
+                    or self._looks_like_proposal_request(text)
+                    or self._looks_like_affirmation(text)
+                    or self._looks_like_upload_signal(text)
+                    or re.search(r"\b(undo|redo)\b", text)
+                    or re.search(r"\b(finalize|mapping|generate\s+mapping|manual\s+grade\s+item)\b", text)
+                )
+                if not is_mapping_action:
+                    return self._unsupported_request_warning()
             return (
                 "✓ Gradebook proposal accepted! "
                 "I'm now mapping your course activities to the grade categories. "
-                "Once complete, you'll review the mapping before I finalize everything in Moodle."
+                "Once complete, you'll review the mapping before I finalize everything in Moodle. "
+                "If a category has no activity row, you can map an existing activity, remove the category, or add a manual grade item."
             )
 
         if session.phase == "COMPLETED":
@@ -618,6 +751,12 @@ class ConversationManager:
                 return "**Midterm** is a major exam at the course's midpoint. **Final exam** is at the end. Both assess overall understanding, but the final is usually cumulative."
             if "participation" in q and ("discussion" in q or "forum" in q):
                 return "**Participation** is engagement activity (class involvement, attendance). **Discussion** is online interaction in forums/chats. They overlap; combine them if your course doesn't distinguish between them."
+
+        if any(term in q for term in ("grade item", "grade items", "activity and grade item", "grade item and activity", "activities and grade items", "activities", "activity")):
+            listing_options = self._parse_listing_request_options(q)
+            if listing_options:
+                return self._format_activity_and_grade_item_summary(session, proposal, **listing_options)
+            return self._format_activity_and_grade_item_summary(session, proposal)
 
         # Questions about weights
         if "weight" in q or "percentage" in q or "how much" in q:
@@ -814,13 +953,21 @@ class ConversationManager:
             if settings:
                 lines.append(f"  ↳ {', '.join(settings)}")
 
-            # Show first few items as examples
+            # Show nested subcategories for baseline-imported gradebooks.
+            if category.subcategories:
+                for subcategory in category.subcategories:
+                    lines.append(f"  ◦ {subcategory.name} ({float(subcategory.weight):.1f}%)")
+
+            # Show first few items; highlight per-item weight overrides when set
+            item_weights = getattr(category, "item_weights", None) or {}
             if category.items and len(category.items) <= 3:
                 for item in category.items[:3]:
-                    lines.append(f"  • {item}")
+                    w_label = f" ({item_weights[item]:.1f}%)" if item in item_weights else ""
+                    lines.append(f"  • {item}{w_label}")
             elif category.items and len(category.items) > 3:
                 for item in category.items[:2]:
-                    lines.append(f"  • {item}")
+                    w_label = f" ({item_weights[item]:.1f}%)" if item in item_weights else ""
+                    lines.append(f"  • {item}{w_label}")
                 lines.append(f"  • ... and {len(category.items) - 2} more")
 
         return "\n".join(lines)
@@ -1017,6 +1164,27 @@ class ConversationManager:
             lines.append(f"- {note}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _format_item_weight_warning(proposal: GradebookProposal) -> str:
+        item_weight_notes = [
+            str(n).strip()
+            for n in (proposal.notes or [])
+            if str(n).strip().lower().startswith("item weight check:")
+        ]
+        if not item_weight_notes:
+            return ""
+
+        lines = [
+            "",
+            "",
+            "**Weight Update Warning:**",
+            "- One or more requested item weight changes were not applied.",
+        ]
+        for note in item_weight_notes[-2:]:
+            lines.append(f"- {note}")
+        lines.append("- Existing valid item weights were kept unchanged.")
+        return "\n".join(lines)
+
     def _syllabus_conflict_warnings(self, session: GradebookSessionRecord, proposal: GradebookProposal) -> List[str]:
         extraction = session.extraction or {}
         if not extraction.get("has_syllabus"):
@@ -1096,6 +1264,73 @@ class ConversationManager:
             return ""
 
         return "I detected the following from syllabus/materials: " + " | ".join(summary_parts) + "\n\n"
+
+    def _format_activity_and_grade_item_summary(
+        self,
+        session: GradebookSessionRecord,
+        proposal: GradebookProposal | None,
+        include_activities: bool = True,
+        include_grade_items: bool = True,
+        show_all: bool = False,
+    ) -> str:
+        activities = list(session.course_activities or [])
+        activity_names = {str(activity.name).strip().lower() for activity in activities if getattr(activity, "name", None)}
+
+        lines = ["Here is the current activity and grade-item summary:"]
+        hidden_activity_count = 0
+        hidden_grade_item_count = 0
+
+        if include_activities:
+            lines.append("")
+            lines.append("**Moodle activities:**")
+            if activities:
+                activity_limit = len(activities) if show_all else 8
+                for activity in activities[:activity_limit]:
+                    module = f" ({activity.module})" if getattr(activity, "module", None) else ""
+                    lines.append(f"- {activity.name}{module}")
+
+                if len(activities) > activity_limit:
+                    hidden_activity_count = len(activities) - activity_limit
+                    lines.append(f"- ... and {hidden_activity_count} more activity(ies)")
+            else:
+                lines.append("- No Moodle activities were found for this session.")
+
+        if include_grade_items:
+            lines.append("")
+            lines.append("**Proposal grade items:**")
+            if proposal and proposal.categories:
+                for category in proposal.categories:
+                    items = list(category.items or [])
+                    if not items:
+                        lines.append(f"- {category.name}: no grade items yet")
+                        continue
+
+                    item_limit = len(items) if show_all else 5
+                    rendered_items = []
+                    for item in items[:item_limit]:
+                        label = "activity" if str(item).strip().lower() in activity_names else "manual"
+                        rendered_items.append(f"{item} [{label}]")
+
+                    if len(items) > item_limit:
+                        hidden_grade_item_count += len(items) - item_limit
+                        extra = f" ... and {len(items) - item_limit} more"
+                    else:
+                        extra = ""
+
+                    lines.append(f"- {category.name}: {', '.join(rendered_items)}{extra}")
+            else:
+                lines.append("- No proposal is available yet.")
+
+        if not show_all and (hidden_activity_count > 0 or hidden_grade_item_count > 0):
+            lines.append("")
+            hints = []
+            if hidden_activity_count > 0:
+                hints.append("'show all activities'")
+            if hidden_grade_item_count > 0:
+                hints.append("'show all grade items'")
+            lines.append("Tip: use " + " or ".join(hints) + " for complete lists.")
+
+        return "\n".join(lines)
 
     @staticmethod
     def _get_aggregation_method_name(method_code: int) -> str:

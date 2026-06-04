@@ -210,6 +210,32 @@ async def test_faq_fallback_caches_repeated_queries():
 
 
 @pytest.mark.asyncio
+async def test_faq_fallback_caches_missing_group_from_graph_search():
+    class GroupNotFoundError(Exception):
+        def __init__(self):
+            self.status_code = 404
+            self.message = '{"code":"GROUP_NOT_FOUND","message":"Group not found"}'
+            super().__init__(self.message)
+
+    sdk = MagicMock()
+    sdk.manage = MagicMock()
+    sdk.content = MagicMock()
+    sdk.manage.graph_search = AsyncMock(side_effect=GroupNotFoundError())
+    sdk.content.search = AsyncMock()
+
+    fallback = FAQFallback(criadex=sdk)
+    fallback._cache.clear()
+
+    first = await fallback.search(prompt="missing faq")
+    second = await fallback.search(prompt="missing faq")
+
+    assert first["response"].nodes == []
+    assert second["response"].nodes == []
+    sdk.manage.graph_search.assert_awaited_once()
+    sdk.content.search.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_faq_indexer_sync_triggers_graph_build():
     sdk = MagicMock()
     sdk.content = MagicMock()

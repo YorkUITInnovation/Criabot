@@ -116,6 +116,86 @@ class ContextRetriever:
         self._semi_known_confidence_threshold = float(os.getenv("RETRIEVAL_SEMI_THRESHOLD", "0.4"))
         self._indexing_retry_attempts = int(os.getenv("RETRIEVAL_INDEXING_RETRY_ATTEMPTS", "3"))
         self._indexing_retry_delay_seconds = float(os.getenv("RETRIEVAL_INDEXING_RETRY_DELAY_SECONDS", "1.0"))
+        self._question_expansion_enabled = os.getenv("RETRIEVAL_QUESTION_EXPANSION_ENABLED", "false").lower() == "true"
+        self._direct_query_max_nodes = int(os.getenv("RETRIEVAL_DIRECT_QUERY_MAX_NODES", "5"))
+        self._complex_query_max_nodes = int(os.getenv("RETRIEVAL_COMPLEX_QUERY_MAX_NODES", "8"))
+        self._index_types = self._resolve_index_types()
+        self._extra_index_suffixes = self._normalized_suffixes(
+            self._parse_suffixes(os.getenv("RETRIEVAL_EXTRA_INDEX_SUFFIXES", ""))
+        )
+        self._document_index_suffixes = self._normalized_suffixes(
+            self._parse_suffixes(os.getenv("RETRIEVAL_DOCUMENT_INDEX_SUFFIXES", "-document-index"))
+        )
+        self._question_index_suffixes = self._normalized_suffixes(
+            self._parse_suffixes(os.getenv("RETRIEVAL_QUESTION_INDEX_SUFFIXES", "-question-index"))
+        )
+
+    @staticmethod
+    def _parse_suffixes(raw_value: str) -> List[str]:
+        if not raw_value:
+            return []
+        return [part.strip() for part in str(raw_value).split(",") if part.strip()]
+
+    @staticmethod
+    def _normalized_suffixes(suffixes: List[str]) -> List[str]:
+        normalized: List[str] = []
+        for suffix in suffixes:
+            normalized_suffix = suffix if suffix.startswith("-") else f"-{suffix}"
+            if normalized_suffix not in normalized:
+                normalized.append(normalized_suffix)
+        return normalized
+
+    def _iter_extra_group_names(self, extra_bots: List[str]) -> List[str]:
+        group_names: List[str] = []
+        if not self._extra_index_suffixes:
+            return group_names
+        for bot_name in dict.fromkeys([self._bot.name, *extra_bots]):
+            for suffix in self._extra_index_suffixes:
+                group_names.append(f"{bot_name}{suffix}")
+        return group_names
+
+    def _is_document_like_group(self, group_name: str) -> bool:
+        return any(group_name.endswith(suffix) for suffix in self._document_index_suffixes)
+
+    def _is_question_like_group(self, group_name: str) -> bool:
+        return any(group_name.endswith(suffix) for suffix in self._question_index_suffixes)
+
+    def _resolve_index_types(self) -> List[str]:
+        configured_raw = os.getenv("RETRIEVAL_INDEX_TYPES", "")
+        configured = [item.strip().upper() for item in configured_raw.split(",") if item.strip()]
+        supported = set(Bot.INDEX_SUFFIX.keys())
+
+        if configured:
+            resolved = [item for item in configured if item in supported]
+            if resolved:
+                return list(dict.fromkeys(resolved))
+
+        default_types = [item for item in self.INDEX_TYPES if item in supported]
+        if default_types:
+            return list(dict.fromkeys(default_types))
+
+        return list(dict.fromkeys(Bot.INDEX_SUFFIX.keys()))
+
+    @classmethod
+    def _is_fact_lookup_request(cls, prompt: str) -> bool:
+        stripped_prompt = (prompt or "").strip()
+        if not stripped_prompt:
+            return False
+
+        if cls._QUESTION_PREFIX_RE.match(stripped_prompt):
+            return True
+
+        token_count = len(re.findall(r"[A-Za-z0-9']+", stripped_prompt))
+        return stripped_prompt.endswith("?") and token_count <= 18
+
+    def _max_nodes_for_prompt(self, prompt: str, summary_style_request: bool) -> int:
+        if summary_style_request:
+            return max(self._complex_query_max_nodes, self._direct_query_max_nodes)
+
+        if self._is_fact_lookup_request(prompt):
+            return max(1, self._direct_query_max_nodes)
+
+        return max(1, self._complex_query_max_nodes)
 
     @staticmethod
     def _extract_listed_file_count(list_payload: object) -> int:
@@ -328,6 +408,8 @@ class ContextRetriever:
             raise TypeError("Unsupported search response payload type")
 
         async def search_named_group(group_name: str, search_config: dict):
+            is_question_group = self._is_question_like_group(group_name)
+
             def build_keyword_query(raw_prompt: str) -> str:
                 tokens = re.findall(r"[A-Za-z0-9']+", raw_prompt or "")
                 keywords = [token for token in tokens if len(token) > 2 or token.isdigit()]
@@ -374,7 +456,7 @@ class ContextRetriever:
 
             # Intermittent ANN/search behavior can return 0 nodes for one source while
             # peers return results. Retry once with a broader config for this group.
-            if not response_obj.nodes:
+            if not response_obj.nodes and (not is_question_group or self._question_expansion_enabled):
                 broad_search_config = {
                     **search_config,
                     "top_k": max(int(search_config.get("top_k", 0) or 0), 50),
@@ -395,7 +477,7 @@ class ContextRetriever:
                         graph_meta = retry_graph_meta
 
             # Final fallback for prompt-specific misses: retry with compact keyword query.
-            if not response_obj.nodes:
+            if not response_obj.nodes and (not is_question_group or self._question_expansion_enabled):
                 keyword_query = build_keyword_query(search_config.get("query", ""))
                 if keyword_query:
                     keyword_search_config = {
@@ -420,7 +502,7 @@ class ContextRetriever:
 
             # Last-resort for document groups: force a lightweight lexical probe to
             # avoid returning an empty source when a group definitely has content.
-            if not response_obj.nodes and group_name.endswith("-document-index"):
+            if not response_obj.nodes and self._is_document_like_group(group_name):
                 probe_search_config = {
                     **search_config,
                     "query": "the",
@@ -447,7 +529,7 @@ class ContextRetriever:
 
             # Fresh uploads may be listed in-group before retrieval is queryable.
             # Retry briefly and mark as indexing so callers can return a specific status.
-            if not response_obj.nodes and group_name.endswith("-document-index"):
+            if not response_obj.nodes and self._is_document_like_group(group_name):
                 attempts = max(self._indexing_retry_attempts, 0)
                 file_count = 0
                 for attempt in range(attempts):
@@ -508,7 +590,7 @@ class ContextRetriever:
                 raise
 
         tasks = []
-        for index_type in self.INDEX_TYPES:
+        for index_type in self._index_types:
             search_config = self.build_search_group_config(
                 prompt=prompt,
                 metadata_filter=metadata_filter,
@@ -519,6 +601,15 @@ class ContextRetriever:
                 *[Bot.bot_group_name(extra_bot, index_type) for extra_bot in extra_bots],
             ]
             for group_name in dict.fromkeys(group_names):
+                tasks.append(safe_search(group_name=group_name, search_config=search_config))
+
+        if self._extra_index_suffixes:
+            search_config = self.build_search_group_config(
+                prompt=prompt,
+                metadata_filter=metadata_filter,
+                extra_groups=[]
+            )
+            for group_name in self._iter_extra_group_names(extra_bots=extra_bots):
                 tasks.append(safe_search(group_name=group_name, search_config=search_config))
 
         results = await asyncio.gather(*tasks)
@@ -716,7 +807,7 @@ class ContextRetriever:
         )
         if not summary_style_request:
             ranked_nodes = self.prioritize_nodes_for_prompt(prompt, ranked_nodes)
-            ranked_nodes = ranked_nodes[:3]
+            ranked_nodes = ranked_nodes[:self._max_nodes_for_prompt(prompt=prompt, summary_style_request=False)]
         if len(ranked_nodes) > 0:
             retriever_response.context = self.build_context(ranked_nodes=ranked_nodes)
         # Give 'er

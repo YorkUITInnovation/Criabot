@@ -1,5 +1,8 @@
 import pytest
+import base64
+from criabot.database.gradebook.tables.gradebook_sessions import GradebookSessionsTable
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from criabot.criabot import Criabot, BotExistsError
 from criabot.schemas import (
@@ -324,9 +327,21 @@ async def test_gradebook_session_flow(criabot_instance):
         bot_name="eecs-1234-bot",
         moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
         course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-1234-F2026",
+            "root_category": {"id": 1, "name": "Course total", "aggregation": 13, "keephigh": 0, "droplow": 0, "aggregateonlygraded": True, "aggregateoutcomes": False},
+            "tree": {"type": "category", "depth": 1, "children": {}},
+            "stats": {"category_count": 1, "item_count": 0, "max_depth": 1, "has_formula": False, "has_locked_items": False, "has_hidden_items": False, "item_types": {}},
+        },
+        import_mode="baseline",
     )
     assert start["session_id"].startswith("gb-")
-    assert start["phase"] == "ANALYSIS"
+    assert start["phase"] == "BASELINE_READY"
+    assert start["import_mode"] == "baseline"
+    assert start["context_source"] == "baseline_import"
 
     session_id = start["session_id"]
     chat = await criabot_instance.gradebook_chat(session_id=session_id, prompt="Please generate proposal")
@@ -344,6 +359,36 @@ async def test_gradebook_session_flow(criabot_instance):
     )
     assert finalized["phase"] == "COMPLETED"
     assert finalized["summary"]["activities_mapped"] == 1
+
+
+def test_gradebook_sessions_phase_enum_includes_baseline_ready():
+    phase_type = GradebookSessionsTable.__table__.c.phase.type
+    assert "BASELINE_READY" in list(getattr(phase_type, "enums", []) or [])
+
+
+@pytest.mark.asyncio
+async def test_gradebook_session_flow_respects_explicit_fresh_mode(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-1234-F2026-fresh",
+        professor_id="prof_jsmith",
+        bot_name="eecs-1234-bot-fresh",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-1234-F2026-fresh",
+            "root_category": {"id": 1, "name": "Course total", "aggregation": 13, "keephigh": 0, "droplow": 0, "aggregateonlygraded": True, "aggregateoutcomes": False},
+            "tree": {"type": "category", "depth": 1, "children": {}},
+            "stats": {"category_count": 1, "item_count": 0, "max_depth": 1, "has_formula": False, "has_locked_items": False, "has_hidden_items": False, "item_types": {}},
+        },
+        import_mode="fresh",
+    )
+
+    assert start["session_id"].startswith("gb-")
+    assert start["import_mode"] == "fresh"
+    assert start["context_source"] == "syllabus_generation"
 
 
 @pytest.mark.asyncio
@@ -445,3 +490,44 @@ async def test_sync_faq_site_invalid_url_marks_error_status(criabot_instance):
     status = criabot_instance.get_faq_sync_status()
     assert status["state"] == "ERROR"
     assert status["error"] is not None
+
+
+@pytest.mark.asyncio
+async def test_gradebook_upload_duplicate_conflict_is_non_fatal(criabot_instance):
+    class DuplicateUploadError(Exception):
+        def __init__(self):
+            self.status_code = 409
+            self.message = '{"status":409,"message":"Requested content already exists in the database.","code":"DUPLICATE"}'
+            super().__init__(self.message)
+
+    session = SimpleNamespace(
+        session_id="gb-session-1",
+        phase="ANALYSIS",
+        bot_name="eclass-faq-bot",
+        proposal=None,
+        extraction={},
+    )
+
+    criabot_instance._gradebook.chat = AsyncMock(return_value=session)
+    criabot_instance._gradebook.register_uploaded_document = AsyncMock()
+    criabot_instance._gradebook_api = SimpleNamespace(
+        sessions=SimpleNamespace(update_session=AsyncMock())
+    )
+    criabot_instance._gradebook_conversation = MagicMock()
+    criabot_instance._gradebook_conversation.make_reply.return_value = "ack"
+
+    criabot_instance._criadex.content = MagicMock()
+    criabot_instance._criadex.content.upload = AsyncMock(side_effect=DuplicateUploadError())
+
+    payload = base64.b64encode(b"Course syllabus with grading percentages").decode("utf-8")
+    result = await criabot_instance.gradebook_upload(
+        session_id="gb-session-1",
+        filename="syllabus.txt",
+        filetype="text/plain",
+        base64_content=payload,
+    )
+
+    assert result["uploaded_document_name"] is not None
+    criabot_instance._gradebook.register_uploaded_document.assert_awaited_once_with(
+        "gb-session-1", result["uploaded_document_name"]
+    )

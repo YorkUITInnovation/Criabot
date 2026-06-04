@@ -12,7 +12,11 @@ view = APIRouter()
 
 
 class ContentMappingItem(BaseModel):
+    grade_item_id: Optional[int] = None
     moodle_cmid: Optional[int] = None
+    activity_name: Optional[str] = None
+    itemtype: Optional[str] = None
+    item_source: Optional[str] = None
     category: str
 
 

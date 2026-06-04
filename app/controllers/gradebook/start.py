@@ -7,6 +7,7 @@ from starlette.requests import Request
 
 from app.controllers.schemas import APIResponse, SUCCESS_CODE, catch_exceptions, general_limiter
 from app.core.route import CriaRoute
+from criabot.gradebook.schemas import BaselineSnapshotV1
 
 view = APIRouter()
 
@@ -17,12 +18,18 @@ class StartGradebookConfig(BaseModel):
     bot_name: str
     moodle_resources: List[dict] = Field(default_factory=list)
     course_activities: List[dict] = Field(default_factory=list)
+    baseline_snapshot: BaselineSnapshotV1 | None = None
+    import_mode: Optional[str] = None
 
 
 class StartGradebookResponse(APIResponse):
     session_id: Optional[str] = None
     phase: Optional[str] = None
     initial_message: Optional[str] = None
+    baseline_available: Optional[bool] = None
+    baseline_snapshot: Optional[dict] = None
+    import_mode: Optional[str] = None
+    context_source: Optional[str] = None
 
 
 @cbv(view)
@@ -44,6 +51,8 @@ class StartGradebookRoute(CriaRoute):
             bot_name=config.bot_name,
             moodle_resources=config.moodle_resources,
             course_activities=config.course_activities,
+            baseline_snapshot=config.baseline_snapshot,
+            import_mode=config.import_mode,
         )
         return self.ResponseModel(
             code=SUCCESS_CODE,
@@ -52,6 +61,10 @@ class StartGradebookRoute(CriaRoute):
             session_id=result.get("session_id"),
             phase=result.get("phase"),
             initial_message=result.get("initial_message"),
+            baseline_available=result.get("baseline_available"),
+            baseline_snapshot=result.get("baseline_snapshot"),
+            import_mode=result.get("import_mode"),
+            context_source=result.get("context_source"),
         )
 
 

@@ -121,6 +121,8 @@ services:
     # Cria-Back Criadex
     criadex:
       image: uitadmin/criadex:latest
+      restart: unless-stopped
+      mem_limit: 3g
       ports:
         - "127.0.0.1:25574:25574"
       environment:
@@ -252,7 +254,7 @@ services:
           condition: service_healthy
     # Cria-Back Embed App
     criaembed-app:
-      image: uitadmin/criaembed-app:v0.5.2-nomic
+      image: uitadmin/criaembed-app:latest
       ports:
         - "127.0.0.1:4000:4000"
       environment:

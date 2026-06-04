@@ -16,6 +16,31 @@ class FAQFallback:
         self._faq_group = os.environ.get("FAQ_GROUP_NAME", "eclass-faq-bot-document-index")
         self._graph_auto_build = os.environ.get("GRAPH_RAG_CHAT_AUTO_BUILD", "true").lower() == "true"
         self._cache_ttl_seconds = int(os.environ.get("FAQ_FALLBACK_CACHE_SECONDS", "300"))
+        self._missing_group_cache_ttl_seconds = int(
+            os.environ.get("FAQ_FALLBACK_MISSING_GROUP_CACHE_SECONDS", "1800")
+        )
+
+    @staticmethod
+    def _is_group_missing_error(exc: Exception) -> bool:
+        msg = str(exc)
+        status_code = getattr(exc, "status_code", None)
+        return (
+            status_code == 404
+            or "GROUP_NOT_FOUND" in msg
+            or "Group not found" in msg
+            or "INDEX_NOT_FOUND" in msg
+        )
+
+    @staticmethod
+    def _empty_group_response_payload() -> Dict[str, Any]:
+        return {
+            "response": {
+                "nodes": [],
+                "assets": [],
+                "search_units": 0,
+                "metadata": {},
+            }
+        }
 
     async def search(self, prompt: str, top_k: int = 5) -> Dict[str, Any]:
         cache_key = f"{self._faq_group}:{top_k}:{prompt.strip().lower()}"
@@ -41,16 +66,43 @@ class FAQFallback:
                 )
                 if inspect.isawaitable(result):
                     result = await result
-            except Exception:
+            except Exception as exc:
+                if self._is_group_missing_error(exc):
+                    empty_payload = {
+                        "group_name": self._faq_group,
+                        "response": GroupSearchResponse(**self._empty_group_response_payload()["response"]),
+                        "sources": [],
+                        "graph_metadata": None,
+                    }
+                    self._cache[cache_key] = (
+                        int(time.time()) + self._missing_group_cache_ttl_seconds,
+                        empty_payload,
+                    )
+                    return empty_payload
                 result = None
 
         if result is None:
-            result = await self._criadex.content.search(
-                group_name=self._faq_group,
-                search_config=search_config,
-            )
-            if inspect.isawaitable(result):
-                result = await result
+            try:
+                result = await self._criadex.content.search(
+                    group_name=self._faq_group,
+                    search_config=search_config,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as exc:
+                if self._is_group_missing_error(exc):
+                    empty_payload = {
+                        "group_name": self._faq_group,
+                        "response": GroupSearchResponse(**self._empty_group_response_payload()["response"]),
+                        "sources": [],
+                        "graph_metadata": None,
+                    }
+                    self._cache[cache_key] = (
+                        int(time.time()) + self._missing_group_cache_ttl_seconds,
+                        empty_payload,
+                    )
+                    return empty_payload
+                raise
 
         if isinstance(result, dict):
             payload = result.get("response", result)

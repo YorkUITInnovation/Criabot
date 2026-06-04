@@ -8,7 +8,12 @@ from criabot.gradebook.content_mapper import ContentMapper
 from criabot.gradebook.conversation import ConversationManager
 from criabot.gradebook.formula_parser import FormulaParser
 from criabot.gradebook.formula_resolver import FormulaResolver
-from criabot.gradebook.proposal import ProposalGenerator, validate_proposal_weights
+from criabot.gradebook.proposal import (
+    ProposalGenerator,
+    validate_proposal_weights,
+    sync_proposal_items_from_mapping,
+    sync_mapping_from_proposal_manual_items,
+)
 from criabot.gradebook.schemas import CourseActivity, GradebookCategory, GradebookProposal, GradebookSessionRecord, MoodleResource, GradebookSubcategory
 from criabot.gradebook.session import GradebookSessionEngine
 
@@ -93,6 +98,71 @@ async def test_gradebook_session_starts_in_intake_without_syllabus():
 
 
 @pytest.mark.asyncio
+async def test_gradebook_session_persists_baseline_snapshot():
+    engine = GradebookSessionEngine()
+    baseline_snapshot = {
+        "contract_name": "baseline_gradebook_v1",
+        "schema_version": 1,
+        "available": True,
+        "courseid": "EECS-1000",
+        "root_category": {"id": 1, "name": "Course total"},
+        "tree": {"type": "category", "children": [{"type": "item"}]},
+        "stats": {"category_count": 1, "item_count": 1, "max_depth": 1},
+    }
+
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Lecture 1 slides")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+        baseline_snapshot=baseline_snapshot,
+        import_mode="baseline",
+    )
+
+    assert session.extraction is not None
+    assert session.phase == "BASELINE_READY"
+    assert session.extraction.get("baseline_available") is True
+    assert session.extraction.get("baseline_snapshot", {}).get("schema_version") == 1
+    assert session.extraction.get("import_mode") == "baseline"
+    assert session.extraction.get("context_source") == "baseline_import"
+    assert session.extraction.get("baseline_policy") == "mirror_then_override"
+    assert isinstance(session.extraction.get("baseline_import_snapshot_ref"), str)
+    assert len(session.extraction.get("baseline_import_snapshot_ref")) == 64
+
+
+@pytest.mark.asyncio
+async def test_gradebook_session_forces_fresh_mode_when_baseline_unavailable():
+    engine = GradebookSessionEngine()
+    baseline_snapshot = {
+        "contract_name": "baseline_gradebook_v1",
+        "schema_version": 1,
+        "available": False,
+        "courseid": "EECS-1000",
+        "root_category": None,
+        "tree": None,
+        "stats": None,
+    }
+
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Lecture 1 slides")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+        baseline_snapshot=baseline_snapshot,
+        import_mode="baseline",
+    )
+
+    assert session.extraction is not None
+    assert session.phase == "INTAKE"
+    assert session.extraction.get("baseline_available") is False
+    assert session.extraction.get("import_mode") == "fresh"
+    assert session.extraction.get("context_source") == "syllabus_generation"
+    assert session.extraction.get("baseline_policy") == "generate_fresh"
+
+
+@pytest.mark.asyncio
 async def test_gradebook_session_with_generic_resource_type_stays_intake():
     engine = GradebookSessionEngine()
     session = await engine.start(
@@ -119,6 +189,968 @@ async def test_gradebook_chat_affirmation_advances_analysis_to_proposal():
 
     updated = await engine.chat(session.session_id, "okay do it")
     assert updated.phase == "PROPOSAL"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_ready_advances_to_proposal_without_analysis_regen():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2000",
+        professor_id="prof_baseline",
+        bot_name="eecs-baseline-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 35%, Final 40%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2000",
+            "root_category": {"id": 1, "name": "Course total"},
+            "tree": {"type": "category", "children": {"1": {"type": "item", "depth": 2}}},
+            "stats": {"category_count": 1, "item_count": 1, "max_depth": 2},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+
+    updated = await engine.chat(session.session_id, "show proposal")
+    assert updated.phase == "PROPOSAL"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_ready_start_fresh_switches_to_fresh_proposal_mode():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2001",
+        professor_id="prof_fresh_switch",
+        bot_name="eecs-fresh-switch-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 35%, Final 40%")],
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign"),
+            CourseActivity(name="Midterm Quiz", module="quiz"),
+        ],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2001",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Baseline Assignments",
+                        "aggregationcoef2": 0.5,
+                        "weightoverride": True,
+                        "children": {},
+                    },
+                    "2": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Baseline Exams",
+                        "aggregationcoef2": 0.5,
+                        "weightoverride": True,
+                        "children": {},
+                    },
+                },
+            },
+            "stats": {"category_count": 2, "item_count": 0, "max_depth": 2},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.extraction is not None
+    assert session.extraction.get("import_mode") == "baseline"
+
+    session = await engine.chat(session.session_id, "start fresh")
+    assert session.phase == "ANALYSIS"
+    assert session.extraction.get("import_mode") == "fresh"
+    assert session.extraction.get("context_source") == "syllabus_generation"
+    assert session.extraction.get("baseline_policy") == "generate_fresh"
+    assert session.proposal is not None
+    assert all("baseline" not in str(note).lower() for note in (session.proposal.notes or []))
+
+    session = await engine.chat(session.session_id, "give me a proposal")
+    assert session.phase == "PROPOSAL"
+    assert session.proposal is not None
+    assert all("baseline" not in str(note).lower() for note in (session.proposal.notes or []))
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_start_mirrors_existing_categories_in_proposal():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2010",
+        professor_id="prof_baseline",
+        bot_name="eecs-baseline-bot-3",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 35%, Final 40%")],
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign"),
+            CourseActivity(name="Final Quiz", module="quiz"),
+        ],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2010",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Coursework",
+                        "aggregationcoef2": 0.7,
+                        "weightoverride": True,
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Homework 1",
+                                "itemtype": "mod",
+                                "itemmodule": "assign",
+                                "children": {},
+                            }
+                        },
+                    },
+                    "2": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Exams",
+                        "aggregationcoef2": 0.3,
+                        "weightoverride": True,
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Final Quiz",
+                                "itemtype": "mod",
+                                "itemmodule": "quiz",
+                                "children": {},
+                            }
+                        },
+                    },
+                },
+            },
+            "stats": {"category_count": 2, "item_count": 2, "max_depth": 3},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+    names = [c.name for c in session.proposal.categories]
+    assert names == ["Coursework", "Exams"]
+    assert session.proposal.categories[0].items == ["Homework 1"]
+    assert session.proposal.categories[1].items == ["Final Quiz"]
+    assert session.proposal.categories[0].weight == pytest.approx(70.0)
+    assert session.proposal.categories[1].weight == pytest.approx(30.0)
+
+
+@pytest.mark.asyncio
+async def test_gradebook_reset_clears_persisted_chat_history():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2011",
+        professor_id="prof_reset",
+        bot_name="eecs-reset-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 35%, Final 40%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+    )
+
+    await engine.persist_chat_turn(session.session_id, "show proposal", "Here is the proposal")
+    existing = await engine.get(session.session_id)
+    assert existing is not None
+    assert len(engine.get_chat_history(existing)) == 2
+
+    reset = await engine.reset(session.session_id, keep_extraction=True)
+    assert engine.get_chat_history(reset) == []
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_snapshot_excludes_category_totals_and_derives_weights_from_points():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2020",
+        professor_id="prof_points",
+        bot_name="eecs-points-bot",
+        moodle_resources=[],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2020",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Coursework",
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Category total",
+                                "itemtype": "category",
+                                "grademax": 40,
+                                "children": {},
+                            },
+                            "2": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Homework 1",
+                                "itemtype": "mod",
+                                "itemmodule": "assign",
+                                "children": {},
+                            },
+                        },
+                    },
+                    "2": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Exams",
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Category total",
+                                "itemtype": "category",
+                                "grademax": 60,
+                                "children": {},
+                            },
+                            "2": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Final Quiz",
+                                "itemtype": "mod",
+                                "itemmodule": "quiz",
+                                "children": {},
+                            },
+                        },
+                    },
+                },
+            },
+            "stats": {"category_count": 2, "item_count": 4, "max_depth": 3},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+    names = [c.name for c in session.proposal.categories]
+    assert names == ["Coursework", "Exams"]
+    assert session.proposal.categories[0].items == ["Homework 1"]
+    assert session.proposal.categories[1].items == ["Final Quiz"]
+    assert session.proposal.categories[0].weight == pytest.approx(40.0)
+    assert session.proposal.categories[1].weight == pytest.approx(60.0)
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_snapshot_imports_category_rules_and_settings():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2030",
+        professor_id="prof_rules",
+        bot_name="eecs-rules-bot",
+        moodle_resources=[],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2030",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Assignments",
+                        "droplow": 1,
+                        "keephigh": 0,
+                        "aggregateonlygraded": False,
+                        "aggregateoutcomes": True,
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Category total",
+                                "itemtype": "category",
+                                "grademax": 100,
+                                "gradepass": 60,
+                                "hidden": 1,
+                                "hiddenuntil": 1767225600,
+                                "locked": True,
+                                "locktime": 1769904000,
+                                "display": 2,
+                                "decimals": 2,
+                                "children": {},
+                            },
+                            "2": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Homework 1",
+                                "itemtype": "mod",
+                                "itemmodule": "assign",
+                                "children": {},
+                            },
+                        },
+                    }
+                },
+            },
+            "stats": {"category_count": 1, "item_count": 2, "max_depth": 3},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+    cat = session.proposal.categories[0]
+    assert cat.drop_lowest == 1
+    assert cat.keep_highest == 0
+    assert cat.aggregate_only_graded is False
+    assert cat.aggregate_outcomes is True
+    assert cat.hidden is True
+    assert cat.hidden_until == 1767225600
+    assert cat.locked is True
+    assert cat.lock_time == 1769904000
+    assert cat.display_type == 2
+    assert cat.decimals == 2
+    assert cat.grade_pass == pytest.approx(60.0)
+    assert any(
+        "Baseline category rules were imported" in note
+        for note in (session.proposal.notes or [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_snapshot_preserves_numeric_category_order():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2031",
+        professor_id="prof_sort",
+        bot_name="eecs-sort-bot",
+        moodle_resources=[],
+        course_activities=[],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2031",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "11": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Final Exam",
+                        "aggregationcoef2": 0.25,
+                        "weightoverride": True,
+                        "children": {},
+                    },
+                    "4": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Assignments",
+                        "aggregationcoef2": 0.25,
+                        "weightoverride": True,
+                        "children": {},
+                    },
+                    "7": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Quizzes",
+                        "aggregationcoef2": 0.25,
+                        "weightoverride": True,
+                        "children": {},
+                    },
+                    "9": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Midterm",
+                        "aggregationcoef2": 0.25,
+                        "weightoverride": True,
+                        "children": {},
+                    },
+                },
+            },
+            "stats": {"category_count": 4, "item_count": 0, "max_depth": 2},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+    assert [c.name for c in session.proposal.categories] == ["Assignments", "Quizzes", "Midterm", "Final Exam"]
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_snapshot_imports_nested_and_root_uncategorized_nodes():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2031b",
+        professor_id="prof_nested",
+        bot_name="eecs-nested-bot",
+        moodle_resources=[],
+        course_activities=[],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2031b",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Assignments",
+                        "aggregationcoef2": 0.5,
+                        "children": {
+                            "1": {
+                                "type": "category",
+                                "depth": 3,
+                                "name": "Homework",
+                                "children": {
+                                    "1": {
+                                        "type": "item",
+                                        "depth": 4,
+                                        "name": "HW 1",
+                                        "itemtype": "mod",
+                                        "itemmodule": "assign",
+                                        "children": {},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "2": {
+                        "type": "item",
+                        "depth": 2,
+                        "name": "Legacy Participation",
+                        "itemtype": "manual",
+                        "children": {},
+                    },
+                },
+            },
+            "stats": {"category_count": 2, "item_count": 2, "max_depth": 4},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+
+    by_name = {c.name: c for c in session.proposal.categories}
+    assert "Assignments" in by_name
+    assert "Uncategorized" in by_name
+    assert by_name["Assignments"].subcategories
+    assert by_name["Assignments"].subcategories[0].name == "Homework"
+    assert "Legacy Participation" in by_name["Uncategorized"].items
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_root_quiz_item_routes_to_quizzes_not_uncategorized():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2031c",
+        professor_id="prof_baseline_quiz",
+        bot_name="eecs-baseline-quiz-bot",
+        moodle_resources=[],
+        course_activities=[],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2031c",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Quizzes",
+                        "aggregationcoef2": 0.2,
+                        "children": {},
+                    },
+                    "2": {
+                        "type": "item",
+                        "depth": 2,
+                        "name": "Quiz 1",
+                        "itemtype": "mod",
+                        "itemmodule": "quiz",
+                        "children": {},
+                    },
+                },
+            },
+            "stats": {"category_count": 1, "item_count": 1, "max_depth": 2},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+
+    by_name = {c.name: c for c in session.proposal.categories}
+    assert "Quizzes" in by_name
+    assert "Quiz 1" in by_name["Quizzes"].items
+    assert "Uncategorized" not in by_name
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_root_course_total_not_added_to_uncategorized():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2031d",
+        professor_id="prof_baseline_course_total",
+        bot_name="eecs-baseline-course-total-bot",
+        moodle_resources=[],
+        course_activities=[],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2031d",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "courseitem",
+                        "depth": 2,
+                        "name": "Course total",
+                        "itemtype": "course",
+                        "children": {},
+                    },
+                    "2": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Assignments",
+                        "aggregationcoef2": 1.0,
+                        "children": {},
+                    },
+                },
+            },
+            "stats": {"category_count": 1, "item_count": 1, "max_depth": 2},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+
+    by_name = {c.name: c for c in session.proposal.categories}
+    assert "Assignments" in by_name
+    assert "Uncategorized" not in by_name
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_snapshot_imports_item_weights_from_category_items():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2032",
+        professor_id="prof_item_weights",
+        bot_name="eecs-item-weights-bot",
+        moodle_resources=[],
+        course_activities=[],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2032",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Quizzes",
+                        "aggregation": 10,
+                        "aggregationcoef2": 0.25,
+                        "weightoverride": False,
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Midterm Quiz",
+                                "itemtype": "mod",
+                                "itemmodule": "quiz",
+                                "aggregationcoef": 0.4,
+                                "children": {},
+                            },
+                            "2": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Final Quiz",
+                                "itemtype": "mod",
+                                "itemmodule": "quiz",
+                                "aggregationcoef": 0.6,
+                                "children": {},
+                            },
+                        },
+                    },
+                },
+            },
+            "stats": {"category_count": 1, "item_count": 2, "max_depth": 3},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+    quizzes = session.proposal.categories[0]
+    assert quizzes.name == "Quizzes"
+    assert quizzes.item_weights.get("Midterm Quiz") == pytest.approx(40.0)
+    assert quizzes.item_weights.get("Final Quiz") == pytest.approx(60.0)
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_snapshot_uses_category_total_item_weights_for_top_level_categories():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2032b",
+        professor_id="prof_top_weight_items",
+        bot_name="eecs-top-weight-items-bot",
+        moodle_resources=[],
+        course_activities=[],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2032b",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 10,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Assignment",
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Category total",
+                                "itemtype": "category",
+                                "aggregationcoef": 25.0,
+                                "children": {},
+                            }
+                        },
+                    },
+                    "2": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Quizzes",
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Category total",
+                                "itemtype": "category",
+                                "aggregationcoef": 10.0,
+                                "children": {},
+                            }
+                        },
+                    },
+                    "3": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Midterm",
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Category total",
+                                "itemtype": "category",
+                                "aggregationcoef": 30.0,
+                                "children": {},
+                            }
+                        },
+                    },
+                    "4": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Final",
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Category total",
+                                "itemtype": "category",
+                                "aggregationcoef": 35.0,
+                                "children": {},
+                            }
+                        },
+                    },
+                },
+            },
+            "stats": {"category_count": 4, "item_count": 4, "max_depth": 3},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+
+    by_name = {c.name: c for c in session.proposal.categories}
+    assert by_name["Assignment"].weight == pytest.approx(25.0)
+    assert by_name["Quizzes"].weight == pytest.approx(10.0)
+    assert by_name["Midterm"].weight == pytest.approx(30.0)
+    assert by_name["Final"].weight == pytest.approx(35.0)
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_snapshot_prefers_uniform_top_level_aggregation_method():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2033",
+        professor_id="prof_agg",
+        bot_name="eecs-agg-bot",
+        moodle_resources=[],
+        course_activities=[],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2033",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Assignments",
+                        "aggregation": 10,
+                        "aggregationcoef2": 0.25,
+                        "children": {},
+                    },
+                    "2": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Quizzes",
+                        "aggregation": 10,
+                        "aggregationcoef2": 0.25,
+                        "children": {},
+                    },
+                },
+            },
+            "stats": {"category_count": 2, "item_count": 0, "max_depth": 2},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+    assert session.proposal.aggregation_method == 10
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_snapshot_infers_item_level_hidden_and_suppresses_default_min_pass_decimals():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2034",
+        professor_id="prof_visibility",
+        bot_name="eecs-visibility-bot",
+        moodle_resources=[],
+        course_activities=[],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2034",
+            "root_category": {
+                "id": 1,
+                "name": "Course total",
+                "aggregation": 13,
+                "keephigh": 0,
+                "droplow": 0,
+                "aggregateonlygraded": True,
+                "aggregateoutcomes": False,
+            },
+            "tree": {
+                "type": "category",
+                "depth": 1,
+                "children": {
+                    "1": {
+                        "type": "category",
+                        "depth": 2,
+                        "name": "Final Exam",
+                        "aggregation": 10,
+                        "children": {
+                            "1": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Category total",
+                                "itemtype": "category",
+                                "grademin": 0,
+                                "gradepass": 0,
+                                "decimals": 0,
+                                "children": {},
+                            },
+                            "2": {
+                                "type": "item",
+                                "depth": 3,
+                                "name": "Final Manual",
+                                "itemtype": "manual",
+                                "hidden": 1,
+                                "children": {},
+                            },
+                        },
+                    },
+                },
+            },
+            "stats": {"category_count": 1, "item_count": 2, "max_depth": 3},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    assert session.proposal is not None
+    cat = session.proposal.categories[0]
+    assert cat.hidden is True
+    assert cat.grade_min is None
+    assert cat.grade_pass is None
+    assert cat.decimals == -1
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_ready_can_switch_to_fresh_analysis_on_request():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2001",
+        professor_id="prof_baseline",
+        bot_name="eecs-baseline-bot-2",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 35%, Final 40%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2001",
+            "root_category": {"id": 1, "name": "Course total"},
+            "tree": {"type": "category", "children": {"1": {"type": "item", "depth": 2}}},
+            "stats": {"category_count": 1, "item_count": 1, "max_depth": 2},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    updated = await engine.chat(session.session_id, "start fresh")
+    assert updated.phase == "ANALYSIS"
 
 
 @pytest.mark.asyncio
@@ -218,6 +1250,84 @@ async def test_gradebook_finalize_marks_confirmed_mapping_and_completes():
     assert finalized.phase == "COMPLETED"
     assert finalized.content_mapping["graded_activities"][0]["confirmed_category"] == "Homework"
     assert finalized.content_mapping["graded_activities"][0]["finalized"] is True
+
+
+@pytest.mark.asyncio
+async def test_gradebook_finalize_prefers_grade_item_id_over_mismatched_cmid():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+
+    engine._content_mapper.build_mapping = AsyncMock(return_value={
+        "graded_activities": [
+            {
+                "grade_item_id": 501,
+                "moodle_cmid": 999,
+                "activity_name": "Homework 1",
+                "suggested_category": "Assignments",
+            }
+        ],
+        "validation_errors": [],
+    })
+
+    accepted = await engine.accept(session.session_id)
+    assert accepted.phase == "ACCEPTED"
+
+    finalized = await engine.finalize(
+        session.session_id,
+        confirmed_mapping=[{"grade_item_id": "501", "moodle_cmid": 10, "category": "Homework"}],
+    )
+
+    row = finalized.content_mapping["graded_activities"][0]
+    assert finalized.phase == "COMPLETED"
+    assert row["confirmed_category"] == "Homework"
+    assert row["finalized"] is True
+
+
+@pytest.mark.asyncio
+async def test_gradebook_finalize_stays_in_refinement_when_no_confirmed_rows_match():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+
+    engine._content_mapper.build_mapping = AsyncMock(return_value={
+        "graded_activities": [
+            {
+                "grade_item_id": 501,
+                "moodle_cmid": 999,
+                "activity_name": "Homework 1",
+                "suggested_category": "Assignments",
+            }
+        ],
+        "validation_errors": [],
+    })
+
+    accepted = await engine.accept(session.session_id)
+    assert accepted.phase == "ACCEPTED"
+
+    finalized = await engine.finalize(
+        session.session_id,
+        confirmed_mapping=[{"grade_item_id": "777", "moodle_cmid": 10, "category": "Homework"}],
+    )
+
+    validation = ((finalized.content_mapping or {}).get("validation") or {})
+    errors = [str(msg) for msg in (validation.get("errors") or [])]
+    unresolved = validation.get("unresolved_confirmations") or []
+
+    assert finalized.phase == "REFINEMENT"
+    assert validation.get("can_proceed") is False
+    assert any("Finalize mapping mismatch" in msg for msg in errors)
+    assert len(unresolved) == 1
 
 
 @pytest.mark.asyncio
@@ -620,6 +1730,76 @@ def test_remove_nonexistent_category_with_punctuation_adds_note():
     assert all(cat.name != "GhostCategory" for cat in updated.categories)
 
 
+def test_split_missing_category_adds_not_found_effect():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignment", weight=20.0, items=["Homework 1", "Homework 2"]),
+            GradebookCategory(name="Quizzes", weight=15.0, items=["Midterm Quiz", "Final Quiz"]),
+            GradebookCategory(name="Midterm", weight=30.0, items=["Midterm exam"]),
+            GradebookCategory(name="Final Exam", weight=35.0, items=["Final exam"]),
+        ],
+        notes=[],
+    )
+
+    updated = generator.update_from_prompt(
+        proposal,
+        "In Labs, keep total 15% and split into Lab Reports 10% and In-lab Work 5%.",
+    )
+
+    assert all(cat.name.lower() != "labs" for cat in updated.categories)
+    effects = [str(n) for n in (updated.notes or []) if str(n).startswith("Effect:")]
+    assert any("not found" in e.lower() and "labs" in e.lower() for e in effects)
+    assert not any("split into" in e.lower() and "assignment" in e.lower() for e in effects)
+    assert not any(cat.subcategories for cat in updated.categories)
+
+
+def test_guard_ignores_syllabus_prose_in_proposal_request_prompt():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    updated = generator.update_from_prompt(
+        base,
+        (
+            "In Teaching and Learning, the number of references needed, "
+            "in particular, five references are required. okay use them and give me a proposal"
+        ),
+    )
+
+    not_found_effects = [
+        str(n)
+        for n in (updated.notes or [])
+        if str(n).startswith("Effect:") and "not found" in str(n).lower()
+    ]
+    assert not_found_effects == []
+
+
+def test_stale_category_not_found_effects_cleared_on_weight_only_prompt():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    polluted = GradebookProposal.parse_obj(base.model_dump())
+    polluted.notes = [
+        (
+            "Effect: Tried to modify 'Teaching and Learning', but category was not found. "
+            "No changes made."
+        ),
+        (
+            "Effect: Tried to modify 'the number of references needed', but category was not found. "
+            "No changes made."
+        ),
+    ]
+
+    updated = generator.update_from_prompt(polluted, "set midterm to 15 and assignment to 25")
+
+    not_found_effects = [
+        str(n)
+        for n in (updated.notes or [])
+        if str(n).startswith("Effect:") and "not found" in str(n).lower()
+    ]
+    assert not_found_effects == []
+    assert any("midterm" in str(n).lower() for n in (updated.notes or []))
+
+
 def test_split_overwrites_previous_subcategories_and_notes():
     generator = ProposalGenerator()
     base = generator.generate_initial([
@@ -658,6 +1838,58 @@ def test_effect_topic_override_keeps_latest_split_for_same_category():
     assert "Pre-Lab 5.0%" in split_effects[0]
 
 
+def test_split_supports_with_weight_of_fractional_values():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Quiz 1", module="quiz"),
+        CourseActivity(name="Quiz 2", module="quiz"),
+    ])
+    base = generator.update_from_prompt(base, "Set Quizzes to 25%")
+
+    updated = generator.update_from_prompt(
+        base,
+        "split quizzes into midterm quiz with weight of 0.4 and final quiz with weight of 0.6",
+    )
+
+    quizzes = next(cat for cat in updated.categories if cat.name == "Quizzes")
+    assert len(quizzes.subcategories) == 2
+    assert quizzes.subcategories[0].name == "Midterm Quiz"
+    assert quizzes.subcategories[1].name == "Final Quiz"
+    assert quizzes.subcategories[0].weight == pytest.approx(10.0)
+    assert quizzes.subcategories[1].weight == pytest.approx(15.0)
+    assert not any("internal split totals" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_split_follow_up_assign_updates_subcategory_weight_and_clears_stale_warning():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Quiz 1", module="quiz"),
+    ])
+    base = generator.update_from_prompt(base, "Set Quizzes to 25%")
+
+    with_even_split = generator.update_from_prompt(
+        base,
+        "split quizzes into Midterm Quiz and Final Quiz",
+    )
+    # Default: even distribution — 2 subs each get 25%/2 = 12.5%; no warning.
+    quizzes_after_split = next(cat for cat in with_even_split.categories if cat.name == "Quizzes")
+    assert quizzes_after_split.subcategories[0].weight == pytest.approx(12.5)
+    assert quizzes_after_split.subcategories[1].weight == pytest.approx(12.5)
+    assert not any("internal split totals" in str(n).lower() for n in (with_even_split.notes or []))
+
+    updated = generator.update_from_prompt(with_even_split, "assign 0.4 to Midterm Quiz")
+
+    quizzes = next(cat for cat in updated.categories if cat.name == "Quizzes")
+    weights = {sub.name: sub.weight for sub in quizzes.subcategories}
+    assert weights["Midterm Quiz"] == pytest.approx(10.0)
+    assert weights["Final Quiz"] == pytest.approx(12.5)  # unchanged from even split
+
+    # Warning appears because 10.0 + 12.5 = 22.5 ≠ 25 (recomputed, not duplicated).
+    split_warnings = [n for n in (updated.notes or []) if "internal split totals" in str(n).lower()]
+    assert len(split_warnings) == 1
+    assert "22.5%" in str(split_warnings[0])
+
+
 def test_formula_effect_topic_override_handles_quoted_category_labels():
     generator = ProposalGenerator()
     proposal = generator.generate_initial([])
@@ -670,6 +1902,32 @@ def test_formula_effect_topic_override_handles_quoted_category_labels():
     labs_effects = [e for e in effects if "formula" in e.lower() and "labs" in e.lower()]
     assert len(labs_effects) == 1
     assert "Cleared formula from Labs" in labs_effects[0]
+
+
+@pytest.mark.asyncio
+async def test_formula_override_flag_requires_explicit_prompt_intent():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Lab Report 1", module="assign"),
+    ])
+
+    updated = generator.update_from_prompt(
+        base,
+        "Set Final Exam as =([[midterm]]*0.4)+([[final]]*0.6)",
+        course_activities=[CourseActivity(name="Lab Report 1", module="assign")],
+    )
+    final_exam = next(cat for cat in updated.categories if cat.name == "Final Exam")
+    assert final_exam.calculation_formula is not None
+    assert final_exam.formula_override is False
+
+    overridden = generator.update_from_prompt(
+        updated,
+        "Override formula for Final Exam and set Final Exam as =([[midterm]]*0.3)+([[final]]*0.7)",
+        course_activities=[CourseActivity(name="Lab Report 1", module="assign")],
+    )
+    final_exam_override = next(cat for cat in overridden.categories if cat.name == "Final Exam")
+    assert final_exam_override.calculation_formula is not None
+    assert final_exam_override.formula_override is True
 
 
 @pytest.mark.asyncio
@@ -1013,16 +2271,27 @@ def test_conversation_zero_weight_category_is_not_marked_invalid():
 
 def test_add_category_without_explicit_weight_defaults_to_zero():
     generator = ProposalGenerator()
-    base = generator.generate_initial([
-        CourseActivity(name="Midterm Exam", module="quiz"),
-        CourseActivity(name="Final Exam", module="quiz"),
-    ])
+    base = generator.generate_initial([])
 
     step = generator.update_from_prompt(base, "added quizzes")
 
     by_name = {cat.name: cat for cat in step.categories}
     assert "Quizzes" in by_name
     assert abs(by_name["Quizzes"].weight - 0.0) < 1e-6
+
+
+def test_add_manual_grade_item_from_chat_prompt():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Final Exam", weight=100.0, items=[]),
+        ]
+    )
+
+    updated = generator.update_from_prompt(proposal, "add grade item Final to Final Exam")
+
+    assert updated.categories[0].items == ["Final"]
+    assert any("manual grade item" in note.lower() for note in (updated.notes or []))
 
 
 # --- Aggregation Method Tests ---
@@ -1043,6 +2312,146 @@ def test_gradebook_proposal_stores_aggregation_method():
     assert proposal.aggregation_method == 10
     dumped = proposal.model_dump()
     assert dumped["aggregation_method"] == 10
+
+
+def test_sync_proposal_items_from_mapping_adds_manual_items_to_categories():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Labs", weight=15.0, items=[]),
+            GradebookCategory(name="Midterm", weight=30.0, items=[]),
+            GradebookCategory(name="Final Exam", weight=30.0, items=[]),
+        ]
+    )
+    mapping = [
+        {"category": "Labs", "activity_name": "Labs Manual Item", "grade_item_id": 101, "itemtype": "manual"},
+        {"category": "Midterm", "activity_name": "Midterm Manual Item", "grade_item_id": 102, "itemtype": "manual"},
+        {"category": "Final Exam", "activity_name": "Final Exam Manual Item", "grade_item_id": 103, "itemtype": "manual"},
+    ]
+
+    changed = sync_proposal_items_from_mapping(proposal, mapping)
+
+    assert changed is True
+    assert proposal.categories[0].items == ["Labs Manual Item"]
+    assert proposal.categories[1].items == ["Midterm Manual Item"]
+    assert proposal.categories[2].items == ["Final Exam Manual Item"]
+
+
+def test_sync_mapping_from_proposal_manual_items_skips_existing_mod_activities():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=["The Role of Balance in Layout Design", "exam"],
+            ),
+        ]
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 63,
+                "grade_item_id": 13,
+                "activity_name": "The Role of Balance in Layout Design",
+                "itemtype": "mod",
+                "item_source": "activity",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+            }
+        ]
+    }
+    course_activities = [
+        CourseActivity(name="The Role of Balance in Layout Design", module="assign", cmid=63, grade_item_id=13),
+    ]
+
+    changed = sync_mapping_from_proposal_manual_items(proposal, content_mapping, course_activities)
+
+    assert changed is True
+    names = [row["activity_name"] for row in content_mapping["graded_activities"]]
+    assert names.count("The Role of Balance in Layout Design") == 1
+    assert "exam" in names
+    assert sum(1 for row in content_mapping["graded_activities"] if row.get("item_source") == "proposal_manual") == 1
+
+
+def test_sync_mapping_from_proposal_manual_items_prunes_stale_proposal_duplicates():
+    proposal = GradebookProposal(
+        categories=[GradebookCategory(name="Quizzes", weight=15.0, items=["quiz 1", "exam"])]
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 1148,
+                "grade_item_id": 336,
+                "activity_name": "quiz 1",
+                "itemtype": "mod",
+                "item_source": "activity",
+                "suggested_category": "Quizzes",
+                "confirmed_category": "Quizzes",
+            },
+            {
+                "activity_name": "quiz 1",
+                "itemtype": "manual",
+                "item_source": "proposal_manual",
+                "suggested_category": "Quizzes",
+                "confirmed_category": "Quizzes",
+            },
+        ]
+    }
+
+    changed = sync_mapping_from_proposal_manual_items(proposal, content_mapping, [])
+
+    assert changed is True
+    quiz_rows = [row for row in content_mapping["graded_activities"] if row.get("activity_name") == "quiz 1"]
+    assert len(quiz_rows) == 1
+    assert quiz_rows[0].get("itemtype") == "mod"
+    assert any(row.get("activity_name") == "exam" for row in content_mapping["graded_activities"])
+
+
+def test_sync_mapping_from_proposal_manual_items_adds_rows():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Midterm", weight=15.0, items=["exam"]),
+            GradebookCategory(name="Final Exam", weight=30.0, items=["final"]),
+        ]
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 10,
+                "grade_item_id": 13,
+                "activity_name": "quiz 1",
+                "itemtype": "mod",
+                "item_source": "activity",
+                "suggested_category": "Quizzes",
+                "confirmed_category": "Quizzes",
+            }
+        ]
+    }
+
+    changed = sync_mapping_from_proposal_manual_items(proposal, content_mapping, [])
+
+    assert changed is True
+    names = {row["activity_name"] for row in content_mapping["graded_activities"]}
+    assert "exam" in names
+    assert "final" in names
+    manual_rows = [
+        row for row in content_mapping["graded_activities"]
+        if row.get("item_source") == "proposal_manual"
+    ]
+    assert len(manual_rows) == 2
+
+
+def test_sync_proposal_items_from_mapping_is_idempotent():
+    proposal = GradebookProposal(
+        categories=[GradebookCategory(name="Labs", weight=15.0, items=["Labs Manual Item"])]
+    )
+    mapping = [
+        {"category": "Labs", "activity_name": "Labs Manual Item", "grade_item_id": 101, "itemtype": "manual"},
+    ]
+
+    changed = sync_proposal_items_from_mapping(proposal, mapping)
+
+    assert changed is False
+    assert proposal.categories[0].items == ["Labs Manual Item"]
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -1128,6 +2537,42 @@ def test_proposal_drop_lowest_parsed_from_prompt():
     assert by_name["Assignments"].drop_lowest == 2
 
 
+def test_activity_name_matches_lab_ignores_syllabus_substring():
+    from criabot.gradebook.naming_utils import activity_name_matches_lab, is_syllabus_like_name
+
+    assert is_syllabus_like_name("syllabus.docx")
+    assert not activity_name_matches_lab("syllabus.docx")
+    assert activity_name_matches_lab("Lab 3 report")
+
+
+def test_generate_initial_syllabus_docx_not_placed_in_labs():
+    generator = ProposalGenerator()
+    proposal = generator.generate_initial([
+        CourseActivity(name="syllabus.docx", module="file"),
+    ])
+    by_name = {c.name: c for c in proposal.categories}
+    assert "syllabus.docx" not in by_name["Labs"].items
+    assert "syllabus.docx" not in by_name["Assignments"].items
+
+
+@pytest.mark.asyncio
+async def test_gradebook_start_does_not_treat_duplicate_syllabus_files_as_activities():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[
+            MoodleResource(name="syllabus.docx", type="file", section="0"),
+            MoodleResource(name="syllabus.docx", type="file", section="0"),
+        ],
+        course_activities=[],
+    )
+
+    assert session.extraction.get("has_syllabus") is True
+    assert session.course_activities == []
+
+
 def test_generate_initial_adds_quizzes_category_for_quiz_activities():
     generator = ProposalGenerator()
 
@@ -1139,8 +2584,26 @@ def test_generate_initial_adds_quizzes_category_for_quiz_activities():
     by_name = {c.name: c for c in proposal.categories}
 
     assert "Quizzes" in by_name
-    assert by_name["Quizzes"].weight == 0.0
+    assert by_name["Quizzes"].weight == pytest.approx(15.0)
     assert by_name["Quizzes"].items == ["Knowledge Check 1", "Quiz 2"]
+
+
+def test_resolve_final_exam_alias_prefers_existing_final_category():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=70.0, items=[]),
+            GradebookCategory(name="Final", weight=30.0, items=["Final Exam"]),
+        ],
+        notes=[],
+    )
+
+    updated = generator.update_from_prompt(base, "set final exam to 35%")
+    by_name = {c.name: c for c in updated.categories}
+
+    assert "Final" in by_name
+    assert "Final Exam" not in by_name
+    assert by_name["Final"].weight == pytest.approx(35.0)
 
 
 def test_proposal_drop_lowest_per_category():
@@ -1151,6 +2614,96 @@ def test_proposal_drop_lowest_per_category():
     by_name = {c.name: c for c in updated.categories}
     assert by_name["Assignments"].drop_lowest == 1
     assert by_name["Midterm"].drop_lowest == 0
+
+
+def test_proposal_drop_lowest_matches_baseline_singular_category_name():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignment", weight=25.0, items=["Homework 1", "Homework 2"]),
+            GradebookCategory(name="Quizzes", weight=25.0, items=["Midterm Quiz", "Final Quiz"]),
+            GradebookCategory(name="Midterm", weight=25.0, items=["Midterm exam"], hidden=True),
+            GradebookCategory(name="Final", weight=25.0, items=["Final exam"], hidden=True),
+        ],
+        notes=["Effect: Midterm hidden from students"],
+        aggregation_method=10,
+    )
+
+    updated = generator.update_from_prompt(base, "For Assignments, set drop lowest to 1")
+    by_name = {c.name: c for c in updated.categories}
+
+    assert by_name["Assignment"].drop_lowest == 1
+    assert any(
+        str(note).strip().lower() == "effect: drop lowest 1 from assignment"
+        for note in (updated.notes or [])
+    )
+
+
+def test_remove_grade_item_phrase_does_not_remove_category():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Final Exam", weight=30.0, items=["fina"]),
+            GradebookCategory(name="Assignments", weight=70.0, items=[]),
+        ],
+        notes=[],
+    )
+
+    updated = generator.update_from_prompt(base, "remove fina grade item")
+    by_name = {c.name: c for c in updated.categories}
+
+    assert "Final Exam" in by_name
+    assert by_name["Final Exam"].items == []
+    assert any("removed 'fina' from final exam" in str(n).lower() for n in (updated.notes or []))
+    assert not any("removed 'final exam'" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_rename_grade_item_phrase_updates_item_name():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Final Exam", weight=100.0, items=["fina"]),
+        ],
+        notes=[],
+    )
+
+    updated = generator.update_from_prompt(base, "rename grade item fina to final")
+
+    assert updated.categories[0].items == ["final"]
+    assert any("renamed 'fina' to 'final' in final exam" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_remove_grade_item_prefix_phrase_removes_item():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Final Exam", weight=100.0, items=["XYZ"]),
+        ],
+        notes=[],
+    )
+
+    updated = generator.update_from_prompt(base, "remove grade item XYZ")
+
+    assert updated.categories[0].items == []
+    assert any("removed 'xyz' from final exam" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_remove_item_from_category_phrase_does_not_remove_category():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Final Exam", weight=30.0, items=["XYZ"]),
+            GradebookCategory(name="Assignments", weight=70.0, items=[]),
+        ],
+        notes=[],
+    )
+
+    updated = generator.update_from_prompt(base, "remove XYZ from Final Exam")
+    by_name = {c.name: c for c in updated.categories}
+
+    assert "Final Exam" in by_name
+    assert by_name["Final Exam"].items == []
+    assert not any("removed 'final exam'" in str(n).lower() for n in (updated.notes or []))
 
 
 def test_proposal_keep_highest_per_category():
@@ -1186,6 +2739,17 @@ def test_proposal_exclude_empty_grades():
     assert by_name["Labs"].aggregate_only_graded is True
 
 
+def test_proposal_exclude_empty_grades_category_first_with_typo_hint():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+
+    step1 = generator.update_from_prompt(base, "include empty grades for Assignments")
+    step2 = generator.update_from_prompt(step1, "for assignmnet Exclude empty grades")
+
+    by_name = {c.name: c for c in step2.categories}
+    assert by_name["Assignments"].aggregate_only_graded is True
+
+
 def test_proposal_include_outcomes_per_category():
     generator = ProposalGenerator()
     base = generator.generate_initial([])
@@ -1219,6 +2783,25 @@ def test_format_categories_shows_per_category_settings():
     text = cm._format_categories(proposal)
     assert "drop lowest 2" in text
     assert "extra credit" in text.lower()
+
+
+def test_format_categories_shows_subcategories():
+    cm = ConversationManager()
+    proposal = GradebookProposal(categories=[
+        GradebookCategory(
+            name="Assignments",
+            weight=40.0,
+            items=["HW 1", "Project"],
+            subcategories=[
+                GradebookSubcategory(name="Homework", weight=20.0),
+                GradebookSubcategory(name="Project", weight=20.0),
+            ],
+        ),
+    ])
+
+    text = cm._format_categories(proposal)
+    assert "Homework (20.0%)" in text
+    assert "Project (20.0%)" in text
 
 
 def test_proposal_formula_is_applied_to_target_category():
@@ -1260,7 +2843,7 @@ def test_formula_resolver_direct_match_uses_grade_item_id():
 
     assert unresolved == []
     assert suggestions == {}
-    assert resolved == "=average([[334]],[[335]])"
+    assert resolved == "=average([[Homework 1]],[[Homework 2]])"
 
 
 def test_formula_resolver_returns_unresolved_with_suggestions():
@@ -1276,7 +2859,7 @@ def test_formula_resolver_returns_unresolved_with_suggestions():
 
     assert "ghost_hw" in unresolved
     assert "final" not in unresolved
-    assert "[[501]]" in resolved
+    assert "[[Final Exam]]" in resolved
     assert suggestions.get("ghost_hw") is not None
 
 
@@ -1292,7 +2875,7 @@ def test_formula_resolver_maps_hw_alias_to_assignment_numbered_item():
 
     assert unresolved == []
     assert suggestions == {}
-    assert "[[420]]" in resolved
+    assert "[[Assignment1]]" in resolved
 
 
 def test_formula_resolver_supports_activity_and_manual_grade_items():
@@ -1308,8 +2891,8 @@ def test_formula_resolver_supports_activity_and_manual_grade_items():
 
     assert unresolved == []
     assert suggestions == {}
-    assert "[[334]]" in resolved
-    assert "[[777]]" in resolved
+    assert "[[Homework 1]]" in resolved
+    assert "[[Participation Bonus]]" in resolved
 
 
 def test_formula_resolver_accepts_category_name_refs_when_activity_ids_missing():
@@ -1490,7 +3073,46 @@ async def test_accept_warns_for_empty_categories_without_blocking():
 
     assert accepted.phase == "ACCEPTED"
     assert validation.get("can_proceed") is True
-    assert any("zero items" in w.lower() for w in (validation.get("warnings") or []))
+    assert any("no activities assigned" in w.lower() for w in (validation.get("warnings") or []))
+    assert any("manual grade item" in w.lower() for w in (validation.get("warnings") or []))
+
+
+@pytest.mark.asyncio
+async def test_finalize_accepts_manual_grade_item_created_after_accept():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_manual_finalize",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Midterm 40%, Final 60%")],
+        course_activities=[],
+    )
+
+    engine._content_mapper.build_mapping = AsyncMock(return_value={
+        "graded_activities": [],
+        "validation_errors": [],
+    })
+
+    accepted = await engine.accept(session.session_id)
+    assert accepted.phase == "ACCEPTED"
+
+    finalized = await engine.finalize(
+        session.session_id,
+        confirmed_mapping=[
+            {
+                "grade_item_id": 777,
+                "moodle_cmid": None,
+                "activity_name": "Midterm Manual Item",
+                "itemtype": "manual",
+                "item_source": "manual",
+                "category": "Midterm",
+            }
+        ],
+    )
+
+    assert finalized.phase == "COMPLETED"
+    graded = (finalized.content_mapping or {}).get("graded_activities") or []
+    assert any(item.get("grade_item_id") == 777 for item in graded)
 
 
 @pytest.mark.asyncio
@@ -1617,6 +3239,162 @@ def test_conversation_help_request_returns_supported_instruction_list():
 
     assert "supported instructions" in reply.lower()
     assert "excel-style formulas" in reply.lower()
+    assert "manual grade item" in reply.lower()
+    assert "show grade items" in reply.lower()
+    assert "show activities" in reply.lower()
+    assert "show activities and grade items" in reply.lower()
+    assert "show all activities" in reply.lower()
+    assert "show all grade items" in reply.lower()
+
+
+def test_conversation_lists_grade_items_and_activities_together():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s1a",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="PROPOSAL",
+        course_activities=[
+            CourseActivity(name="Homework 1", module="assign"),
+            CourseActivity(name="Quiz 1", module="quiz"),
+        ],
+        proposal=GradebookProposal(
+            categories=[
+                GradebookCategory(name="Assignments", weight=50.0, items=["Homework 1", "Final"]),
+                GradebookCategory(name="Quizzes", weight=50.0, items=["Quiz 1"]),
+            ],
+        ),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="show activities and grade items")
+
+    assert "moodle activities" in reply.lower()
+    assert "homework 1" in reply.lower()
+    assert "proposal grade items" in reply.lower()
+    assert "final [manual]" in reply.lower()
+    assert "quiz 1 [activity]" in reply.lower()
+
+
+def test_conversation_show_grade_items_lists_all_items_by_default():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s1b",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="PROPOSAL",
+        course_activities=[
+            CourseActivity(name="A1", module="assign"),
+            CourseActivity(name="A2", module="assign"),
+            CourseActivity(name="A3", module="assign"),
+            CourseActivity(name="A4", module="assign"),
+            CourseActivity(name="A5", module="assign"),
+            CourseActivity(name="A6", module="assign"),
+        ],
+        proposal=GradebookProposal(
+            categories=[
+                GradebookCategory(name="Assignments", weight=100.0, items=["A1", "A2", "A3", "A4", "A5", "A6"]),
+            ],
+        ),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="show grade items")
+
+    assert "proposal grade items" in reply.lower()
+    assert "moodle activities" not in reply.lower()
+    assert "a6 [activity]" in reply.lower()
+    assert "... and" not in reply.lower()
+
+
+def test_conversation_listing_shows_show_all_hints_when_truncated():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s1c",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="PROPOSAL",
+        course_activities=[
+            CourseActivity(name=f"Activity {i}", module="assign")
+            for i in range(1, 11)
+        ],
+        proposal=GradebookProposal(
+            categories=[
+                GradebookCategory(
+                    name="Assignments",
+                    weight=100.0,
+                    items=[f"Activity {i}" for i in range(1, 8)],
+                ),
+            ],
+        ),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="show activities and grade items")
+
+    assert "... and" in reply.lower()
+    assert "show all activities" in reply.lower()
+    assert "show all grade items" in reply.lower()
+
+
+def test_conversation_show_all_activities_returns_full_list():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s1d",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        course_activities=[
+            CourseActivity(name=f"Activity {i}", module="assign")
+            for i in range(1, 12)
+        ],
+        proposal=GradebookProposal(
+            categories=[
+                GradebookCategory(name="Assignments", weight=100.0, items=["Activity 1"]),
+            ],
+        ),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="show all activities")
+
+    assert "moodle activities" in reply.lower()
+    assert "activity 11" in reply.lower()
+    assert "... and" not in reply.lower()
+
+
+def test_conversation_offtopic_prompt_returns_unsupported_warning_in_accepted_phase():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s2a",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="ACCEPTED",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="ffasfasfaf")
+
+    assert "couldn't understand" in reply.lower()
+    assert "manual grade item" in reply.lower()
+
+
+def test_conversation_mapping_prompt_keeps_accepted_phase_guidance():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s2b",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="ACCEPTED",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="show mapping rows before finalize")
+
+    assert "proposal accepted" in reply.lower()
+    assert "mapping" in reply.lower()
 
 
 def test_conversation_offtopic_prompt_returns_unsupported_warning_in_refinement():
@@ -1689,6 +3467,41 @@ def test_conversation_upload_signal_in_refinement_returns_analysis_message():
 
     assert "couldn't understand" not in reply.lower()
     assert "received your syllabus/supporting document" in reply.lower()
+
+
+def test_conversation_upload_signal_with_proposal_request_returns_proposal():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s3up2",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        extraction={"has_syllabus": True},
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="use syllabus and give me a proposal")
+
+    assert "received your syllabus/supporting document" not in reply.lower()
+    assert "updated proposal" in reply.lower()
+
+
+def test_conversation_give_me_proposal_based_on_what_you_know_is_supported():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s3up3",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="give me proposal based on what you know")
+
+    assert "couldn't understand" not in reply.lower()
+    assert "updated proposal" in reply.lower()
 
 
 def test_conversation_formula_target_prompt_is_not_rejected_in_refinement():
@@ -1810,6 +3623,47 @@ def test_conversation_does_not_repeat_formula_error_when_formula_unchanged():
 
     assert "saved the formula" not in reply.lower()
     assert "updated proposal" in reply.lower()
+
+
+def test_refinement_reply_surfaces_item_weight_rejection_warning():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s_item_warning",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        extraction={"proposal_changed": True},
+        proposal=GradebookProposal(
+            categories=[
+                GradebookCategory(name="Assignments", weight=25.0, items=[]),
+                GradebookCategory(name="Midterm", weight=25.0, items=[]),
+                GradebookCategory(name="Final Exam", weight=25.0, items=[]),
+                GradebookCategory(
+                    name="Quizzes",
+                    weight=25.0,
+                    items=["quiz 1", "quiz 2"],
+                    item_weights={"quiz 1": 40.0, "quiz 2": 60.0},
+                ),
+            ],
+            notes=[
+                "Effect: Set item weight for 'quiz 1' in Quizzes to 40.0%",
+                "Effect: Set item weight for 'quiz 2' in Quizzes to 60.0%",
+                "Item weight check: Quizzes item weights would total 110.0% (max 100%).",
+            ],
+            aggregation_method=0,
+        ),
+    )
+
+    reply = cm.make_reply(
+        session,
+        session.proposal,
+        prompt="set weight of quiz 1 to 40% and set weight of quiz 2 to 70%",
+    )
+
+    assert "**weight update warning:**" in reply.lower()
+    assert "were not applied" in reply.lower()
+    assert "kept unchanged" in reply.lower()
 
 
 def test_formula_if_expression_is_parsed_without_truncation():
@@ -2029,6 +3883,20 @@ def test_proposal_hidden_until_relative_parsed_from_hide_phrase():
     assert by_name["Final Exam"].hidden_until is not None
     assert any("effect: final exam hidden until next week" in str(n).lower() for n in (updated.notes or []))
     assert not any("effect: final exam hidden from students" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_proposal_hidden_until_relative_parsed_for_chained_categories():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    updated = generator.update_from_prompt(base, "hide midterm until next week and final until next month")
+    by_name = {c.name: c for c in updated.categories}
+    assert by_name["Midterm"].hidden is True
+    assert by_name["Final Exam"].hidden is True
+    assert by_name["Midterm"].hidden_until is not None
+    assert by_name["Final Exam"].hidden_until is not None
+    assert by_name["Final Exam"].hidden_until > by_name["Midterm"].hidden_until
+    assert any("effect: midterm hidden until next week" in str(n).lower() for n in (updated.notes or []))
+    assert any("effect: final exam hidden until next month" in str(n).lower() for n in (updated.notes or []))
 
 
 def test_proposal_hidden_until_accepts_untill_typo():
@@ -3042,6 +4910,51 @@ async def test_mapper_multiple_manual_items_without_cmid_are_distinct():
 
 
 @pytest.mark.asyncio
+async def test_content_mapper_llm_uses_activity_key_for_manual_grade_items_without_cmid():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(return_value={
+        "agent_response": {
+            "chat_response": {
+                "message": {
+                    "content": (
+                        '[{"activity_key": "gradeitem:501:0", "moodle_cmid": null, '
+                        '"category": "Midterm", "confidence": 0.92, "reasoning": "midterm keyword"}, '
+                        '{"activity_key": "gradeitem:502:1", "moodle_cmid": null, '
+                        '"category": "Final Exam", "confidence": 0.94, "reasoning": "final exam keyword"}]'
+                    )
+                }
+            }
+        }
+    })
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Midterm", weight=40.0),
+            GradebookCategory(name="Final Exam", weight=60.0),
+        ]
+    )
+
+    result = await mapper.build_mapping(
+        course_activities=[
+            CourseActivity(name="Term Assessment", module=None, cmid=None, grade_item_id=501, itemtype="manual"),
+            CourseActivity(name="Summative Assessment", module=None, cmid=None, grade_item_id=502, itemtype="manual"),
+        ],
+        proposal=proposal,
+    )
+
+    graded = result["graded_activities"]
+    assert len(graded) == 2
+    assert graded[0]["suggested_category"] == "Midterm"
+    assert graded[1]["suggested_category"] == "Final Exam"
+    assert graded[0]["activity_key"] == "gradeitem:501:0"
+    assert graded[1]["activity_key"] == "gradeitem:502:1"
+
+
+@pytest.mark.asyncio
 async def test_mapper_keyword_confidence_levels():
     """Test that keyword matches report appropriate confidence scores."""
     mapper = ContentMapper()
@@ -3235,6 +5148,98 @@ def test_delete_category_pattern_variations():
         updated = generator.update_from_prompt(base, pattern)
         by_name = {c.name: c for c in updated.categories}
         assert "Quizzes" not in by_name, f"Pattern '{pattern}' should delete Quizzes"
+
+
+def test_item_weight_set_does_not_mutate_parent_category_weight():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=25.0, items=[]),
+            GradebookCategory(name="Midterm", weight=25.0, items=[]),
+            GradebookCategory(name="Final Exam", weight=25.0, items=[]),
+            GradebookCategory(name="Quizzes", weight=25.0, items=["quiz 1", "quiz 2"]),
+        ],
+    )
+
+    updated = generator.update_from_prompt(base, "set weight of quiz 1 to 40")
+    by_name = {c.name: c for c in updated.categories}
+
+    assert by_name["Quizzes"].weight == 25.0
+    assert by_name["Quizzes"].item_weights.get("quiz 1") == 40.0
+    assert by_name["Quizzes"].item_weights.get("quiz 2") is None
+    assert abs(sum(c.weight for c in updated.categories) - 100.0) < 0.1
+    assert any("set item weight for 'quiz 1'" in str(n).lower() for n in (updated.notes or []))
+    assert not any("set quizzes to" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_item_weight_assign_keyword_is_supported_without_parent_mutation():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=25.0, items=[]),
+            GradebookCategory(name="Midterm", weight=25.0, items=[]),
+            GradebookCategory(name="Final Exam", weight=25.0, items=[]),
+            GradebookCategory(name="Quizzes", weight=25.0, items=["quiz 1", "quiz 2"]),
+        ],
+    )
+
+    updated = generator.update_from_prompt(base, "assign quiz 1 to 40")
+    by_name = {c.name: c for c in updated.categories}
+
+    assert by_name["Quizzes"].weight == 25.0
+    assert by_name["Quizzes"].item_weights.get("quiz 1") == 40.0
+    assert by_name["Quizzes"].item_weights.get("quiz 2") is None
+    assert abs(sum(c.weight for c in updated.categories) - 100.0) < 0.1
+    assert any("set item weight for 'quiz 1'" in str(n).lower() for n in (updated.notes or []))
+    assert not any("set quizzes to" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_item_weight_multi_set_keeps_parent_weight_stable():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=25.0, items=[]),
+            GradebookCategory(name="Midterm", weight=25.0, items=[]),
+            GradebookCategory(name="Final Exam", weight=25.0, items=[]),
+            GradebookCategory(name="Quizzes", weight=25.0, items=["quiz 1", "quiz 2"]),
+        ],
+    )
+
+    updated = generator.update_from_prompt(
+        base,
+        "set weight of quiz 1 to 40 and set weight of quiz 2 to 60",
+    )
+    by_name = {c.name: c for c in updated.categories}
+
+    assert by_name["Quizzes"].weight == 25.0
+    assert by_name["Quizzes"].item_weights.get("quiz 1") == 40.0
+    assert by_name["Quizzes"].item_weights.get("quiz 2") == 60.0
+    assert abs(sum(c.weight for c in updated.categories) - 100.0) < 0.1
+    assert not any("set quizzes to" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_item_weight_validation_blocks_sum_over_100():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=25.0, items=[]),
+            GradebookCategory(name="Midterm", weight=25.0, items=[]),
+            GradebookCategory(name="Final Exam", weight=25.0, items=[]),
+            GradebookCategory(name="Quizzes", weight=25.0, items=["quiz 1", "quiz 2"]),
+        ],
+    )
+
+    updated = generator.update_from_prompt(
+        base,
+        "set weight of quiz 1 to 70 and set weight of quiz 2 to 40",
+    )
+    by_name = {c.name: c for c in updated.categories}
+
+    assert by_name["Quizzes"].weight == 25.0
+    assert by_name["Quizzes"].item_weights.get("quiz 1") == 70.0
+    assert by_name["Quizzes"].item_weights.get("quiz 2") is None
+    assert any("item weight check:" in str(n).lower() for n in (updated.notes or []))
+    assert any("max 100%" in str(n).lower() for n in (updated.notes or []))
 
 
 def test_delete_category_with_redistribution_syntax():
@@ -3487,3 +5492,103 @@ async def test_session_delete_calls_criadex_content_delete_for_uploaded_docs():
     assert result["success"] is True
     assert result["docs_deleted"] == 2
     assert criadex.content.delete.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_mapping_validation_recognizes_category_with_manual_grade_item():
+    """
+    Regression: categories with manual grade items added via proposal (e.g. 'final'
+    in Final Exam) must NOT appear as empty in mapping validation warnings.
+    Bug: _pre_accept_validation() only checked graded_activities rows from the
+    mapping, ignoring proposal.category.items (manual grade items).
+    """
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Final Exam 75%")],
+        course_activities=[CourseActivity(name="Assignment 1", module="assign", cmid=10)],
+    )
+
+    # Add a manual grade item to Final Exam (which has no Moodle activities)
+    session = await engine.chat(session.session_id, "add grade item 'final' to Final Exam")
+    final_exam_cat = next((c for c in session.proposal.categories if c.name == "Final Exam"), None)
+    assert final_exam_cat is not None
+    assert any("final" in item.lower() for item in (final_exam_cat.items or [])), (
+        f"Manual grade item 'final' must be in Final Exam items, got: {final_exam_cat.items}"
+    )
+
+    # Accept to trigger validation
+    accepted = await engine.accept(session.session_id)
+    assert accepted.phase == "ACCEPTED"
+
+    # Validation should NOT warn that Final Exam has no activities assigned
+    validation = (accepted.content_mapping or {}).get("validation") or {}
+    warnings = [str(w) for w in (validation.get("warnings") or [])]
+    assert not any("Final Exam" in w and "no activities" in w for w in warnings), (
+        f"Final Exam should not appear as empty — it has a manual grade item. Got warnings: {warnings}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mapping_validation_still_warns_categories_with_no_items_or_activities():
+    """
+    The fix should only suppress the warning for categories that truly have manual
+    grade items. Categories with zero items AND no mapped activities must still warn.
+    """
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Labs 15%, Final Exam 60%")],
+        course_activities=[CourseActivity(name="Assignment 1", module="assign", cmid=10)],
+    )
+
+    # Accept without adding any manual grade items — Labs and Final Exam have nothing
+    accepted = await engine.accept(session.session_id)
+    assert accepted.phase == "ACCEPTED"
+
+    validation = (accepted.content_mapping or {}).get("validation") or {}
+    warnings = [str(w) for w in (validation.get("warnings") or [])]
+    # Labs and/or Final Exam have no activities and no manual grade items → must warn
+    assert any("no activities" in w for w in warnings), (
+        f"Expected a warning for empty categories, got: {warnings}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mapping_validation_multiple_categories_manual_items_suppress_correctly():
+    """
+    When multiple categories each have manual grade items, none of them should
+    appear in empty-category warnings.
+    """
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Midterm 40%, Final Exam 60%")],
+        course_activities=[],
+    )
+
+    # Add manual grade items to both categories
+    session = await engine.chat(session.session_id, "add grade item 'midterm exam' to Midterm")
+    session = await engine.chat(session.session_id, "add grade item 'final exam' to Final Exam")
+
+    midterm_cat = next((c for c in session.proposal.categories if c.name == "Midterm"), None)
+    final_cat = next((c for c in session.proposal.categories if c.name == "Final Exam"), None)
+    assert midterm_cat is not None and final_cat is not None
+
+    accepted = await engine.accept(session.session_id)
+
+    validation = (accepted.content_mapping or {}).get("validation") or {}
+    warnings = [str(w) for w in (validation.get("warnings") or [])]
+    # Neither category should be flagged
+    assert not any("Midterm" in w and "no activities" in w for w in warnings), (
+        f"Midterm has a manual grade item but is flagged empty. Warnings: {warnings}"
+    )
+    assert not any("Final Exam" in w and "no activities" in w for w in warnings), (
+        f"Final Exam has a manual grade item but is flagged empty. Warnings: {warnings}"
+    )

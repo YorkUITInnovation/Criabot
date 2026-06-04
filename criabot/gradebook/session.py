@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import os
 import re
 import time
@@ -9,7 +11,13 @@ from typing import Dict, List, TYPE_CHECKING, Any
 
 from .conversation import ConversationManager
 from .content_mapper import ContentMapper
-from .proposal import ProposalGenerator, validate_proposal_weights
+from .proposal import (
+    ProposalGenerator,
+    validate_proposal_weights,
+    sync_proposal_items_from_mapping,
+    sync_mapping_from_proposal_manual_items,
+)
+from .naming_utils import derive_course_activities_from_resources
 from .schemas import CourseActivity, GradebookSessionRecord, MoodleResource
 from criabot.cache.objects.gradebooks import _parse_time_to_seconds
 
@@ -21,6 +29,15 @@ logger = logging.getLogger(__name__)
 
 
 class GradebookSessionEngine:
+    _origin_context_keys = (
+        "baseline_available",
+        "baseline_snapshot",
+        "import_mode",
+        "context_source",
+        "baseline_policy",
+        "baseline_import_snapshot_ref",
+    )
+
     def __init__(
         self,
         gradebook_db: 'GradebookDatabaseAPI' = None,
@@ -60,6 +77,78 @@ class GradebookSessionEngine:
         if not isinstance(values, list):
             return []
         return [str(v).strip() for v in values if str(v).strip()]
+
+    def _merge_course_activities(
+        self,
+        existing: List[CourseActivity],
+        incoming: List[CourseActivity],
+    ) -> List[CourseActivity]:
+        merged: Dict[str, CourseActivity] = {}
+        order: List[str] = []
+
+        def activity_key(activity: CourseActivity) -> str:
+            grade_item_id = getattr(activity, "grade_item_id", None)
+            if grade_item_id is not None and str(grade_item_id).strip() != "":
+                return f"gi:{grade_item_id}"
+            cmid = getattr(activity, "cmid", None)
+            if cmid is not None and str(cmid).strip() != "":
+                return f"cm:{cmid}"
+            return f"name:{str(activity.name).strip().lower()}"
+
+        for activity in list(existing or []) + list(incoming or []):
+            key = activity_key(activity)
+            if key not in merged:
+                order.append(key)
+            merged[key] = activity
+
+        return [merged[key] for key in order]
+
+    async def sync_moodle_context(
+        self,
+        session_id: str,
+        course_activities: List[CourseActivity] | List[dict] | None = None,
+        confirmed_mapping: List[dict] | None = None,
+    ) -> GradebookSessionRecord:
+        session = self._active_sessions.get(session_id) or await self.get(session_id)
+        if session is None:
+            raise KeyError("gradebook session not found")
+
+        changed = False
+
+        if course_activities:
+            incoming = [
+                CourseActivity(**activity) if isinstance(activity, dict) else activity
+                for activity in course_activities
+            ]
+            merged = self._merge_course_activities(list(session.course_activities or []), incoming)
+            if [activity.model_dump() for activity in merged] != [
+                activity.model_dump() for activity in (session.course_activities or [])
+            ]:
+                session.course_activities = merged
+                changed = True
+
+        if confirmed_mapping and session.proposal is not None:
+            if sync_proposal_items_from_mapping(
+                session.proposal,
+                confirmed_mapping,
+                session.course_activities,
+            ):
+                self._ensure_history_initialized(session)
+                self._push_proposal_history(session)
+                changed = True
+
+        if session.content_mapping is not None and session.proposal is not None:
+            if sync_mapping_from_proposal_manual_items(
+                session.proposal,
+                session.content_mapping,
+                session.course_activities,
+            ):
+                changed = True
+
+        if changed:
+            await self._save_session(session)
+
+        return session
 
     async def register_uploaded_document(self, session_id: str, document_name: str) -> None:
         """Track an uploaded document name for session-bound cleanup at delete time."""
@@ -412,18 +501,12 @@ class GradebookSessionEngine:
         bot_name: str,
         moodle_resources: List[MoodleResource],
         course_activities: List[CourseActivity],
+        baseline_snapshot: dict | None = None,
+        import_mode: str | None = None,
     ) -> GradebookSessionRecord:
         if not course_activities and moodle_resources:
-            # Fallback: derive activity-like records from visible Moodle resources.
-            course_activities = [
-                CourseActivity(
-                    cmid=resource.cmid,
-                    module=resource.type,
-                    name=resource.name,
-                )
-                for resource in moodle_resources
-                if resource.name
-            ]
+            # Fallback: only real gradeable modules; syllabus/files stay in moodle_resources for analysis.
+            course_activities = derive_course_activities_from_resources(moodle_resources)
         session_id = "gb-" + str(uuid.uuid4())
         uploaded_docs = []
         # If any uploaded docs are tracked for this session, include them
@@ -432,8 +515,26 @@ class GradebookSessionEngine:
         extraction = {}
         syllabus_sources = self._detect_syllabus_sources(moodle_resources, uploaded_docs)
         has_syllabus = len(syllabus_sources) > 0
-        phase = "ANALYSIS" if has_syllabus else "INTAKE"
-        proposal = self._proposal_generator.generate_initial(course_activities) if phase == "ANALYSIS" else None
+        baseline_available = bool(isinstance(baseline_snapshot, dict) and baseline_snapshot.get("available"))
+        normalized_import_mode = "baseline" if (str(import_mode or "").strip().lower() == "baseline" and baseline_available) else "fresh"
+        context_source = "baseline_import" if normalized_import_mode == "baseline" else "syllabus_generation"
+        baseline_policy = "mirror_then_override" if normalized_import_mode == "baseline" else "generate_fresh"
+        baseline_import_snapshot_ref = None
+        if baseline_available:
+            try:
+                serialized = json.dumps(baseline_snapshot, sort_keys=True, separators=(",", ":"), default=str)
+                baseline_import_snapshot_ref = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            except Exception:
+                baseline_import_snapshot_ref = None
+        if normalized_import_mode == "baseline":
+            phase = "BASELINE_READY"
+            proposal = self._proposal_generator.generate_from_baseline_snapshot(
+                baseline_snapshot=baseline_snapshot,
+                activities=course_activities,
+            )
+        else:
+            phase = "ANALYSIS" if has_syllabus else "INTAKE"
+            proposal = self._proposal_generator.generate_initial(course_activities) if phase == "ANALYSIS" else None
         record = GradebookSessionRecord(
             session_id=session_id,
             course_id=course_id,
@@ -445,6 +546,12 @@ class GradebookSessionEngine:
             extraction={
                 "has_syllabus": has_syllabus,
                 "syllabus_sources": syllabus_sources,
+                "baseline_available": baseline_available,
+                "baseline_snapshot": baseline_snapshot if isinstance(baseline_snapshot, dict) else None,
+                "import_mode": normalized_import_mode,
+                "context_source": context_source,
+                "baseline_policy": baseline_policy,
+                "baseline_import_snapshot_ref": baseline_import_snapshot_ref,
             },
             proposal=proposal,
             last_touched_at=int(time.time()),
@@ -513,7 +620,29 @@ class GradebookSessionEngine:
 
         previous_phase = session.phase
         session.phase = self._conversation.next_phase(session, prompt)
-        if session.phase in {"ANALYSIS", "REFINEMENT", "PROPOSAL"} and session.proposal is None:
+
+        switched_to_fresh_from_baseline = bool(
+            previous_phase == "BASELINE_READY"
+            and self._conversation._looks_like_fresh_generation_request(prompt)
+            and session.phase in {"ANALYSIS", "INTAKE"}
+        )
+        if switched_to_fresh_from_baseline:
+            if session.phase == "ANALYSIS":
+                session.proposal = self._proposal_generator.generate_initial(session.course_activities)
+                self._proposal_history[session.session_id] = []
+                self._proposal_history_index[session.session_id] = -1
+                self._push_proposal_history(session)
+            else:
+                session.proposal = None
+                self._proposal_history[session.session_id] = []
+                self._proposal_history_index[session.session_id] = -1
+
+            session.content_mapping = None
+            session.extraction["import_mode"] = "fresh"
+            session.extraction["context_source"] = "syllabus_generation"
+            session.extraction["baseline_policy"] = "generate_fresh"
+
+        if session.phase in {"ANALYSIS", "BASELINE_READY", "REFINEMENT", "PROPOSAL"} and session.proposal is None:
             session.proposal = self._proposal_generator.generate_initial(session.course_activities)
             self._push_proposal_history(session)
 
@@ -564,6 +693,12 @@ class GradebookSessionEngine:
             raise KeyError("gradebook session not found")
 
         if session.phase in {"ACCEPTED", "COMPLETED"} and session.content_mapping is not None:
+            if sync_mapping_from_proposal_manual_items(
+                session.proposal,
+                session.content_mapping,
+                session.course_activities,
+            ):
+                await self._save_session(session)
             return session
 
         session.extraction = session.extraction or {}
@@ -573,6 +708,14 @@ class GradebookSessionEngine:
             course_activities=session.course_activities,
             proposal=session.proposal,
             mapper_chat_id=mapper_chat_id,
+        )
+
+        if session.content_mapping is None:
+            session.content_mapping = {}
+        sync_mapping_from_proposal_manual_items(
+            session.proposal,
+            content_mapping,
+            session.course_activities,
         )
 
         latest_mapper_chat_id = str((content_mapping or {}).get("llm_mapper_chat_id") or "").strip()
@@ -652,10 +795,28 @@ class GradebookSessionEngine:
             )
 
         # Empty categories are warnings (non-blocking) so instructors can intentionally keep them.
+        assigned_categories = set()
+        for item in list((content_mapping or {}).get("graded_activities") or []):
+            mapped_category = str(item.get("confirmed_category") or item.get("suggested_category") or "").strip()
+            if mapped_category and mapped_category not in {ContentMapper.NOT_GRADED, ContentMapper.UNCATEGORIZED}:
+                assigned_categories.add(mapped_category)
+
+        # Also check for manual grade items in the proposal itself
         for category in proposal.categories:
-            item_count = len(category.items or [])
-            if item_count == 0:
-                warnings.append(f"Category '{category.name}' has zero items.")
+            if category.items:  # If category has manual grade items
+                assigned_categories.add(str(category.name).strip())
+
+        empty_categories = [
+            str(category.name).strip()
+            for category in proposal.categories
+            if str(category.name).strip() and str(category.name).strip() not in assigned_categories
+        ]
+        if empty_categories:
+            warnings.append(
+                "These categories have no activities assigned: "
+                f"{', '.join(empty_categories)}. "
+                "Pick an activity row, remove the category, or add a manual grade item to assign to it."
+            )
 
         return {
             "errors": errors,
@@ -668,13 +829,35 @@ class GradebookSessionEngine:
         if session is None:
             raise KeyError("gradebook session not found")
 
-        has_syllabus = bool((session.extraction or {}).get("has_syllabus"))
+        previous_extraction = session.extraction or {}
+        has_syllabus = bool(previous_extraction.get("has_syllabus"))
+        origin_context = {
+            key: previous_extraction.get(key)
+            for key in self._origin_context_keys
+            if key in previous_extraction
+        }
         session.proposal = self._proposal_generator.generate_initial(session.course_activities)
         session.content_mapping = None
         if not keep_extraction:
-            session.extraction = {"has_syllabus": has_syllabus, "syllabus_sources": list((session.extraction or {}).get("syllabus_sources") or [])}
+            session.extraction = {
+                "has_syllabus": has_syllabus,
+                "syllabus_sources": list(previous_extraction.get("syllabus_sources") or []),
+                **origin_context,
+            }
 
-        session.phase = "PROPOSAL" if has_syllabus else "INTAKE"
+        # Reset must clear persisted chat transcript regardless of extraction retention mode.
+        if isinstance(session.extraction, dict):
+            session.extraction.pop(self._chat_history_key(), None)
+
+        if str((session.extraction or {}).get("import_mode") or "").strip().lower() == "baseline" and bool((session.extraction or {}).get("baseline_available")):
+            baseline_snapshot = (session.extraction or {}).get("baseline_snapshot")
+            session.proposal = self._proposal_generator.generate_from_baseline_snapshot(
+                baseline_snapshot=baseline_snapshot,
+                activities=session.course_activities,
+            )
+            session.phase = "BASELINE_READY"
+        else:
+            session.phase = "PROPOSAL" if has_syllabus else "INTAKE"
         self._proposal_history[session.session_id] = []
         self._proposal_history_index[session.session_id] = -1
         self._push_proposal_history(session)
@@ -793,20 +976,137 @@ class GradebookSessionEngine:
             await self._save_session(session)
             return session
 
+        if session.content_mapping is None:
+            session.content_mapping = {}
+        sync_mapping_from_proposal_manual_items(
+            session.proposal,
+            session.content_mapping,
+            session.course_activities,
+        )
         graded_activities = list((session.content_mapping or {}).get("graded_activities", []))
+        session.content_mapping["graded_activities"] = graded_activities
         activity_by_cmid = {
             item.get("moodle_cmid"): item
             for item in graded_activities
             if item.get("moodle_cmid") is not None
         }
+        activity_by_grade_item_id = {
+            int(item.get("grade_item_id")): item
+            for item in graded_activities
+            if item.get("grade_item_id") is not None
+            and str(item.get("grade_item_id")).strip() != ""
+        }
+
+        unresolved_confirmations: List[dict] = []
+        matched_count = 0
 
         for confirmed in confirmed_mapping:
-            existing = activity_by_cmid.get(confirmed.get("moodle_cmid"))
+            existing = None
+
+            confirmed_grade_item_id = confirmed.get("grade_item_id")
+            if confirmed_grade_item_id is not None and str(confirmed_grade_item_id).strip() != "":
+                try:
+                    existing = activity_by_grade_item_id.get(int(confirmed_grade_item_id))
+                except (TypeError, ValueError):
+                    existing = None
+
             if existing is None:
+                existing = activity_by_cmid.get(confirmed.get("moodle_cmid"))
+
+            if existing is None:
+                confirmed_name = str(
+                    confirmed.get("activity_name") or confirmed.get("grade_item_name") or ""
+                ).strip().lower()
+                if confirmed_name:
+                    for item in graded_activities:
+                        if str(item.get("activity_name") or "").strip().lower() == confirmed_name:
+                            existing = item
+                            break
+
+            if existing is None:
+                confirmed_grade_item_id = confirmed.get("grade_item_id")
+                manual_source = str(confirmed.get("item_source") or confirmed.get("itemtype") or "").strip().lower()
+                if (
+                    confirmed_grade_item_id is not None
+                    and str(confirmed_grade_item_id).strip() != ""
+                    and (manual_source == "manual" or confirmed.get("moodle_cmid") in (None, "", 0))
+                ):
+                    try:
+                        manual_grade_item_id = int(confirmed_grade_item_id)
+                    except (TypeError, ValueError):
+                        manual_grade_item_id = 0
+
+                    if manual_grade_item_id > 0:
+                        existing = {
+                            "grade_item_id": manual_grade_item_id,
+                            "moodle_cmid": None,
+                            "activity_name": str(
+                                confirmed.get("activity_name") or f"Manual Grade Item #{manual_grade_item_id}"
+                            ).strip(),
+                            "itemtype": "manual",
+                            "module": None,
+                            "item_source": "manual",
+                            "suggested_category": confirmed.get("category"),
+                            "confirmed_category": confirmed.get("category"),
+                            "finalized": False,
+                            "confidence": 1.0,
+                            "reasoning": "Manual grade item created during mapping review.",
+                            "mapping_method": "manual_ui",
+                        }
+                        graded_activities.append(existing)
+                        activity_by_grade_item_id[manual_grade_item_id] = existing
+
+            if existing is None:
+                unresolved_confirmations.append(
+                    {
+                        "grade_item_id": confirmed.get("grade_item_id"),
+                        "moodle_cmid": confirmed.get("moodle_cmid"),
+                        "category": confirmed.get("category"),
+                    }
+                )
                 continue
+
             existing["suggested_category"] = confirmed.get("category")
             existing["confirmed_category"] = confirmed.get("category")
             existing["finalized"] = True
+            matched_count += 1
+
+        if confirmed_mapping and matched_count == 0:
+            validation = dict((session.content_mapping or {}).get("validation") or {})
+            errors = list(validation.get("errors") or [])
+            errors.append(
+                "Finalize mapping mismatch: confirmed rows did not match session graded activities by grade_item_id or moodle_cmid."
+            )
+            validation["errors"] = errors
+            validation["can_proceed"] = False
+            validation["unresolved_confirmations"] = unresolved_confirmations
+            if session.content_mapping is None:
+                session.content_mapping = {}
+            session.content_mapping["validation"] = validation
+            session.phase = "REFINEMENT"
+            await self._save_session(session)
+            return session
+
+        if unresolved_confirmations:
+            validation = dict((session.content_mapping or {}).get("validation") or {})
+            warnings = list(validation.get("warnings") or [])
+            warnings.append(
+                f"Finalize skipped {len(unresolved_confirmations)} mapping row(s) that could not be resolved to graded activities."
+            )
+            validation["warnings"] = warnings
+            validation["unresolved_confirmations"] = unresolved_confirmations
+            if session.content_mapping is None:
+                session.content_mapping = {}
+            session.content_mapping["validation"] = validation
+
+        if session.proposal is not None and confirmed_mapping:
+            if sync_proposal_items_from_mapping(
+                session.proposal,
+                confirmed_mapping,
+                session.course_activities,
+            ):
+                self._ensure_history_initialized(session)
+                self._push_proposal_history(session)
 
         session.phase = "COMPLETED"
         await self._save_session(session)
