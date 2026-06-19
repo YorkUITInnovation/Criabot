@@ -4,8 +4,14 @@ from datetime import datetime, timezone
 import re
 from typing import List, Dict, Optional
 
-from .schemas import GradebookProposal, GradebookSessionRecord, GRADE_DISPLAY_TYPE_NAMES
-from .proposal import ProposalGenerator, validate_proposal_weights
+from .schemas import (
+    CourseActivity,
+    GradebookCategory,
+    GradebookProposal,
+    GradebookSessionRecord,
+    GRADE_DISPLAY_TYPE_NAMES,
+)
+from .proposal import ProposalGenerator, validate_proposal_weights, _proposal_tracked_item_names
 from .formula_parser import FormulaParser
 
 
@@ -31,6 +37,63 @@ def check_weight_warnings(proposal: GradebookProposal) -> List[str]:
 
 
 class ConversationManager:
+    @staticmethod
+    def _mapping_row_for_item(item_name: str, mapping_rows: List[dict]) -> Optional[dict]:
+        name_key = str(item_name or "").strip().lower()
+        if not name_key:
+            return None
+        for row in mapping_rows:
+            if str(row.get("activity_name") or "").strip().lower() == name_key:
+                return row
+        return None
+
+    @staticmethod
+    def _is_manual_mapping_row(row: Optional[dict]) -> bool:
+        if not row:
+            return False
+        source = str(row.get("item_source") or "").strip().lower()
+        itemtype = str(row.get("itemtype") or row.get("grade_item_type") or "").strip().lower()
+        return source in {"manual", "proposal_manual", "proposal"} or itemtype == "manual"
+
+    @staticmethod
+    def _match_course_activity(item_name: str, course_activities: List[CourseActivity]) -> Optional[CourseActivity]:
+        query_key = str(item_name or "").strip().lower()
+        if not query_key:
+            return None
+        for activity in course_activities:
+            name_key = str(getattr(activity, "name", "") or "").strip().lower()
+            if name_key == query_key:
+                return activity
+        return None
+
+    @staticmethod
+    def _course_activity_is_moodle_activity(activity: CourseActivity) -> bool:
+        module = str(getattr(activity, "module", None) or "").strip()
+        cmid = getattr(activity, "cmid", None)
+        itemtype = str(getattr(activity, "itemtype", None) or "mod").strip().lower()
+        if itemtype == "manual" and not module and cmid in (None, "", 0):
+            return False
+        return bool(
+            module
+            or itemtype == "mod"
+            or (cmid is not None and str(cmid).strip() not in {"", "0"})
+        )
+
+    @staticmethod
+    def _is_moodle_activity_item(
+        item_name: str,
+        course_activities: List[CourseActivity],
+        mapping_rows: Optional[List[dict]] = None,
+    ) -> bool:
+        mapping_row = ConversationManager._mapping_row_for_item(item_name, mapping_rows or [])
+        if ConversationManager._is_manual_mapping_row(mapping_row):
+            return False
+
+        activity = ConversationManager._match_course_activity(item_name, course_activities)
+        if activity is None:
+            return False
+        return ConversationManager._course_activity_is_moodle_activity(activity)
+
     @staticmethod
     def _contains_phrase(text: str, phrases: tuple[str, ...]) -> bool:
         text_l = text.lower()
@@ -194,8 +257,10 @@ class ConversationManager:
         if self._looks_like_help_request(text):
             return session.phase
 
-        if self._looks_like_listing_request(text):
-            return session.phase
+        # Read-only view/listing commands should not alter phase once editing has started.
+        if session.phase in {"PROPOSAL", "REFINEMENT", "ACCEPTED", "COMPLETED"}:
+            if self._looks_like_proposal_view_request(text) or self._looks_like_listing_request(text):
+                return session.phase
 
         # Explicit proposal requests should not be interpreted as acceptance.
         if self._looks_like_proposal_request(text):
@@ -277,8 +342,23 @@ class ConversationManager:
         return session.phase
 
     @staticmethod
+    def _is_read_only_gradebook_prompt(text: str) -> bool:
+        """Return True when the prompt should only render information, not mutate the proposal."""
+        if not text or not str(text).strip():
+            return False
+        return (
+            ConversationManager._looks_like_help_request(text)
+            or ConversationManager._looks_like_proposal_view_request(text)
+            or ConversationManager._looks_like_listing_request(text)
+            or ConversationManager._looks_like_proposal_request(text)
+            or bool(re.search(r"\b(?:undo|redo)\b", text.lower()))
+        )
+
+    @staticmethod
     def _looks_like_gradebook_refinement(text: str) -> bool:
         """Return True if the prompt appears to contain a valid gradebook refinement request."""
+        if ConversationManager._is_read_only_gradebook_prompt(text):
+            return False
         t = text.lower()
         # Explicit weight change indicators.
         if "%" in t:
@@ -310,7 +390,8 @@ class ConversationManager:
             "hide", "hidden", "show", "unhide", "reveal", "lock", "unlock",
             "drop", "keep", "extra credit", "aggregat", "method", "weighted",
             "natural", "mean", "weight", "rebalance", "redistribute", "proportion",
-            "normalize", "swap", "move", "to category", "grade item", "manual grade item",
+            "normalize", "swap",             "move", "to category", "grade item", "manual grade item",
+            "not graded", "ungraded", "don't grade", "do not grade",
         )
         for kw in refinement_keywords:
             if kw in t:
@@ -407,6 +488,41 @@ class ConversationManager:
         }
 
     @staticmethod
+    def _parse_proposal_view_request(text: str) -> Optional[str]:
+        """Detect read-only proposal/mapping view commands."""
+        t = text.lower().strip()
+        if not t or ConversationManager._looks_like_listing_request(t):
+            return None
+
+        if re.search(r"\b(show|display|check|view|what(?:'s| is))\b.*\b(sync\s+status|mapping\s+sync)\b", t):
+            return "mapping_sync"
+        if re.search(r"\b(sync\s+status|mapping\s+sync)\b", t) and re.search(
+            r"\b(show|display|check|view|what(?:'s| is))\b", t
+        ):
+            return "mapping_sync"
+
+        if re.search(r"\b(show|display|list|print)\b.*\bmapping\s+rows?\b", t):
+            return "mapping_rows"
+        if re.search(r"\bmapping\s+rows?\b", t) and re.search(r"\bbefore\s+finalize\b", t):
+            return "mapping_rows"
+
+        if re.search(r"\b(show|display)\b.*\bproposal\b.*\bmarkdown\b", t) or re.search(
+            r"\bproposal\b.*\bas\s+markdown\b", t
+        ):
+            return "markdown_tree"
+
+        if re.search(r"\b(show|display)\b.*\b(full\s+)?(proposal|gradebook\s+structure)\b", t):
+            return "full_proposal"
+        if re.search(r"\bshow\s+proposal\b", t):
+            return "full_proposal"
+
+        return None
+
+    @staticmethod
+    def _looks_like_proposal_view_request(text: str) -> bool:
+        return ConversationManager._parse_proposal_view_request(text) is not None
+
+    @staticmethod
     def _extract_formula_from_prompt(text: str) -> Optional[Dict]:
         """
         Extract formula from user prompt if present.
@@ -420,89 +536,113 @@ class ConversationManager:
     def _unsupported_request_warning() -> str:
         return (
             "⚠ I couldn't understand that request. Try one of these:\n\n"
-            "- Set weights: 'Set Labs to 20%'\n"
-            "- Add category: 'Add Quizzes' or 'Added Quizzes'\n"
-            "- Add category with weight: 'Add Quizzes 10%'\n"
-            "- Aggregation: 'Use weighted mean' or 'Use mean'\n"
-            "- Split categories: 'In Labs, split into Lab Reports 10%, In-Lab 5%'\n"
-            "- Even split: 'Split Quizzes into Midterm Quiz and Final Quiz' — weights are divided evenly by default\n"
-            "- Subcategory share: 'Assign 0.4 to Midterm Quiz' — 0.4 = 40% of the parent category\n"
-            "- Formula: 'Set Assignments formula to =average([[hw1]],[[hw2]])'\n"
-            "- Rules/visibility: 'Hide Midterm until 2026-05-19' or 'Drop lowest 1 from Assignments'\n"
-            "- Grade items: 'Add grade item X to Final Exam'\n"
-            "- Listing: 'Show grade items', 'Show activities', 'Show activities and grade items', 'Show all activities', 'Show all grade items'\n"
-            "- Grade item edits: 'remove grade item X' or 'rename grade item X to Y'\n"
-            "- Finalize: 'Accept proposal and generate mapping'\n"
-            "- Mapping fix: 'Add a manual grade item for Final Exam in mapping'\n"
-            "- Undo/redo: 'undo' or 'redo'\n\n"
-            "Tip: type 'help' to see the full supported instruction list."
+            "- **Set weights:** Set Labs to 20%\n"
+            "- **Add category:** Add Quizzes (or Added Quizzes)\n"
+            "- **Add with weight:** Add Quizzes 10%\n"
+            "- **Aggregation:** Use weighted mean or Use mean\n"
+            "- **Split categories:** In Labs, split into Lab Reports 10%, In-Lab 5%\n"
+            "- **Even split:** Split Quizzes into Midterm Quiz and Final Quiz\n"
+            "- **Subcategories:** drop Projects, rename Projects to Project, or In Assignments, add subcategory Reflection 5%\n"
+            "- **Subcategory share:** Assign 0.4 to Midterm Quiz (0.4 = 40% of the parent category)\n"
+            "- **Formula:** Set Assignments formula to =average([[hw1]],[[hw2]])\n"
+            "- **Rules/visibility:** Hide Midterm until 2026-05-19 or Drop lowest 1 from Assignments\n"
+            "- **Grade items:** Add grade item X to Final Exam\n"
+            "- **Activities:** Move quiz 1 to Assignments or Set Homework 1 to not graded\n"
+            "- **Listing:** Show proposal, Show grade items, Show activities, Show activities and grade items\n"
+            "- **Grade item edits:** remove manual grade item X, rename grade item X to Y\n"
+            "- **Finalize:** Accept proposal and generate mapping\n"
+            "- **Mapping fix:** Add a manual grade item for Final Exam in mapping\n"
+            "- **Undo/redo:** undo or redo\n\n"
+            "Tip: type **help** to see the full supported instruction list."
         )
 
     @staticmethod
     def _supported_instructions_help_text() -> str:
         return (
             "Here are supported instructions you can use:\n\n"
-            "**Syllabus/Supporting docs**\n"
-            "- 'Use my uploaded syllabus and give me a proposal'\n"
-            "- 'Analyze the latest uploaded supporting document and regenerate proposal'\n"
-            "- 'I uploaded a new file, use it and rebuild the gradebook proposal'\n\n"
+            "**Proposal layout and sync views**\n"
+            "- Show proposal — full structure with totals, effects, notes, and aggregation\n"
+            "- Show proposal as markdown — hierarchy only (categories, subcategories, and items)\n"
+            "- Show activities and grade items — includes activity/manual labels and mapping-ready overview\n"
+            "- Show mapping sync status — checks category/item alignment with current mapping rows\n"
+            "- Show mapping rows before finalize — prints mapping rows to verify cmid/category/subcategory before apply\n\n"
+            "**Syllabus / supporting docs**\n"
+            "- Use my uploaded syllabus and give me a proposal\n"
+            "- Analyze the latest uploaded supporting document and regenerate proposal\n"
+            "- I uploaded a new file, use it and rebuild the gradebook proposal\n\n"
             "**Weights and categories**\n"
-            "- 'Set Assignments 35%, Labs 15%, Midterm 20%, Final 30%'\n"
-            "- 'Change Labs to 20% and rebalance automatically'\n"
-            "- 'Rename Labs to Laboratory'\n"
-            "- 'Add Quizzes' — creates the category at 0% so you can rebalance later\n"
-            "- 'Add Projects 15%' — creates the category with that weight immediately\n"
-            "- 'Added Quizzes' — shorthand phrasing also works\n\n"
-            "**Grade items and activities**\n"
-            "- 'Add grade item X to Final Exam' — creates a manual grade item inside a category\n"
-            "- 'Show grade items' — lists proposal items inside each category\n"
-            "- 'Show activities' — lists Moodle activities only\n"
-            "- 'Show activities and grade items' — lists Moodle activities alongside proposal items\n"
-            "- 'Show all activities' — lists the complete Moodle activity list without truncation\n"
-            "- 'Show all grade items' — lists all proposal grade items without truncation\n"
-            "- 'remove grade item X' or 'remove X from Final Exam' — removes a grade item\n"
-            "- 'rename grade item X to Y' — renames a grade item in place\n\n"
+            "- Set Assignments 35%, Labs 15%, Midterm 20%, Final 30%\n"
+            "- Change Labs to 20% and rebalance automatically\n"
+            "- Rename Labs to Laboratory\n"
+            "- Add Quizzes — creates the category at 0% so you can rebalance later\n"
+            "- Add Projects 15% — creates the category with that weight immediately\n"
+            "- Added Quizzes — shorthand phrasing also works\n\n"
+            "**Manual grade items**\n"
+            "- **Subcategory** = grouping bucket inside a parent category; **grade item** = concrete scored row inside a category or subcategory\n"
+            "- Add grade item X to Final Exam — creates a manual grade item inside a category\n"
+            "- Add grade item Reflection Journal 1 to Assignments\n"
+            "- In Assignments, add subcategory Reflection 5% — or omit weight to start at 0%\n"
+            "- Show grade items — lists proposal items inside each category\n"
+            "- Show all grade items — lists all proposal grade items without truncation\n"
+            "- remove manual grade item X or remove X from Final Exam — removes a manual grade item only\n"
+            "- rename grade item X to Y — renames a grade item in place\n\n"
+            "**Moodle activities**\n"
+            "- Show activities — lists Moodle activities only\n"
+            "- Show all activities — lists the complete Moodle activity list without truncation\n"
+            "- Move quiz 1 to Final Exam — reassigns a Moodle activity to a different category\n"
+            "- Move quiz 2 from Quizzes to Assignments — explicit source and target\n"
+            "- Move quiz 1 to Homework — assigns a mapped activity to a subcategory under its parent\n"
+            "- Move quiz 1 to Homework in Assignments — scoped subcategory assignment\n"
+            "- Clear subcategory for quiz 1 or move quiz 1 to parent category — removes subcategory placement\n"
+            "- Set weight of quiz 1 to 30% — overrides an activity's weight within its category\n"
+            "- quiz 1 weight 30% — shorthand weight update\n"
+            "- Set Homework 1 to not graded — marks the activity as not graded (removed from proposal categories; mapping syncs to not graded)\n"
+            "- Moodle activities cannot be removed; move them, reassign them, set them to Not graded, or change their weight instead\n"
+            "Note: category moves affect proposal items; subcategory moves update mapping rows when mapping exists.\n\n"
             "**Remove / drop a category**\n"
-            "- 'Remove Quizzes' — frees the weight (total decreases; you can reallocate later)\n"
-            "- 'Drop Labs evenly' — removes Labs and spreads its weight equally across remaining categories\n"
-            "- 'Delete Midterm and give weight to Final Exam' — removes Midterm and adds its weight to Final Exam\n"
-            "- 'Remove Assignments and split weight among Labs and Midterm' — removes Assignments and splits weight equally between the two targets\n\n"
+            "- Remove Quizzes — frees the weight (total decreases; you can reallocate later)\n"
+            "- Drop Labs evenly — removes Labs and spreads its weight equally across remaining categories\n"
+            "- Delete Midterm and give weight to Final Exam — removes Midterm and adds its weight to Final Exam\n"
+            "- Remove Assignments and split weight among Labs and Midterm — splits weight equally between the two targets\n\n"
             "**Aggregation method**\n"
-            "- 'Use weighted mean of grades'\n"
-            "- 'Switch to Natural'\n"
-            "- 'Show aggregation methods'\n\n"
+            "- Use weighted mean of grades\n"
+            "- Switch to Natural\n"
+            "- Show aggregation methods\n\n"
             "**Excel-style formulas**\n"
-            "- 'Set Assignments formula to =average([[hw1]],[[hw2]],[[project]])'\n"
-            "- 'Use formula =([[midterm]]*0.4)+([[final]]*0.6) for Final Exam'\n"
-            "- 'Clear formula from Labs'\n"
-            "Use Moodle item references like `[[item_id]]` (legacy `[item]` is also accepted).\n"
-            "Default separator is comma `,` (YorkU standard).\n\n"
+            "- Set Assignments formula to `=average([[hw1]],[[hw2]],[[project]])`\n"
+            "- Use formula `=([[midterm]]*0.4)+([[final]]*0.6)` for Final Exam\n"
+            "- Clear formula from Labs\n"
+            "**Item references:** use `[[item_id]]` (legacy `[item]` is also accepted).\n"
+            "**Separator:** use comma `,` between arguments (YorkU standard).\n\n"
             "If a formula is invalid, I'll return a direct warning and ask you to retry.\n"
             "Formula help: [YorkU custom formula guide](https://lthelp.yorku.ca/gradebook/creating-a-custom-formula)\n"
             "Excel help: [Excel formula reference](https://support.microsoft.com/excel)\n\n"
             "**Split subcategories**\n"
-            "- 'In Quizzes, split into Midterm Quiz and Final Quiz' — weights divided evenly (e.g. 12.5% each if parent is 25%)\n"
-            "- 'Split Quizzes into Midterm Quiz with weight 0.4 and Final Quiz with weight 0.6' — 0.4/0.6 are fractions of parent weight\n"
-            "- 'Assign 0.4 to Midterm Quiz' — updates a subcategory share (0.4 × parent weight = 10% when parent is 25%)\n"
-            "- 'Assign 0.6 to Final Quiz' — once all shares sum to 1.0, the split warning clears\n\n"
-            "**Grade items (activities)**\n"
-            "- 'Move quiz 1 to Final Exam' — reassigns a grade item to a different category\n"
-            "- 'Move quiz 2 from Quizzes to Assignments' — explicit source and target\n"
-            "- 'Set weight of quiz 1 to 30%' — overrides an item's weight within its category\n"
-            "- 'quiz 1 weight 30%' — shorthand weight update\n"
-            "- 'Remove quiz 1 from Assignments' — unassigns an item from its category\n"
-            "Note: item changes affect mapping suggestions at accept time.\n\n"
+            "- In Quizzes, split into Midterm Quiz and Final Quiz — weights divided evenly (e.g. 12.5% each if parent is 25%)\n"
+            "- Split Quizzes into Midterm Quiz with weight 0.4 and Final Quiz with weight 0.6 — fractions of parent weight\n"
+            "- Assign 0.4 to Midterm Quiz — updates a subcategory share (0.4 × parent weight = 10% when parent is 25%)\n"
+            "- Assign 0.6 to Final Quiz — once all shares sum to 1.0, the split warning clears\n\n"
+            "**Subcategory edits (add / remove / rename / weight)**\n"
+            "- drop Projects or remove Projects from Assignments — removes a subcategory and redistributes weight to siblings\n"
+            "- drop Projects evenly — same, but explicitly spreads weight across remaining subcategories\n"
+            "- rename Projects to Project or In Assignments, rename Projects to Project\n"
+            "- In Assignments, add subcategory Reflection 5% or add Reflection 5% to Assignments\n"
+            "- In Assignments, add subcategory Reflection — creates Reflection with 0% until you set a weight\n"
+            "- set Homework weight to 12% — updates one subcategory share inside its parent\n"
+            "- set weight of Lab Reports in Labs to 5% — scoped subcategory weight (parent name disambiguates)\n"
+            "- set Lab Reports subcategory weight to 5% — explicit subcategory keyword\n"
+            "- set weight of quiz 1 in Quizzes to 40% — scoped grade-item weight inside a category\n\n"
             "**Rules and visibility**\n"
-            "- 'Drop lowest 1 from Assignments'\n"
-            "- 'Keep highest 2 from Labs'\n"
-            "- 'Hide Midterm until 2026-05-19'\n"
-            "- 'For Assignments, exclude empty grades' or 'Include empty grades for Labs'\n\n"
+            "- Drop lowest 1 from Assignments\n"
+            "- Keep highest 2 from Labs\n"
+            "- Hide Midterm until 2026-05-19\n"
+            "- For Assignments, exclude empty grades or Include empty grades for Labs\n\n"
             "**Finalize flow**\n"
-            "- 'Accept proposal and generate mapping'\n"
-            "- 'Show mapping rows before finalize'\n"
-            "- 'Add a manual grade item for Midterm in mapping'\n"
+            "- Accept proposal and generate mapping\n"
+            "- Show mapping rows before finalize\n"
+            "- Add a manual grade item for Midterm in mapping\n"
             "- If a category has no activity row, map an existing activity, remove the category, or add a manual grade item in the mapping UI\n"
-            "- 'Finalize now'"
+            "- Finalize now"
         )
 
     def make_reply(self, session: GradebookSessionRecord, proposal: GradebookProposal | None, prompt: str = "") -> str:
@@ -533,6 +673,10 @@ class ConversationManager:
             if listing_options:
                 return self._format_activity_and_grade_item_summary(session, proposal, **listing_options)
 
+        view_request = self._parse_proposal_view_request(text) if text else None
+        if view_request:
+            return self._reply_for_proposal_view(session, proposal, view_request)
+
         # Handle questions: answer them without forcing phase transitions
         if text and self._looks_like_question(text):
             answer = self._answer_question(session, text, proposal)
@@ -555,6 +699,8 @@ class ConversationManager:
                 or self._extract_formula_from_prompt(text) is not None
                 or self._looks_like_affirmation(text)
                 or self._looks_like_proposal_request(text)
+                or self._looks_like_proposal_view_request(text)
+                or self._looks_like_listing_request(text)
                 or self._looks_like_help_request(text)
                 or self._looks_like_question(text)
                 or self._looks_like_upload_signal(text)
@@ -609,35 +755,7 @@ class ConversationManager:
                 if formula_error:
                     return formula_error
 
-            categories_text = self._format_categories(proposal)
-            total_weight = sum(cat.weight for cat in proposal.categories)
-            effects_text = self._format_effects(proposal)
-            notes_text = self._format_notes(session, proposal)
-            item_weight_warning_text = self._format_item_weight_warning(proposal)
-            findings_text = self._format_findings(session)
-
-            aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
-            
-            proposal_errors = validate_proposal_weights(proposal)
-            has_weight_error = any(err.get("path") == ["proposal"] for err in proposal_errors)
-            weight_warnings = check_weight_warnings(proposal)
-
-            if has_weight_error:
-                return (
-                    f"Here is the gradebook structure I built based on your materials:\n\n"
-                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n\n"
-                    "⚠ The total weight is not 100% yet. Please adjust the weights so they add up to 100% before we continue."
-                )
-            else:
-                aggregation_msg = f"\n\n**Grade Aggregation Method**: {aggregation_name}\n(I'll use '{aggregation_name}' when creating your gradebook. If you prefer a different method, let me know.)"
-                weight_msg = f"\n{weight_warnings[0]}" if weight_warnings else ""
-                return (
-                    f"Here is the gradebook structure based on what I found:\n\n"
-                    f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}{item_weight_warning_text}"
-                    f"{weight_msg}"
-                    f"{aggregation_msg}\n\n"
-                    "Does this look right? If you'd like to adjust any weights, categories, or the grade aggregation method, let me know and I'll refine it."
-                )
+            return self._build_full_proposal_reply(session, proposal, context="initial_proposal")
 
         if session.phase == "REFINEMENT":
             if proposal:
@@ -648,33 +766,11 @@ class ConversationManager:
                     formula_error = self._formula_error_reply(proposal)
                     if formula_error:
                         return formula_error
-                categories_text = self._format_categories(proposal)
-                total_weight = sum(cat.weight for cat in proposal.categories)
-                effects_text = self._format_effects(proposal)
-                notes_text = self._format_notes(session, proposal)
-                item_weight_warning_text = self._format_item_weight_warning(proposal)
-                aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
-                proposal_errors = validate_proposal_weights(proposal)
-                has_weight_error = any(err.get("path") == ["proposal"] for err in proposal_errors)
-                weight_warnings = check_weight_warnings(proposal)
-                if has_weight_error:
-                    return (
-                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}\n\n"
-                        f"**Grade Aggregation Method**: {aggregation_name}\n\n"
-                        "⚠ Total weight is still not 100%. Please adjust to proceed."
-                    )
-                else:
-                    weight_msg = f"\n{weight_warnings[0]}" if weight_warnings else ""
-                    return (
-                        f"Updated proposal:\n\n{categories_text}\n**Total: {total_weight:.1f}%**{effects_text}{notes_text}{item_weight_warning_text}\n"
-                        f"{weight_msg}\n"
-                        f"**Grade Aggregation Method**: {aggregation_name}\n\n"
-                        "What else would you like to adjust? I can modify weights, add/remove categories, or rename items."
-                    )
+                return self._build_full_proposal_reply(session, proposal, context="refinement")
             else:
                 return (
                     "I'm ready to refine your gradebook. "
-                    "What would you like to change? You can adjust weights, add/remove categories, or reorganize items."
+                    "What would you like to change? You can adjust weights, add/remove categories or subcategories, or reorganize items."
                 )
 
         if session.phase == "ACCEPTED":
@@ -796,10 +892,10 @@ class ConversationManager:
             if "example" in q:
                 return (
                     "**Formula Examples:**\n"
-                    "- `=([hw1]+[hw2]+[hw3])/3` — Average of three homeworks\n"
-                    "- `=([midterm]*0.4)+([final]*0.6)` — Weighted average: 40% midterm, 60% final\n"
-                    "- `=[quiz1]+[quiz2]*0.5` — Quiz 1 full, Quiz 2 half weight\n"
-                    "- `=([lab]*0.5)+([project]*0.5)` — Split between lab and project\n\n"
+                    "- =average([[hw1]],[[hw2]],[[hw3]]) — Average of three homeworks\n"
+                    "- =([[midterm]]*0.4)+([[final]]*0.6) — Weighted average: 40% midterm, 60% final\n"
+                    "- =[[quiz1]]+[[quiz2]]*0.5 — Quiz 1 full, Quiz 2 half weight\n"
+                    "- =([[lab]]*0.5)+([[project]]*0.5) — Split between lab and project\n\n"
                     "Tell me the formula you'd like and which category it should apply to."
                 )
 
@@ -888,24 +984,184 @@ class ConversationManager:
         # Default: no specific answer
         return ""
 
-    def _format_categories(self, proposal: GradebookProposal) -> str:
-        """Format categories for display in conversation, including all per-category settings."""
-        lines = []
-        for category in proposal.categories:
-            weight = category.weight
-            item_count = len(category.items) if category.items else 0
-            extra_label = " ★ extra credit" if getattr(category, 'extra_credit', False) else ""
-            hidden_label = " 🔒 hidden" if getattr(category, 'hidden', False) else ""
-            locked_label = " 🔐 locked" if getattr(category, 'locked', False) else ""
-            lines.append(f"- **{category.name}** ({weight:.1f}%){extra_label}{hidden_label}{locked_label}: {item_count} items")
+    def _format_categories(self, proposal: GradebookProposal, session: Optional[GradebookSessionRecord] = None) -> str:
+        """Format categories as markdown bullets: parent -> subcategory -> item."""
+        course_activities = list((session.course_activities if session else None) or [])
+        content_mapping = session.content_mapping if session else None
+        mapping_rows: List[dict] = (
+            list(content_mapping.get("graded_activities") or [])
+            if isinstance(content_mapping, dict)
+            else []
+        )
 
-            # Aggregation rules
-            settings = []
-            drop_lowest = getattr(category, 'drop_lowest', 0)
-            keep_highest = getattr(category, 'keep_highest', 0)
-            aggregate_only_graded = getattr(category, 'aggregate_only_graded', True)
-            aggregate_outcomes = getattr(category, 'aggregate_outcomes', False)
-            effective_children = len(getattr(category, 'subcategories', None) or []) or len(category.items or [])
+        def _row_category(row: dict) -> str:
+            return str(
+                row.get("confirmed_category")
+                or row.get("category")
+                or row.get("suggested_category")
+                or ""
+            ).strip()
+
+        def _row_subcategory(row: dict) -> str:
+            return str(
+                row.get("confirmed_subcategory")
+                or row.get("suggested_subcategory")
+                or row.get("subcategory")
+                or ""
+            ).strip()
+
+        proposal_tracked_names = _proposal_tracked_item_names(proposal)
+
+        # Build mapping row index: parent_key -> sub_key -> [rows]
+        rows_by_parent_sub: Dict[str, Dict[str, List[dict]]] = {}
+        for row in mapping_rows:
+            p = _row_category(row)
+            if not p or p in {"__not_graded__", "__uncategorized__"}:
+                continue
+            s = _row_subcategory(row)
+            rows_by_parent_sub.setdefault(p.lower(), {}).setdefault(s.lower(), []).append(row)
+
+        mapped_parent_keys = set(rows_by_parent_sub.keys())
+
+        def _has_nondefault_settings(category: GradebookCategory) -> bool:
+            return bool(
+                getattr(category, "extra_credit", False)
+                or getattr(category, "hidden", False)
+                or getattr(category, "locked", False)
+                or getattr(category, "drop_lowest", 0) > 0
+                or getattr(category, "keep_highest", 0) > 0
+                or not getattr(category, "aggregate_only_graded", True)
+                or bool(getattr(category, "aggregate_outcomes", False))
+                or (getattr(category, "grade_min", None) is not None)
+                or float(getattr(category, "grade_max", 100.0) or 100.0) != 100.0
+                or (getattr(category, "grade_pass", None) is not None)
+                or int(getattr(category, "display_type", 0) or 0) != 0
+                or int(getattr(category, "decimals", -1) or -1) >= 0
+                or bool(getattr(category, "calculation_formula", None))
+            )
+
+        def _is_renderable_category(category: GradebookCategory) -> bool:
+            has_items = bool(category.items)
+            has_subcategories = bool(category.subcategories)
+            has_weight = abs(float(getattr(category, "weight", 0.0) or 0.0)) > 0.0001
+            has_mapping = str(getattr(category, "name", "")).strip().lower() in mapped_parent_keys
+            return has_items or has_subcategories or has_weight or has_mapping or _has_nondefault_settings(category)
+
+        def _item_mapping(item_name: str) -> tuple[str, str]:
+            """Return (category, subcategory) mapped for an activity/item name, if available."""
+            name_key = str(item_name or "").strip().lower()
+            if not name_key:
+                return "", ""
+            for row in mapping_rows:
+                row_name = str(row.get("activity_name") or "").strip().lower()
+                if row_name != name_key:
+                    continue
+                row_cat = _row_category(row)
+                row_sub = _row_subcategory(row)
+                return row_cat, row_sub
+            return "", ""
+
+        lines: List[str] = []
+        categories = [category for category in (proposal.categories or []) if _is_renderable_category(category)]
+        not_graded_items = [
+            str(name).strip()
+            for name in (getattr(proposal, "not_graded_items", None) or [])
+            if str(name).strip()
+        ]
+        not_graded_keys = {name.lower() for name in not_graded_items}
+        uncategorized_rows: List[dict] = []
+        for row in mapping_rows:
+            mapped = _row_category(row).lower()
+            if mapped in {"__not_graded__", "not graded"} or bool(row.get("not_graded")):
+                activity_name = str(row.get("activity_name") or "").strip()
+                if activity_name:
+                    not_graded_keys.add(activity_name.lower())
+                continue
+            activity_name = str(row.get("activity_name") or row.get("grade_item_name") or "").strip()
+            if activity_name and activity_name.lower() in proposal_tracked_names:
+                continue
+            if mapped in {"__uncategorized__", ""}:
+                uncategorized_rows.append(row)
+
+        n_cats = len(categories)
+        has_unassigned = bool(uncategorized_rows)
+        has_not_graded_footer = bool(not_graded_items)
+
+        for cat_idx, category in enumerate(categories):
+            is_last_cat = cat_idx == n_cats - 1 and not has_unassigned and not has_not_graded_footer
+            cat_branch = "  └── " if is_last_cat else "  ├── "
+            cat_cont   = "      " if is_last_cat else "  │   "
+
+            parent_key = str(category.name).strip().lower()
+            proposal_sub_item_keys = {
+                str(item).strip().lower()
+                for sub in (category.subcategories or [])
+                for item in (sub.items or [])
+                if str(item).strip()
+            }
+
+            def _subcategory_item_names(sub) -> List[str]:
+                names: List[str] = []
+                seen: set[str] = set()
+                for item in (sub.items or []):
+                    name = str(item).strip()
+                    if name and name.lower() not in not_graded_keys and name.lower() not in seen:
+                        seen.add(name.lower())
+                        names.append(name)
+                sub_key = str(sub.name).strip().lower()
+                for row in rows_by_parent_sub.get(parent_key, {}).get(sub_key, []):
+                    name = str(row.get("activity_name") or row.get("grade_item_name") or "").strip()
+                    if name and name.lower() not in not_graded_keys and name.lower() not in seen:
+                        seen.add(name.lower())
+                        names.append(name)
+                return names
+
+            def _direct_category_item_names() -> List[str]:
+                placed_in_subs = {
+                    name.lower()
+                    for sub in (category.subcategories or [])
+                    for name in _subcategory_item_names(sub)
+                }
+                names: List[str] = []
+                seen: set[str] = set()
+                for item in (category.items or []):
+                    name = str(item).strip()
+                    if not name or name.lower() in not_graded_keys:
+                        continue
+                    if name.lower() in proposal_sub_item_keys:
+                        continue
+                    if name.lower() in placed_in_subs:
+                        continue
+                    row_cat, row_sub = _item_mapping(name)
+                    if row_sub and row_cat.lower() == parent_key:
+                        continue
+                    if name.lower() not in seen:
+                        seen.add(name.lower())
+                        names.append(name)
+                return names
+
+            weight = category.weight
+            sub_item_count = sum(
+                len(_subcategory_item_names(sub))
+                for sub in (category.subcategories or [])
+            )
+            item_count = len(_direct_category_item_names()) + sub_item_count
+
+            badges = ""
+            if getattr(category, "extra_credit", False):
+                badges += " ★ extra credit"
+            if getattr(category, "hidden", False):
+                badges += " 🔒 hidden"
+            if getattr(category, "locked", False):
+                badges += " 🔐 locked"
+
+            settings: List[str] = []
+            drop_lowest = getattr(category, "drop_lowest", 0)
+            keep_highest = getattr(category, "keep_highest", 0)
+            aggregate_only_graded = getattr(category, "aggregate_only_graded", True)
+            aggregate_outcomes = getattr(category, "aggregate_outcomes", False)
+            effective_children = len(getattr(category, "subcategories", None) or []) or len(category.items or [])
+
             if drop_lowest > 0:
                 if effective_children > 0 and drop_lowest >= effective_children:
                     settings.append(f"drop lowest {drop_lowest} (no effect with {effective_children} children)")
@@ -921,14 +1177,14 @@ class ConversationManager:
             if aggregate_outcomes:
                 settings.append("include outcomes")
 
-            # Grade total settings
-            grade_min = getattr(category, 'grade_min', None)
-            grade_max = getattr(category, 'grade_max', 100.0)
-            grade_pass = getattr(category, 'grade_pass', None)
-            hidden_until = getattr(category, 'hidden_until', None)
-            lock_time = getattr(category, 'lock_time', None)
-            display_type = getattr(category, 'display_type', 0)
-            decimals = getattr(category, 'decimals', -1)
+            grade_min = getattr(category, "grade_min", None)
+            grade_max = getattr(category, "grade_max", 100.0)
+            grade_pass = getattr(category, "grade_pass", None)
+            hidden_until = getattr(category, "hidden_until", None)
+            lock_time = getattr(category, "lock_time", None)
+            display_type = getattr(category, "display_type", 0)
+            decimals = getattr(category, "decimals", -1)
+
             if grade_min is not None:
                 settings.append(f"min {grade_min:.0f} pts")
             if grade_max != 100.0:
@@ -936,39 +1192,329 @@ class ConversationManager:
             if grade_pass is not None:
                 settings.append(f"pass ≥ {grade_pass:.0f}")
             if hidden_until:
-                hidden_label = datetime.fromtimestamp(int(hidden_until), tz=timezone.utc).strftime("%Y-%m-%d")
-                settings.append(f"hidden until {hidden_label}")
+                hu_label = datetime.fromtimestamp(int(hidden_until), tz=timezone.utc).strftime("%Y-%m-%d")
+                settings.append(f"hidden until {hu_label}")
             if lock_time:
-                lock_label = datetime.fromtimestamp(int(lock_time), tz=timezone.utc).strftime("%Y-%m-%d")
-                settings.append(f"lock at {lock_label}")
+                lt_label = datetime.fromtimestamp(int(lock_time), tz=timezone.utc).strftime("%Y-%m-%d")
+                settings.append(f"lock at {lt_label}")
             if display_type != 0:
                 settings.append(f"display: {GRADE_DISPLAY_TYPE_NAMES.get(display_type, str(display_type))}")
             if decimals >= 0:
                 settings.append(f"{decimals} decimal{'s' if decimals != 1 else ''}")
 
-            formula = getattr(category, 'calculation_formula', None)
-            if formula:
-                settings.append(f"formula: {formula}")
+            formula = getattr(category, "calculation_formula", None)
+            formula_badge = " 📐" if formula else ""
+            settings_inline = f" [{'; '.join(settings)}]" if settings else ""
 
-            if settings:
-                lines.append(f"  ↳ {', '.join(settings)}")
+            lines.append(
+                f"{cat_branch}**{category.name}** ({weight:.1f}%){badges}{formula_badge}{settings_inline}: "
+                f"{item_count} item{'s' if item_count != 1 else ''}"
+            )
 
-            # Show nested subcategories for baseline-imported gradebooks.
-            if category.subcategories:
-                for subcategory in category.subcategories:
-                    lines.append(f"  ◦ {subcategory.name} ({float(subcategory.weight):.1f}%)")
-
-            # Show first few items; highlight per-item weight overrides when set
             item_weights = getattr(category, "item_weights", None) or {}
-            if category.items and len(category.items) <= 3:
-                for item in category.items[:3]:
-                    w_label = f" ({item_weights[item]:.1f}%)" if item in item_weights else ""
-                    lines.append(f"  • {item}{w_label}")
-            elif category.items and len(category.items) > 3:
-                for item in category.items[:2]:
-                    w_label = f" ({item_weights[item]:.1f}%)" if item in item_weights else ""
-                    lines.append(f"  • {item}{w_label}")
-                lines.append(f"  • ... and {len(category.items) - 2} more")
+
+            # Build children: subcategories first, then direct items.
+            direct_items = _direct_category_item_names()
+            children: list = [
+                ("sub", sub) for sub in (category.subcategories or [])
+            ] + [
+                ("item", item) for item in direct_items
+            ]
+            n_children = len(children)
+            for ci, (kind, child) in enumerate(children):
+                is_last_ch = ci == n_children - 1
+                ch_branch = cat_cont + ("└── " if is_last_ch else "├── ")
+                ch_cont   = cat_cont + ("    " if is_last_ch else "│   ")
+
+                if kind == "sub":
+                    sub_weight = float(getattr(child, "weight", 0.0) or 0.0)
+                    lines.append(f"{ch_branch}**{child.name}** ({sub_weight:.1f}%)")
+                    sub_weights = getattr(child, "item_weights", None) or {}
+                    sub_items = _subcategory_item_names(child)
+                    n_sub = len(sub_items)
+                    for si, item_name in enumerate(sub_items):
+                        is_last_sub = si == n_sub - 1
+                        si_branch = ch_cont + ("└── " if is_last_sub else "├── ")
+                        w_label = f" ({sub_weights[item_name]:.1f}%)" if item_name in sub_weights else ""
+                        item_kind = (
+                            "activity"
+                            if self._is_moodle_activity_item(item_name, course_activities, mapping_rows)
+                            else "grade item"
+                        )
+                        item_context = f"[{item_kind}] [{category.name} > {child.name}]"
+                        lines.append(f"{si_branch}{item_context} {item_name}{w_label}")
+                else:
+                    item_name = str(child).strip()
+                    w_label = f" ({item_weights[item_name]:.1f}%)" if item_name in item_weights else ""
+                    item_kind = (
+                        "activity"
+                        if self._is_moodle_activity_item(item_name, course_activities, mapping_rows)
+                        else "grade item"
+                    )
+                    item_context = f"[{item_kind}] [{category.name}]"
+                    lines.append(f"{ch_branch}{item_context} {item_name}{w_label}")
+
+        if uncategorized_rows:
+            lines.append("  └── **Unassigned**")
+            n_un = len(uncategorized_rows)
+            for ri, row in enumerate(uncategorized_rows):
+                activity_name = str(row.get("activity_name") or "Unnamed activity")
+                branch = "      └── " if ri == n_un - 1 and not has_not_graded_footer else "      ├── "
+                lines.append(f"{branch}{activity_name}")
+
+        if not_graded_items:
+            lines.append("  └── **Not graded activities**")
+            n_ng = len(not_graded_items)
+            for ni, item_name in enumerate(not_graded_items):
+                branch = "      └── " if ni == n_ng - 1 else "      ├── "
+                lines.append(f"{branch}{item_name}")
+
+        if not lines:
+            return ""
+        return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_mapping_label(value: str) -> str:
+        return str(value or "").strip().lower()
+
+    def _format_mapping_sync_status(self, session: GradebookSessionRecord, proposal: GradebookProposal) -> str:
+        mapping = session.content_mapping if isinstance(session.content_mapping, dict) else {}
+        rows = list(mapping.get("graded_activities") or [])
+        if not rows:
+            return (
+                "\n\n**Mapping Sync:**"
+                "\n- Mapping not generated yet. Say 'Accept proposal and generate mapping' to build rows."
+            )
+
+        proposal_categories = {
+            self._normalize_mapping_label(category.name): category.name
+            for category in (proposal.categories or [])
+            if str(category.name or "").strip()
+        }
+
+        assigned_rows = 0
+        not_graded_rows = 0
+        missing_category_rows = 0
+        missing_cmid_rows = 0
+        stale_subcategory_rows = 0
+        category_counts: Dict[str, int] = {}
+        subcategory_counts: Dict[str, int] = {}
+        for row in rows:
+            mapped_name = str(row.get("confirmed_category") or row.get("suggested_category") or "").strip()
+            mapped_key = self._normalize_mapping_label(mapped_name)
+            if row.get("moodle_cmid") in (None, "", 0):
+                missing_cmid_rows += 1
+            if not mapped_key or mapped_key in {"__not_graded__", "__uncategorized__"}:
+                if mapped_key in {"__not_graded__", "not graded"} or bool(row.get("not_graded")):
+                    not_graded_rows += 1
+                continue
+            assigned_rows += 1
+            if mapped_key not in proposal_categories:
+                missing_category_rows += 1
+                continue
+            category_counts[proposal_categories[mapped_key]] = category_counts.get(proposal_categories[mapped_key], 0) + 1
+            sub_name = str(
+                row.get("confirmed_subcategory")
+                or row.get("suggested_subcategory")
+                or row.get("subcategory")
+                or ""
+            ).strip()
+            if sub_name:
+                sub_key = f"{proposal_categories[mapped_key]}/{sub_name}"
+                subcategory_counts[sub_key] = subcategory_counts.get(sub_key, 0) + 1
+
+        validation_errors = list(mapping.get("validation_errors") or [])
+        for issue in validation_errors:
+            if issue.get("missing_subcategory"):
+                stale_subcategory_rows += 1
+
+        lines = ["", "", "**Mapping Sync:**"]
+        lines.append(f"- Mapped rows: {assigned_rows}/{len(rows)}")
+        if not_graded_rows > 0:
+            lines.append(f"- Not graded rows: {not_graded_rows}")
+        lines.append(f"- Rows without Moodle CMID (manual-only rows): {missing_cmid_rows}")
+        if category_counts:
+            cat_parts = [f"{name}: {count}" for name, count in sorted(category_counts.items())]
+            lines.append(f"- Rows by category: {', '.join(cat_parts)}")
+        if subcategory_counts:
+            sub_parts = [f"{name}: {count}" for name, count in sorted(subcategory_counts.items())]
+            lines.append(f"- Rows by subcategory: {', '.join(sub_parts)}")
+        if missing_category_rows > 0:
+            lines.append(f"- Warning: {missing_category_rows} row(s) reference categories not present in current proposal.")
+        if stale_subcategory_rows > 0:
+            lines.append(
+                f"- Warning: {stale_subcategory_rows} row(s) reference subcategories not present under their parent category."
+            )
+
+        return "\n".join(lines)
+
+    def _reply_for_proposal_view(
+        self,
+        session: GradebookSessionRecord,
+        proposal: GradebookProposal | None,
+        view: str,
+    ) -> str:
+        if view == "mapping_sync":
+            sync_proposal = proposal or GradebookProposal(categories=[])
+            return (
+                "Here is the current mapping sync status:"
+                f"{self._format_mapping_sync_status(session, sync_proposal)}"
+            )
+
+        if view == "mapping_rows":
+            return self._format_mapping_rows(session, proposal)
+
+        if proposal is None:
+            return (
+                "No proposal is available yet. "
+                "Upload a syllabus or ask for a proposal first."
+            )
+
+        if view == "markdown_tree":
+            categories_text = self._format_categories(proposal, session)
+            if not categories_text:
+                return "No category hierarchy to display yet."
+            total_weight = sum(cat.weight for cat in proposal.categories)
+            return (
+                f"**Proposal hierarchy:**\n\n"
+                f"{categories_text}\n\n"
+                f"**Total: {total_weight:.1f}%**"
+            )
+
+        if view == "full_proposal":
+            if session.phase in {"ACCEPTED", "COMPLETED"}:
+                context = "review"
+            elif session.phase == "PROPOSAL":
+                context = "initial_proposal"
+            else:
+                context = "refinement"
+            return self._build_full_proposal_reply(session, proposal, context=context)
+
+        return "I could not render that view."
+
+    def _build_full_proposal_reply(
+        self,
+        session: GradebookSessionRecord,
+        proposal: GradebookProposal,
+        *,
+        context: str = "refinement",
+    ) -> str:
+        categories_text = self._format_categories(proposal, session)
+        total_weight = sum(cat.weight for cat in proposal.categories)
+        effects_text = self._format_effects(proposal)
+        notes_text = self._format_notes(session, proposal)
+        item_weight_warning_text = self._format_item_weight_warning(proposal)
+        mapping_sync_text = self._format_mapping_sync_status(session, proposal)
+        findings_text = self._format_findings(session) if context == "initial_proposal" else ""
+        aggregation_name = self._get_aggregation_method_name(proposal.aggregation_method)
+
+        proposal_errors = validate_proposal_weights(proposal)
+        has_weight_error = any(err.get("path") == ["proposal"] for err in proposal_errors)
+        weight_warnings = check_weight_warnings(proposal)
+
+        if context == "initial_proposal":
+            intro = (
+                "Here is the gradebook structure I built based on your materials:"
+                if has_weight_error
+                else "Here is the gradebook structure based on what I found:"
+            )
+        elif context == "review":
+            intro = "Current proposal:"
+        else:
+            intro = "Updated proposal:"
+
+        body = (
+            f"{intro}\n\n"
+            f"{findings_text}{categories_text}\n**Total: {total_weight:.1f}%**"
+            f"{mapping_sync_text}{effects_text}{notes_text}{item_weight_warning_text}"
+        )
+
+        if has_weight_error:
+            if context == "initial_proposal":
+                return (
+                    f"{body}\n\n"
+                    "⚠ The total weight is not 100% yet. Please adjust the weights so they add up to 100% before we continue."
+                )
+            return (
+                f"{body}\n\n"
+                f"**Grade Aggregation Method**: {aggregation_name}\n\n"
+                "⚠ Total weight is still not 100%. Please adjust to proceed."
+            )
+
+        weight_msg = f"\n{weight_warnings[0]}" if weight_warnings else ""
+        aggregation_block = f"\n\n**Grade Aggregation Method**: {aggregation_name}"
+        if context == "initial_proposal":
+            aggregation_block += (
+                f"\n(I'll use '{aggregation_name}' when creating your gradebook. "
+                "If you prefer a different method, let me know.)"
+            )
+
+        footer = ""
+        if context == "initial_proposal":
+            footer = (
+                "\n\nDoes this look right? If you'd like to adjust any weights, categories, "
+                "or the grade aggregation method, let me know and I'll refine it."
+            )
+        elif context == "refinement":
+            footer = (
+                "\n\nWhat else would you like to adjust? I can modify weights, add/remove "
+                "categories or subcategories, or rename items."
+            )
+
+        return f"{body}{weight_msg}{aggregation_block}{footer}"
+
+    def _format_mapping_rows(
+        self,
+        session: GradebookSessionRecord,
+        proposal: GradebookProposal | None,
+    ) -> str:
+        mapping = session.content_mapping if isinstance(session.content_mapping, dict) else {}
+        rows = list(mapping.get("graded_activities") or [])
+        if not rows:
+            return (
+                "**Mapping rows:** none yet.\n"
+                "Say **Accept proposal and generate mapping** to build rows before finalize."
+            )
+
+        lines = [
+            "**Mapping rows** (verify cmid / category / subcategory before finalize):",
+            "",
+        ]
+        for index, row in enumerate(rows, start=1):
+            activity_name = str(row.get("activity_name") or "Unnamed activity").strip()
+            cmid = row.get("moodle_cmid")
+            cmid_label = str(cmid) if cmid not in (None, "", 0) else "manual"
+            category = str(row.get("confirmed_category") or row.get("suggested_category") or "—").strip()
+            subcategory = str(
+                row.get("confirmed_subcategory")
+                or row.get("suggested_subcategory")
+                or row.get("subcategory")
+                or ""
+            ).strip() or "—"
+            extras: List[str] = []
+            grade_item_id = row.get("grade_item_id")
+            if grade_item_id not in (None, "", 0):
+                extras.append(f"grade_item_id={grade_item_id}")
+            itemtype = str(row.get("itemtype") or "").strip()
+            if itemtype:
+                extras.append(itemtype)
+            extra_suffix = f" | {' | '.join(extras)}" if extras else ""
+            lines.append(
+                f"{index}. **{activity_name}** — cmid {cmid_label} | {category} > {subcategory}{extra_suffix}"
+            )
+
+        validation_errors = list(mapping.get("validation_errors") or [])
+        if validation_errors:
+            lines.append("")
+            lines.append(f"**Validation issues:** {len(validation_errors)}")
+            for issue in validation_errors[:8]:
+                activity_name = str(issue.get("activity_name") or "Row").strip()
+                if issue.get("missing_subcategory"):
+                    parent = str(issue.get("parent_category") or "category").strip()
+                    missing = str(issue.get("missing_subcategory") or "subcategory").strip()
+                    lines.append(f"- {activity_name}: missing subcategory '{missing}' under {parent}")
+                else:
+                    lines.append(f"- {activity_name}: {issue}")
 
         return "\n".join(lines)
 
@@ -1007,15 +1553,14 @@ class ConversationManager:
     def _formula_help_text() -> str:
         return (
             "**Excel-Style Formulas** allow you to define custom grade calculations using item references.\n"
-            "Use Moodle-style double square brackets around item IDs: `[[item_id]]`.\n"
-            "(Legacy single-bracket input like `[item]` is accepted and normalized.)\n\n"
+            "**Item references:** wrap IDs in double square brackets, e.g. `[[hw1]]`. Legacy `[item]` input is also accepted.\n\n"
             "**Examples:**\n"
             "- Simple average: `=average([[hw1]],[[hw2]],[[hw3]])`\n"
             "- Weighted calculation: `=([[midterm]]*0.3)+([[final]]*0.7)`\n"
             "- Nested functions: `=round(average([[q1]],[[q2]]),2)`\n"
             "- Conditional: `=if([[bonus]]>0, [[score]]+[[bonus]], [[score]])`\n\n"
             "**Supported operators:** `+` (addition), `-` (subtraction), `*` (multiplication), `/` (division)\n"
-            "Use parentheses `()` for grouping operations. Use comma `,` between function arguments.\n\n"
+            "Use parentheses `()` for grouping. Use comma `,` between function arguments.\n\n"
             "Tell me the formula you'd like to use and which category it applies to."
         )
 
@@ -1274,7 +1819,11 @@ class ConversationManager:
         show_all: bool = False,
     ) -> str:
         activities = list(session.course_activities or [])
-        activity_names = {str(activity.name).strip().lower() for activity in activities if getattr(activity, "name", None)}
+        content_mapping = session.content_mapping if isinstance(session.content_mapping, dict) else {}
+        mapping_rows: List[dict] = list(content_mapping.get("graded_activities") or [])
+        moodle_activities = [
+            activity for activity in activities if self._course_activity_is_moodle_activity(activity)
+        ]
 
         lines = ["Here is the current activity and grade-item summary:"]
         hidden_activity_count = 0
@@ -1283,14 +1832,14 @@ class ConversationManager:
         if include_activities:
             lines.append("")
             lines.append("**Moodle activities:**")
-            if activities:
-                activity_limit = len(activities) if show_all else 8
-                for activity in activities[:activity_limit]:
+            if moodle_activities:
+                activity_limit = len(moodle_activities) if show_all else 8
+                for activity in moodle_activities[:activity_limit]:
                     module = f" ({activity.module})" if getattr(activity, "module", None) else ""
                     lines.append(f"- {activity.name}{module}")
 
-                if len(activities) > activity_limit:
-                    hidden_activity_count = len(activities) - activity_limit
+                if len(moodle_activities) > activity_limit:
+                    hidden_activity_count = len(moodle_activities) - activity_limit
                     lines.append(f"- ... and {hidden_activity_count} more activity(ies)")
             else:
                 lines.append("- No Moodle activities were found for this session.")
@@ -1300,26 +1849,49 @@ class ConversationManager:
             lines.append("**Proposal grade items:**")
             if proposal and proposal.categories:
                 for category in proposal.categories:
-                    items = list(category.items or [])
-                    if not items:
+                    # Collect items from both parent category and subcategories
+                    parent_items = list(category.items or [])
+                    all_items = list(parent_items)
+                    
+                    # Add items from subcategories
+                    for sub in (category.subcategories or []):
+                        sub_items = list(sub.items or [])
+                        for sub_item in sub_items:
+                            # Prefix subcategory items with subcategory name
+                            all_items.append(f"{sub_item} ({sub.name})")
+                    
+                    if not all_items:
                         lines.append(f"- {category.name}: no grade items yet")
                         continue
 
-                    item_limit = len(items) if show_all else 5
+                    item_limit = len(all_items) if show_all else 5
                     rendered_items = []
-                    for item in items[:item_limit]:
-                        label = "activity" if str(item).strip().lower() in activity_names else "manual"
+                    for item in all_items[:item_limit]:
+                        # Extract base item name for activity lookup (before subcategory marker)
+                        base_item = str(item).split(" (")[0].strip() if " (" in str(item) else str(item)
+                        label = (
+                            "activity"
+                            if self._is_moodle_activity_item(base_item, activities, mapping_rows)
+                            else "manual"
+                        )
                         rendered_items.append(f"{item} [{label}]")
 
-                    if len(items) > item_limit:
-                        hidden_grade_item_count += len(items) - item_limit
-                        extra = f" ... and {len(items) - item_limit} more"
+                    if len(all_items) > item_limit:
+                        hidden_grade_item_count += len(all_items) - item_limit
+                        extra = f" ... and {len(all_items) - item_limit} more"
                     else:
                         extra = ""
 
                     lines.append(f"- {category.name}: {', '.join(rendered_items)}{extra}")
             else:
                 lines.append("- No proposal is available yet.")
+
+        not_graded_items = list(getattr(proposal, "not_graded_items", None) or []) if proposal else []
+        if not_graded_items:
+            lines.append("")
+            lines.append("**Not graded activities:**")
+            for item_name in not_graded_items:
+                lines.append(f"- {item_name} [not graded]")
 
         if not show_all and (hidden_activity_count > 0 or hidden_grade_item_count > 0):
             lines.append("")

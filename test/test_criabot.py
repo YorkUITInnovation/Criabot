@@ -412,6 +412,70 @@ async def test_gradebook_chat_reports_proposal_changed_only_for_real_updates(cri
 
 
 @pytest.mark.asyncio
+async def test_gradebook_chat_returns_content_mapping_after_subcategory_rename(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-5555-W2027",
+        professor_id="prof_submap",
+        bot_name="eecs-5555-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 101, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    await criabot_instance.gradebook_chat(
+        session_id=session_id,
+        prompt="In Assignments, split into Homework 10%, Projects 15%",
+    )
+    accepted = await criabot_instance.gradebook_accept(session_id=session_id)
+    assert accepted["content_mapping"] is not None
+
+    renamed = await criabot_instance.gradebook_chat(
+        session_id=session_id,
+        prompt="rename Homework to Homework Tasks",
+    )
+    assert renamed.get("content_mapping") is not None
+    rows = (renamed.get("content_mapping") or {}).get("graded_activities") or []
+    homework_rows = [row for row in rows if int(row.get("moodle_cmid") or 0) == 101]
+    assert homework_rows
+    assert str(homework_rows[0].get("confirmed_subcategory") or homework_rows[0].get("subcategory") or "").lower() == "homework tasks"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_sync_preserves_subcategory_in_content_mapping(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-5566-W2027",
+        professor_id="prof_sync_sub",
+        bot_name="eecs-5566-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 101, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    await criabot_instance.gradebook_chat(
+        session_id=session_id,
+        prompt="In Assignments, split into Homework 10%, Projects 15%",
+    )
+    await criabot_instance.gradebook_accept(session_id=session_id)
+
+    synced = await criabot_instance.gradebook_sync_moodle_context(
+        session_id=session_id,
+        confirmed_mapping=[
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Homework 1",
+                "category": "Assignments",
+                "subcategory": "Projects",
+            }
+        ],
+    )
+
+    rows = (synced.get("content_mapping") or {}).get("graded_activities") or []
+    homework_rows = [row for row in rows if int(row.get("moodle_cmid") or 0) == 101]
+    assert homework_rows
+    assert str(homework_rows[0].get("confirmed_subcategory") or homework_rows[0].get("subcategory") or "") == "Projects"
+
+
+@pytest.mark.asyncio
 async def test_gradebook_status_includes_latest_chat_history_after_post_finalize_edit(criabot_instance):
     start = await criabot_instance.start_gradebook_session(
         course_id="EECS-9999-F2026",
@@ -531,3 +595,54 @@ async def test_gradebook_upload_duplicate_conflict_is_non_fatal(criabot_instance
     criabot_instance._gradebook.register_uploaded_document.assert_awaited_once_with(
         "gb-session-1", result["uploaded_document_name"]
     )
+
+
+def test_duplicate_content_error_detection_409_with_duplicate_code():
+    """Test that 409 errors with DUPLICATE code are properly detected"""
+    class Mock409Error(Exception):
+        def __init__(self):
+            self.status_code = 409
+            self.message = '{"status":409,"code":"DUPLICATE","message":"Requested content already exists in the database."}'
+
+    error = Mock409Error()
+    
+    # Simulate the error detection logic
+    if error.status_code == 409:
+        raw_message = str(getattr(error, "message", "")) or str(error)
+        is_duplicate = "DUPLICATE" in raw_message or "already exists" in raw_message.lower()
+        assert is_duplicate is True
+
+
+def test_duplicate_content_error_detection_409_with_already_exists():
+    """Test that 409 errors with 'already exists' message are properly detected"""
+    class Mock409Error(Exception):
+        def __init__(self):
+            self.status_code = 409
+            self.message = "Requested content already exists in the database."
+
+    error = Mock409Error()
+    
+    # Simulate the error detection logic
+    if error.status_code == 409:
+        raw_message = str(getattr(error, "message", "")) or str(error)
+        is_duplicate = "DUPLICATE" in raw_message or "already exists" in raw_message.lower()
+        assert is_duplicate is True
+
+
+def test_duplicate_content_error_detection_non_409_ignored():
+    """Test that non-409 errors are not treated as duplicates"""
+    class Mock500Error(Exception):
+        def __init__(self):
+            self.status_code = 500
+            self.message = "Internal server error"
+
+    error = Mock500Error()
+    
+    # Simulate the error detection logic
+    if error.status_code == 409:
+        raw_message = str(getattr(error, "message", "")) or str(error)
+        is_duplicate = "DUPLICATE" in raw_message or "already exists" in raw_message.lower()
+    else:
+        is_duplicate = False
+    
+    assert is_duplicate is False

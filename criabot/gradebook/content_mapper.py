@@ -22,6 +22,8 @@ class ContentMapper:
 
     NOT_GRADED = "__not_graded__"
     UNCATEGORIZED = "__uncategorized__"
+    CATEGORY_CONFIDENCE_THRESHOLD = 0.8
+    SUBCATEGORY_CONFIDENCE_THRESHOLD = 0.7
 
     # Module type to category mapping (Moodle activity types)
     MODULE_CATEGORY_HINTS = {
@@ -75,6 +77,32 @@ class ContentMapper:
     ) -> dict:
         proposal_categories = proposal.categories if proposal else []
         category_names = [c.name for c in proposal_categories]
+        category_by_key = {
+            str(category.name).strip().lower(): category
+            for category in proposal_categories
+            if str(category.name).strip()
+        }
+
+        # Pre-pass: build a name → (category, subcategory) index from proposal item placement.
+        # Items explicitly placed in the proposal tree skip deterministic/LLM and get
+        # confirmed category/subcategory pre-populated from the proposal.
+        proposal_item_placement: dict[str, tuple[str, str]] = {}
+        not_graded_keys = {
+            str(item).strip().lower()
+            for item in (getattr(proposal, "not_graded_items", None) or [])
+            if str(item).strip()
+        }
+        for cat in proposal_categories:
+            for item in (cat.items or []):
+                key = str(item).strip().lower()
+                if key:
+                    proposal_item_placement[key] = (cat.name, "")
+            for sub in (cat.subcategories or []):
+                for item in (sub.items or []):
+                    key = str(item).strip().lower()
+                    if key:
+                        proposal_item_placement[key] = (cat.name, sub.name)
+
         mapping = []
         unmatched = []
         uncategorized = []
@@ -97,7 +125,7 @@ class ContentMapper:
             if category_name == self.UNCATEGORIZED:
                 # Marked as uncategorized; let LLM try to suggest based on context
                 llm_candidates.append(activity)
-            elif category_name and confidence < 0.8:
+            elif category_name and confidence < self.CATEGORY_CONFIDENCE_THRESHOLD:
                 llm_candidates.append(activity)
             elif not category_name:
                 llm_candidates.append(activity)
@@ -108,7 +136,7 @@ class ContentMapper:
         if llm_candidates:
             llm_by_key, active_mapper_chat_id = await self._llm_assignments(
                 llm_candidates,
-                category_names,
+                proposal,
                 preferred_chat_id=mapper_chat_id,
                 return_chat_id=True,
             )
@@ -123,15 +151,55 @@ class ContentMapper:
             from_deterministic = True
             item_type = deterministic["item_type"]
 
-            # Override with LLM result if available and deterministic was low confidence or uncategorized
+            # Stage 2: Override with LLM category when deterministic match is low-confidence.
             llm_pick = llm_by_key.get(activity_key)
             if llm_pick is None and activity.cmid is not None:
                 llm_pick = llm_by_key.get(activity.cmid)
-            if llm_pick and (confidence < 0.8 or category_name == self.UNCATEGORIZED):
+            category_from_llm = False
+            if llm_pick and (confidence < self.CATEGORY_CONFIDENCE_THRESHOLD or category_name == self.UNCATEGORIZED):
                 category_name = llm_pick["category"]
                 confidence = float(llm_pick.get("confidence", 0.75))
                 reasoning = llm_pick.get("reasoning") or "Mapped using LLM category classification with course context."
                 from_deterministic = False
+                category_from_llm = True
+
+            # Stage 3: Subcategory assignment only after a confident parent category is chosen.
+            parent_category = category_by_key.get(str(category_name or "").strip().lower())
+            subcategory_name, subcategory_reasoning = self._assign_subcategory_after_category(
+                activity=activity,
+                category_name=category_name,
+                category_confidence=confidence,
+                parent_category=parent_category,
+                llm_pick=llm_pick if category_from_llm else None,
+            )
+
+            if subcategory_name and subcategory_reasoning and reasoning:
+                reasoning = f"{reasoning} {subcategory_reasoning}".strip()
+            elif subcategory_name and subcategory_reasoning:
+                reasoning = subcategory_reasoning
+
+            # Stage 4: When the activity is explicitly placed under a *subcategory*
+            # in the proposal tree, honour that placement unconditionally — it is a
+            # direct instructor instruction that is more authoritative than
+            # deterministic/LLM category inference.  Category-level placement (no
+            # subcategory) is already handled by _suggest_category Priority 1 with
+            # the bias guard, so we leave those rows untouched here.
+            activity_name_key = str(activity.name or "").strip().lower()
+            placement = proposal_item_placement.get(activity_name_key)
+            if activity_name_key in not_graded_keys:
+                category_name = self.NOT_GRADED
+                subcategory_name = ""
+                confidence = 1.0
+                reasoning = "Marked not graded per instructor instruction."
+                from_deterministic = True
+            elif placement and placement[1]:
+                # placement[1] is the subcategory — non-empty means explicit placement
+                pinned_cat, pinned_sub = placement
+                category_name = pinned_cat
+                subcategory_name = pinned_sub
+                confidence = 1.0
+                reasoning = "Category and subcategory pre-assigned from proposal item placement."
+                from_deterministic = True
 
             item = {
                 "moodle_cmid": activity.cmid,
@@ -143,6 +211,9 @@ class ContentMapper:
                 "item_source": item_type,  # "activity" or "manual" grade item
                 "suggested_category": category_name,
                 "confirmed_category": category_name,
+                "suggested_subcategory": subcategory_name,
+                "confirmed_subcategory": subcategory_name,
+                "subcategory": subcategory_name,
                 "finalized": False,
                 "confidence": confidence,
                 "reasoning": reasoning,
@@ -174,8 +245,83 @@ class ContentMapper:
                 if activity_key in invalid_by_key or cmid in invalid_by_key:
                     item["suggested_category"] = self.UNCATEGORIZED
                     item["confirmed_category"] = self.UNCATEGORIZED
+                    item["suggested_subcategory"] = ""
+                    item["confirmed_subcategory"] = ""
+                    item["subcategory"] = ""
                     if item not in uncategorized:
                         uncategorized.append(item)
+
+        invalid_sub_by_key = {}
+        for issue in validation_errors:
+            if not issue.get("missing_subcategory"):
+                continue
+            activity_key = issue.get("activity_key")
+            if activity_key:
+                invalid_sub_by_key[activity_key] = issue
+            elif issue.get("moodle_cmid") is not None:
+                invalid_sub_by_key[issue.get("moodle_cmid")] = issue
+        if invalid_sub_by_key:
+            for item in mapping:
+                activity_key = item.get("activity_key")
+                cmid = item.get("moodle_cmid")
+                if activity_key in invalid_sub_by_key or cmid in invalid_sub_by_key:
+                    item["suggested_subcategory"] = ""
+                    item["confirmed_subcategory"] = ""
+                    item["subcategory"] = ""
+
+        # Post-pass: Add mapping rows for manual grade items from the proposal
+        # that aren't already in the mapping (i.e., not from course_activities).
+        activity_names_in_mapping = {
+            str(item.get("activity_name") or "").strip().lower()
+            for item in mapping
+            if str(item.get("activity_name") or "").strip()
+        }
+        for category in proposal_categories:
+            for manual_item in (category.items or []):
+                item_key = str(manual_item).strip().lower()
+                if item_key and item_key not in activity_names_in_mapping:
+                    manual_row = {
+                        "moodle_cmid": None,
+                        "grade_item_id": None,
+                        "module_type": None,
+                        "itemtype": "manual",
+                        "activity_name": str(manual_item).strip(),
+                        "activity_key": f"manual:{item_key}",
+                        "item_source": "manual",
+                        "suggested_category": category.name,
+                        "confirmed_category": category.name,
+                        "suggested_subcategory": "",
+                        "confirmed_subcategory": "",
+                        "subcategory": "",
+                        "finalized": False,
+                        "confidence": 1.0,
+                        "reasoning": "Manual grade item from proposal.",
+                        "mapping_method": "manual",
+                    }
+                    mapping.append(manual_row)
+            for sub in (category.subcategories or []):
+                for manual_item in (sub.items or []):
+                    item_key = str(manual_item).strip().lower()
+                    if item_key and item_key not in activity_names_in_mapping:
+                        manual_row = {
+                            "moodle_cmid": None,
+                            "grade_item_id": None,
+                            "module_type": None,
+                            "itemtype": "manual",
+                            "activity_name": str(manual_item).strip(),
+                            "activity_key": f"manual:{item_key}",
+                            "item_source": "manual",
+                            "suggested_category": category.name,
+                            "confirmed_category": category.name,
+                            "suggested_subcategory": sub.name,
+                            "confirmed_subcategory": sub.name,
+                            "subcategory": sub.name,
+                            "finalized": False,
+                            "confidence": 1.0,
+                            "reasoning": "Manual grade item from proposal.",
+                            "mapping_method": "manual",
+                        }
+                        mapping.append(manual_row)
 
         return {
             "graded_activities": mapping,
@@ -196,6 +342,17 @@ class ContentMapper:
             for category in (proposal.categories or [])
             if str(category.name).strip()
         }
+        valid_subcategories_by_parent: dict[str, set[str]] = {}
+        for category in proposal.categories or []:
+            parent_key = str(category.name).strip().lower()
+            if not parent_key:
+                continue
+            valid_subcategories_by_parent[parent_key] = {
+                str(sub.name).strip().lower()
+                for sub in (category.subcategories or [])
+                if str(sub.name).strip()
+            }
+
         issues: List[dict] = []
         for row in mapping_rows or []:
             suggested = str(row.get("suggested_category") or "").strip()
@@ -203,15 +360,37 @@ class ContentMapper:
                 continue
             if suggested in {self.UNCATEGORIZED, self.NOT_GRADED}:
                 continue
-            if suggested.lower() in valid_categories:
+            parent_key = suggested.lower()
+            if parent_key not in valid_categories:
+                issues.append(
+                    {
+                        "activity_key": row.get("activity_key"),
+                        "moodle_cmid": row.get("moodle_cmid"),
+                        "activity_name": row.get("activity_name"),
+                        "missing_category": suggested,
+                        "reason": "Category was removed, renamed, or not present in the current proposal.",
+                    }
+                )
                 continue
+
+            suggested_sub = str(
+                row.get("suggested_subcategory") or row.get("subcategory") or ""
+            ).strip()
+            if not suggested_sub:
+                continue
+
+            valid_subs = valid_subcategories_by_parent.get(parent_key, set())
+            if suggested_sub.lower() in valid_subs:
+                continue
+
             issues.append(
                 {
                     "activity_key": row.get("activity_key"),
                     "moodle_cmid": row.get("moodle_cmid"),
                     "activity_name": row.get("activity_name"),
-                    "missing_category": suggested,
-                    "reason": "Category was removed, renamed, or not present in the current proposal.",
+                    "parent_category": suggested,
+                    "missing_subcategory": suggested_sub,
+                    "reason": "Subcategory was removed, renamed, or not present under the parent category.",
                 }
             )
         return issues
@@ -219,7 +398,7 @@ class ContentMapper:
     async def _llm_assignments(
         self,
         course_activities: List[CourseActivity],
-        category_names: List[str],
+        proposal: Optional[GradebookProposal],
         preferred_chat_id: Optional[str] = None,
         return_chat_id: bool = False,
     ) -> dict | tuple[dict, Optional[str]]:
@@ -228,6 +407,8 @@ class ContentMapper:
                 return data, chat_id
             return data
 
+        proposal_categories = proposal.categories if proposal else []
+        category_names = [category.name for category in proposal_categories]
         if not course_activities:
             logger.warning("No course activities provided for LLM assignments.")
             return _ret({}, preferred_chat_id)
@@ -238,7 +419,7 @@ class ContentMapper:
             logger.error("Criadex instance is not initialized. Cannot perform LLM assignments.")
             return _ret({}, preferred_chat_id)
 
-        prompt = self._build_llm_prompt(course_activities, category_names)
+        prompt = self._build_llm_prompt(course_activities, proposal_categories)
         response = None
         resolved_chat_id: Optional[str] = None
         # Keep chat_id on every attempt because Criadex contract requires it.
@@ -334,6 +515,14 @@ class ContentMapper:
                 if not canonical:
                     logger.warning(f"Invalid category '{category}' in LLM response. Skipping row.")
                     continue
+                confidence = float(row.get("confidence", 0.75))
+                subcategory_raw = str(row.get("subcategory") or "").strip()
+                subcategory_reasoning = str(row.get("subcategory_reasoning") or "").strip()
+                subcategory_confidence = row.get("subcategory_confidence")
+                if subcategory_confidence is None:
+                    subcategory_confidence = confidence if subcategory_raw else 0.0
+                else:
+                    subcategory_confidence = float(subcategory_confidence)
                 key = activity_key
                 if key == "":
                     activity = course_activities[idx] if idx < len(course_activities) else None
@@ -343,8 +532,11 @@ class ContentMapper:
                     key = self._activity_key(activity, idx)
                 value = {
                     "category": canonical,
-                    "confidence": float(row.get("confidence", 0.75)),
+                    "subcategory": subcategory_raw,
+                    "confidence": confidence,
+                    "subcategory_confidence": subcategory_confidence,
                     "reasoning": str(row.get("reasoning") or "Mapped using LLM category classification."),
+                    "subcategory_reasoning": subcategory_reasoning,
                 }
                 out[key] = value
                 if cmid is not None:
@@ -355,7 +547,8 @@ class ContentMapper:
 
         return _ret(out, resolved_chat_id or preferred_chat_id)
 
-    def _build_llm_prompt(self, course_activities: List[CourseActivity], category_names: List[str]) -> str:
+    def _build_llm_prompt(self, course_activities: List[CourseActivity], proposal_categories: list) -> str:
+        category_names = [category.name for category in proposal_categories]
         activity_rows = []
         for activity in course_activities:
             item_source = "Activity Module" if (activity.cmid and activity.module) else "Manual Grade Item"
@@ -367,6 +560,17 @@ class ContentMapper:
                 "activity_name": activity.name,
                 "item_source": item_source,
             })
+
+        subcategories_by_parent = {}
+        for category in proposal_categories:
+            parent_name = str(category.name).strip()
+            if not parent_name:
+                continue
+            subcategories_by_parent[parent_name] = [
+                str(sub.name).strip()
+                for sub in (category.subcategories or [])
+                if str(sub.name).strip()
+            ]
 
         # Build detailed category descriptions to help LLM distinguish
         category_descriptions = []
@@ -386,10 +590,14 @@ class ContentMapper:
             elif "participation" in cat_lower or "discussion" in cat_lower:
                 hint = "Forum posts, discussions, engagement, classroom participation"
             
+            subcats = subcategories_by_parent.get(cat) or []
+            sub_hint = ""
+            if subcats:
+                sub_hint = f" Subcategories: {', '.join(subcats)}."
             if hint:
-                category_descriptions.append(f"- **{cat}**: {hint}")
+                category_descriptions.append(f"- **{cat}**: {hint}{sub_hint}")
             else:
-                category_descriptions.append(f"- **{cat}**: (no description provided)")
+                category_descriptions.append(f"- **{cat}**: (no description provided){sub_hint}")
 
         # Build keyword reference section
         keyword_reference = """
@@ -405,6 +613,7 @@ class ContentMapper:
 
         payload = {
             "allowed_categories": category_names,
+            "subcategories_by_parent": subcategories_by_parent,
             "category_descriptions": "\n".join(category_descriptions),
             "uncategorized": self.UNCATEGORIZED,
             "not_graded": self.NOT_GRADED,
@@ -412,14 +621,23 @@ class ContentMapper:
             "keyword_reference": keyword_reference,
             "instructions": [
                 "You are a Moodle gradebook expert following YorkU eClass standards.",
-                "Analyze each grade item (activity or manual) and assign it to ONE category from the allowed list.",
+                "Step 1 — Category: analyze each grade item and assign ONE category from allowed_categories.",
+                "Step 2 — Subcategory: only after choosing a category with confidence >= 0.8, "
+                "optionally assign a subcategory from that same category's subcategories_by_parent entry.",
+                "If the chosen category has no subcategories, return an empty subcategory string.",
+                "If category confidence is below 0.8, return an empty subcategory string.",
                 "Use the keyword reference above to guide your categorization.",
                 "If an item name contains clear keywords (Quiz, Assignment, Midterm, etc.), prioritize that mapping.",
                 "For Activity Modules (course activities with modules), check module type: quiz→Quizzes, assign→Assignments, etc.",
                 f"If an item genuinely doesn't fit any category, use '{self.UNCATEGORIZED}' so professor can manually review.",
                 f"Use '{self.NOT_GRADED}' ONLY for administrative items (announcements, resources, links) with zero grade points.",
+                "For subcategories: use an exact allowed subcategory name only when subcategory_confidence is >= 0.7.",
+                "If no subcategory is a clear fit, return an empty string for subcategory (parent category only).",
+                "Never assign a subcategory from a different parent category.",
                 "DO NOT default everything to 'Assignments' — be precise and use keyword matching.",
-                "Return ONLY a JSON array with objects: {activity_key (string), moodle_cmid (int|null), category (string), confidence (0.5-1.0), reasoning (string)}.",
+                "Return ONLY a JSON array with objects: "
+                "{activity_key (string), moodle_cmid (int|null), category (string), subcategory (string), "
+                "confidence (0.5-1.0), subcategory_confidence (0.0-1.0), reasoning (string), subcategory_reasoning (string)}.",
                 "Reasoning must explain WHY you chose this category (e.g., 'Matched keyword Quiz in name' or 'Quiz module type').",
             ],
         }
@@ -460,6 +678,128 @@ class ContentMapper:
             return parsed if isinstance(parsed, list) else []
         except Exception:
             return []
+
+    def _category_assignment_confident(self, category_name: Optional[str], confidence: float) -> bool:
+        if not category_name:
+            return False
+        if category_name in {self.UNCATEGORIZED, self.NOT_GRADED}:
+            return False
+        return float(confidence) >= self.CATEGORY_CONFIDENCE_THRESHOLD
+
+    @staticmethod
+    def _parent_has_subcategories(parent_category) -> bool:
+        if parent_category is None:
+            return False
+        subcategories = getattr(parent_category, "subcategories", None) or []
+        return any(str(getattr(sub, "name", "") or "").strip() for sub in subcategories)
+
+    def _resolve_subcategory_for_parent(self, parent_category, subcategory_name: str) -> str:
+        if parent_category is None:
+            return ""
+        valid_subs = {
+            str(sub.name).strip().lower(): str(sub.name).strip()
+            for sub in (getattr(parent_category, "subcategories", None) or [])
+            if str(sub.name).strip()
+        }
+        if not valid_subs:
+            return ""
+        raw = str(subcategory_name or "").strip()
+        if not raw:
+            return ""
+        canonical = valid_subs.get(raw.lower())
+        if canonical:
+            return canonical
+        for candidate_key, candidate_name in valid_subs.items():
+            if raw.lower() in candidate_key or candidate_key in raw.lower():
+                return candidate_name
+        return ""
+
+    def _assign_subcategory_after_category(
+        self,
+        activity: CourseActivity,
+        category_name: Optional[str],
+        category_confidence: float,
+        parent_category,
+        llm_pick: Optional[dict] = None,
+    ) -> tuple[str, str]:
+        """
+        Assign a subcategory only after a confident parent category is resolved.
+
+        Skips subcategory mapping when the parent category is uncertain, has no
+        subcategories, or when a suggested subcategory does not belong to that parent.
+        """
+        if not self._category_assignment_confident(category_name, category_confidence):
+            return "", ""
+        if not self._parent_has_subcategories(parent_category):
+            return "", ""
+
+        subcategory_name = ""
+        subcategory_reasoning = ""
+
+        if llm_pick:
+            raw_subcategory = str(llm_pick.get("subcategory") or "").strip()
+            subcategory_confidence = float(
+                llm_pick.get("subcategory_confidence", llm_pick.get("confidence", 0.0))
+            )
+            if raw_subcategory and subcategory_confidence >= self.SUBCATEGORY_CONFIDENCE_THRESHOLD:
+                resolved = self._resolve_subcategory_for_parent(parent_category, raw_subcategory)
+                if resolved:
+                    subcategory_name = resolved
+                    subcategory_reasoning = str(llm_pick.get("subcategory_reasoning") or "").strip()
+
+        if not subcategory_name:
+            deterministic_sub, sub_confidence, deterministic_reason = self._suggest_subcategory(
+                activity,
+                str(category_name or ""),
+                parent_category,
+            )
+            if deterministic_sub and sub_confidence >= self.SUBCATEGORY_CONFIDENCE_THRESHOLD:
+                subcategory_name = deterministic_sub
+                subcategory_reasoning = deterministic_reason
+
+        return subcategory_name, subcategory_reasoning
+
+    def _suggest_subcategory(
+        self,
+        activity: CourseActivity,
+        parent_category_name: str,
+        parent_category,
+    ) -> tuple[str, float, str]:
+        subcategories = list(getattr(parent_category, "subcategories", None) or [])
+        if not subcategories:
+            return "", 0.0, ""
+
+        normalized_name = self._normalize(activity.name)
+        best_name = ""
+        best_score = 0.0
+        best_reason = ""
+
+        for subcategory in subcategories:
+            sub_name = str(subcategory.name).strip()
+            if not sub_name:
+                continue
+            sub_norm = self._normalize(sub_name)
+            if sub_norm and sub_norm in normalized_name:
+                score = 0.92
+                if score > best_score:
+                    best_name = sub_name
+                    best_score = score
+                    best_reason = f"Activity name contains subcategory '{sub_name}'."
+                continue
+
+            for token in sub_norm.split():
+                if len(token) < 4:
+                    continue
+                if token in normalized_name:
+                    score = 0.86
+                    if score > best_score:
+                        best_name = sub_name
+                        best_score = score
+                        best_reason = f"Matched subcategory token '{token}' in activity name."
+
+        if best_score >= self.SUBCATEGORY_CONFIDENCE_THRESHOLD:
+            return best_name, best_score, best_reason
+        return "", 0.0, ""
 
     def _suggest_category(self, activity: CourseActivity, proposal_categories: list) -> tuple[Optional[str], float, str, str]:
         """

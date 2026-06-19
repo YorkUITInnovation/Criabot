@@ -1,10 +1,12 @@
 # SearXNG settings (override defaults safely)
+# DuckDuckGo omitted: frequent CAPTCHA blocks from Docker/host IPs add log noise
+# without improving reliability; Google/Bing/Wikipedia provide stable fallback coverage.
 use_default_settings:
   engines:
     keep_only:
       - google
       - bing
-      - duckduckgo
+      #- duckduckgo # bug from searxng
       - wikipedia
       - youtube
 

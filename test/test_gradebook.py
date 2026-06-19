@@ -13,9 +13,27 @@ from criabot.gradebook.proposal import (
     validate_proposal_weights,
     sync_proposal_items_from_mapping,
     sync_mapping_from_proposal_manual_items,
+    snapshot_subcategories,
+    infer_subcategory_renames,
+    sync_content_mapping_with_proposal_subcategory_changes,
+    sync_confirmed_mapping_into_content_mapping,
+    apply_mapping_subcategory_operations,
+    sync_mapping_subcategories_from_proposal,
+    sync_mapping_not_graded_items,
+    sync_proposal_not_graded_from_confirmed_mapping,
+    is_subcategory_only_proposal_change,
+    should_invalidate_content_mapping,
+    NOT_GRADED_CATEGORY,
 )
 from criabot.gradebook.schemas import CourseActivity, GradebookCategory, GradebookProposal, GradebookSessionRecord, MoodleResource, GradebookSubcategory
 from criabot.gradebook.session import GradebookSessionEngine
+
+
+def _mapper_proposal_with_categories(*names: str) -> GradebookProposal:
+    weight = 100.0 / len(names) if names else 100.0
+    return GradebookProposal(
+        categories=[GradebookCategory(name=name, weight=weight) for name in names]
+    )
 
 
 @pytest.mark.asyncio
@@ -217,6 +235,56 @@ async def test_gradebook_baseline_ready_advances_to_proposal_without_analysis_re
 
     updated = await engine.chat(session.session_id, "show proposal")
     assert updated.phase == "PROPOSAL"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_baseline_show_proposal_does_not_mutate_proposal():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-2000b",
+        professor_id="prof_baseline_view",
+        bot_name="eecs-baseline-view-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 35%, Final 40%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign")],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-2000b",
+            "root_category": {"id": 1, "name": "Course total"},
+            "tree": {"type": "category", "children": {"1": {"type": "item", "depth": 2}}},
+            "stats": {"category_count": 1, "item_count": 1, "max_depth": 2},
+        },
+        import_mode="baseline",
+    )
+
+    assert session.phase == "BASELINE_READY"
+    before = session.proposal.model_dump() if session.proposal else None
+
+    updated = await engine.chat(session.session_id, "show proposal")
+
+    assert updated.phase == "PROPOSAL"
+    assert updated.proposal is not None
+    assert updated.proposal.model_dump() == before
+    assert bool((updated.extraction or {}).get("proposal_changed")) is False
+
+
+def test_show_proposal_is_not_gradebook_refinement():
+    assert ConversationManager._looks_like_gradebook_refinement("show proposal") is False
+    assert ConversationManager._is_read_only_gradebook_prompt("show proposal") is True
+
+
+def test_show_proposal_does_not_unhide_proposal_category():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Quizzes", weight=15, hidden=True),
+            GradebookCategory(name="Proposal", weight=10, hidden=True),
+        ]
+    )
+    before = proposal.model_dump()
+    updated = generator.update_from_prompt(proposal, "show proposal")
+    assert updated.model_dump() == before
 
 
 @pytest.mark.asyncio
@@ -1452,7 +1520,7 @@ async def test_post_finalize_first_edit_aggregation_phrase_is_applied_immediatel
 
 
 @pytest.mark.asyncio
-async def test_refinement_edit_invalidates_stale_content_mapping():
+async def test_refinement_weight_only_edit_preserves_content_mapping():
     engine = GradebookSessionEngine()
     session = await engine.start(
         course_id="EECS-1000",
@@ -1470,6 +1538,32 @@ async def test_refinement_edit_invalidates_stale_content_mapping():
     assert accepted.content_mapping is not None
 
     edited = await engine.chat(session.session_id, "make quizzes 10")
+
+    assert edited.phase == "REFINEMENT"
+    assert bool((edited.extraction or {}).get("proposal_changed")) is True
+    assert edited.content_mapping is not None
+    assert len((edited.content_mapping or {}).get("graded_activities") or []) > 0
+
+
+@pytest.mark.asyncio
+async def test_refinement_edit_invalidates_stale_content_mapping():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof-a",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%, Midterm 30%, Final 45%")],
+        course_activities=[
+            CourseActivity(name="Assignment 1", module="assign", cmid=901),
+            CourseActivity(name="Midterm", module="quiz", cmid=902),
+            CourseActivity(name="Final", module="quiz", cmid=903),
+        ],
+    )
+
+    accepted = await engine.accept(session.session_id)
+    assert accepted.content_mapping is not None
+
+    edited = await engine.chat(session.session_id, "remove Midterm")
 
     assert edited.phase == "REFINEMENT"
     assert bool((edited.extraction or {}).get("proposal_changed")) is True
@@ -1567,6 +1661,44 @@ def test_weight_validation_simple_weighted_mean_is_enforced():
     errors = validate_proposal_weights(proposal)
     assert errors
     assert errors[0]["aggregation_method"] == 11
+
+
+def test_post_update_checks_clears_stale_weight_check_when_total_is_100():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            _make_category("Assignments", 10.0),
+            _make_category("Labs", 15.0),
+            _make_category("Midterm", 30.0),
+            _make_category("Final Exam", 30.0),
+            _make_category("Quizzes", 15.0),
+        ],
+        aggregation_method=10,
+        notes=["Weight check: total is 95.0% (expected 100%)."],
+    )
+
+    generator._post_update_checks(proposal, "show proposal")
+
+    assert not any(str(note).lower().startswith("weight check:") for note in (proposal.notes or []))
+
+
+def test_post_update_checks_adds_weight_check_when_total_is_not_100():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            _make_category("Assignments", 10.0),
+            _make_category("Labs", 15.0),
+            _make_category("Midterm", 30.0),
+            _make_category("Final Exam", 30.0),
+            _make_category("Quizzes", 10.0),
+        ],
+        aggregation_method=10,
+        notes=[],
+    )
+
+    generator._post_update_checks(proposal, "show proposal")
+
+    assert any("Weight check: total is 95.0%" in str(note) for note in (proposal.notes or []))
 
 
 def test_weight_validation_mean_with_extra_credit_enforces_non_extra_total():
@@ -1858,6 +1990,180 @@ def test_split_supports_with_weight_of_fractional_values():
     assert quizzes.subcategories[0].weight == pytest.approx(10.0)
     assert quizzes.subcategories[1].weight == pytest.approx(15.0)
     assert not any("internal split totals" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_drop_subcategory_removes_split_piece_and_redistributes_weight():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Assignments, split into Homework 10%, Projects 15%")
+
+    updated = generator.update_from_prompt(split, "drop Projects")
+
+    assignments = next(cat for cat in updated.categories if cat.name == "Assignments")
+    sub_names = [sub.name for sub in (assignments.subcategories or [])]
+    assert sub_names == ["Homework"]
+    assert assignments.subcategories[0].weight == pytest.approx(25.0)
+    assert any("removed subcategory 'projects'" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_rename_subcategory_updates_split_label():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Assignments, split into Homework 10%, Projects 15%")
+
+    updated = generator.update_from_prompt(split, "rename Projects to Project")
+
+    assignments = next(cat for cat in updated.categories if cat.name == "Assignments")
+    sub_names = [sub.name for sub in (assignments.subcategories or [])]
+    assert "Project" in sub_names
+    assert "Projects" not in sub_names
+    assert any("renamed subcategory 'projects' to 'project'" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_add_subcategory_appends_without_overwriting_existing_split():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Assignments, split into Homework 10%, Projects 15%")
+
+    updated = generator.update_from_prompt(split, "In Assignments, add subcategory Reflection 5%")
+
+    assignments = next(cat for cat in updated.categories if cat.name == "Assignments")
+    sub_names = [sub.name for sub in (assignments.subcategories or [])]
+    assert sub_names == ["Homework", "Projects", "Reflection"]
+    assert any("added subcategory 'reflection'" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_drop_subcategory_does_not_emit_top_level_category_not_found():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Assignments, split into Homework 10%, Projects 15%")
+
+    updated = generator.update_from_prompt(split, "drop Projects")
+
+    effects = [str(n) for n in (updated.notes or []) if str(n).startswith("Effect:")]
+    assert not any(
+        "category was not found" in effect.lower() and "projects" in effect.lower()
+        for effect in effects
+    )
+
+
+def test_drop_missing_subcategory_reports_subcategory_not_found():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Assignments, split into Homework 10%, Projects 15%")
+
+    updated = generator.update_from_prompt(split, "drop GhostSubcategory")
+
+    effects = [str(n) for n in (updated.notes or []) if str(n).startswith("Effect:")]
+    assert any(
+        "subcategory" in effect.lower()
+        and "ghostsubcategory" in effect.lower()
+        and "was not found" in effect.lower()
+        for effect in effects
+    )
+
+
+def test_remove_subcategory_scoped_from_parent_phrase():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Labs, split into Lab Reports 10%, In-Lab Work 5%")
+
+    updated = generator.update_from_prompt(split, "remove In-Lab Work from Labs")
+
+    labs = next(cat for cat in updated.categories if cat.name == "Labs")
+    sub_names = [sub.name for sub in (labs.subcategories or [])]
+    assert sub_names == ["Lab Reports"]
+    assert labs.subcategories[0].weight == pytest.approx(15.0)
+
+
+def test_rename_subcategory_scoped_in_parent_phrase():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Assignments, split into Homework 10%, Projects 15%")
+
+    updated = generator.update_from_prompt(split, "In Assignments, rename Projects to Project")
+
+    assignments = next(cat for cat in updated.categories if cat.name == "Assignments")
+    sub_names = [sub.name for sub in (assignments.subcategories or [])]
+    assert sub_names == ["Homework", "Project"]
+
+
+def test_subcategory_weight_scoped_in_parent_does_not_change_parent_category():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Labs, split into Lab Reports 10%, In-lab Work 5%")
+    labs = next(cat for cat in split.categories if cat.name == "Labs")
+    assert labs.weight == pytest.approx(15.0)
+
+    updated = generator.update_from_prompt(split, "set weight of Lab Reports in Labs to 5%")
+    labs = next(cat for cat in updated.categories if cat.name == "Labs")
+    lab_reports = next(sub for sub in labs.subcategories if sub.name == "Lab Reports")
+
+    assert labs.weight == pytest.approx(15.0)
+    assert lab_reports.weight == pytest.approx(5.0)
+    effects = [str(n) for n in (updated.notes or []) if str(n).startswith("Effect:")]
+    assert any("Lab Reports split weight in Labs to 5.0%" in effect for effect in effects)
+    assert not any("Set Labs to 5.0%" in effect for effect in effects)
+
+
+def test_subcategory_weight_explicit_keyword_without_parent():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Labs, split into Lab Reports 10%, In-lab Work 5%")
+
+    updated = generator.update_from_prompt(split, "set Lab Reports subcategory weight to 5%")
+    labs = next(cat for cat in updated.categories if cat.name == "Labs")
+    lab_reports = next(sub for sub in labs.subcategories if sub.name == "Lab Reports")
+
+    assert labs.weight == pytest.approx(15.0)
+    assert lab_reports.weight == pytest.approx(5.0)
+
+
+def test_rename_subcategory_does_not_rename_matching_grade_item():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([
+        CourseActivity(name="Homework 1", module="assign", cmid=10),
+    ])
+    split = generator.update_from_prompt(
+        base,
+        "In Assignments, split into Homework 10%, Projects 15%",
+    )
+    assignments = next(cat for cat in split.categories if cat.name == "Assignments")
+    assert "Homework 1" in (assignments.items or [])
+
+    updated = generator.update_from_prompt(split, "rename Homework to Homework Tasks")
+    assignments = next(cat for cat in updated.categories if cat.name == "Assignments")
+    sub_names = [sub.name for sub in (assignments.subcategories or [])]
+
+    assert "Homework Tasks" in sub_names
+    assert "Homework 1" in (assignments.items or [])
+    assert "Homework Tasks" not in (assignments.items or [])
+
+
+def test_rename_subcategory_when_name_overlaps_parent_category_tokens():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Labs, split into Lab Reports 10%, In-Lab Work 5%")
+
+    updated = generator.update_from_prompt(split, "rename Lab Reports to Lab Report")
+
+    labs = next(cat for cat in updated.categories if cat.name == "Labs")
+    sub_names = [sub.name.lower() for sub in (labs.subcategories or [])]
+    assert "lab report" in sub_names
+    assert "lab reports" not in sub_names
+
+
+def test_set_subcategory_weight_matches_fuzzy_label():
+    generator = ProposalGenerator()
+    base = generator.generate_initial([])
+    split = generator.update_from_prompt(base, "In Assignments, split into Homework 10%, Projects 15%")
+    renamed = generator.update_from_prompt(split, "rename Projects to Project")
+
+    updated = generator.update_from_prompt(renamed, "set Project weight to 12%")
+
+    assignments = next(cat for cat in updated.categories if cat.name == "Assignments")
+    weights = {sub.name: sub.weight for sub in (assignments.subcategories or [])}
+    assert weights["Project"] == pytest.approx(12.0)
 
 
 def test_split_follow_up_assign_updates_subcategory_weight_and_clears_stale_warning():
@@ -2294,6 +2600,72 @@ def test_add_manual_grade_item_from_chat_prompt():
     assert any("manual grade item" in note.lower() for note in (updated.notes or []))
 
 
+def _gradebook_chat_baseline_proposal() -> GradebookProposal:
+    return GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=["HW 2"],
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0, items=["HW 1"]),
+                    GradebookSubcategory(name="Project", weight=15.0, items=["Term Project"]),
+                ],
+            ),
+            GradebookCategory(
+                name="Labs",
+                weight=15.0,
+                items=[],
+                subcategories=[
+                    GradebookSubcategory(name="In-lab", weight=5.0, items=["Week 1 Lab"]),
+                    GradebookSubcategory(name="Lab-report", weight=10.0, items=[]),
+                ],
+            ),
+            GradebookCategory(name="Midterm", weight=30.0, items=["Midterm Exam"]),
+            GradebookCategory(name="Final", weight=30.0, items=["Final Exam"], hidden=True),
+        ]
+    )
+
+
+def test_add_test_creates_test_category_not_quizzes_alias():
+    generator = ProposalGenerator()
+    updated = generator.update_from_prompt(_gradebook_chat_baseline_proposal(), "add test")
+
+    assert [category.name for category in updated.categories] == [
+        "Assignments",
+        "Labs",
+        "Midterm",
+        "Final",
+        "Test",
+    ]
+
+
+def test_add_grade_item_without_category_creates_item_not_category():
+    generator = ProposalGenerator()
+    updated = generator.update_from_prompt(_gradebook_chat_baseline_proposal(), "add grade item kazem")
+
+    assert [category.name for category in updated.categories] == [
+        "Assignments",
+        "Labs",
+        "Midterm",
+        "Final",
+    ]
+    assert "kazem" in (updated.categories[0].items or [])
+    assert any("manual grade item 'kazem'" in note.lower() for note in (updated.notes or []))
+
+
+def test_move_chat_created_grade_item_to_subcategory():
+    generator = ProposalGenerator()
+    proposal = generator.update_from_prompt(_gradebook_chat_baseline_proposal(), "add grade item kazem")
+    updated = generator.update_from_prompt(proposal, "move grade item kazem to Lab-report in Labs")
+
+    labs = next(category for category in updated.categories if category.name == "Labs")
+    lab_report = next(sub for sub in labs.subcategories if sub.name == "Lab-report")
+    assert "kazem" in (lab_report.items or [])
+    assert "kazem" not in (labs.items or [])
+    assert "kazem" not in (updated.categories[0].items or [])
+
+
 # --- Aggregation Method Tests ---
 
 def test_gradebook_proposal_default_aggregation_is_natural():
@@ -2452,6 +2824,288 @@ def test_sync_proposal_items_from_mapping_is_idempotent():
 
     assert changed is False
     assert proposal.categories[0].items == ["Labs Manual Item"]
+
+
+def test_sync_proposal_items_from_mapping_places_items_in_subcategories():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=10.0,
+                items=["assignment1", "assignment2", "HW essay"],
+                subcategories=[
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                ],
+            ),
+        ]
+    )
+    mapping = [
+        {
+            "category": "Assignments",
+            "confirmed_subcategory": "Projects",
+            "activity_name": "assignment1",
+            "itemtype": "mod",
+        },
+        {
+            "category": "Assignments",
+            "confirmed_subcategory": "Projects",
+            "activity_name": "assignment2",
+            "itemtype": "mod",
+        },
+        {
+            "category": "Assignments",
+            "confirmed_subcategory": "Homework",
+            "activity_name": "HW essay",
+            "itemtype": "mod",
+        },
+    ]
+
+    changed = sync_proposal_items_from_mapping(proposal, mapping)
+
+    assert changed is True
+    projects, homework = proposal.categories[0].subcategories
+    assert projects.items == ["assignment1", "assignment2"]
+    assert homework.items == ["HW essay"]
+    assert proposal.categories[0].items == []
+
+
+def test_sync_proposal_items_from_mapping_moves_parent_item_into_subcategory():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Labs",
+                weight=15.0,
+                items=["Labs Manual Item"],
+                subcategories=[GradebookSubcategory(name="Lab Reports", weight=10.0)],
+            ),
+        ]
+    )
+    mapping = [
+        {
+            "category": "Labs",
+            "confirmed_subcategory": "Lab Reports",
+            "activity_name": "Labs Manual Item",
+            "grade_item_id": 101,
+            "itemtype": "manual",
+        },
+    ]
+
+    changed = sync_proposal_items_from_mapping(proposal, mapping)
+
+    assert changed is True
+    assert proposal.categories[0].items == []
+    assert proposal.categories[0].subcategories[0].items == ["Labs Manual Item"]
+
+
+def test_format_categories_nests_mapping_subcategory_items_without_arrow():
+    cm = ConversationManager()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=10.0,
+                items=["assignment1", "The Role of Balance in Layout Design"],
+                subcategories=[
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                ],
+            ),
+        ]
+    )
+    session = GradebookSessionRecord(
+        session_id="mapping-sub-tree",
+        course_id="EECS-1000",
+        professor_id="prof",
+        bot_name="eecs-bot",
+        phase="ACCEPTED",
+        proposal=proposal,
+        content_mapping={
+            "graded_activities": [
+                {
+                    "activity_name": "assignment1",
+                    "confirmed_category": "Assignments",
+                    "confirmed_subcategory": "Projects",
+                    "itemtype": "mod",
+                },
+                {
+                    "activity_name": "The Role of Balance in Layout Design",
+                    "confirmed_category": "Assignments",
+                    "confirmed_subcategory": "Homework",
+                    "itemtype": "mod",
+                },
+            ]
+        },
+        course_activities=[
+            CourseActivity(name="assignment1", module="assign", cmid=1, grade_item_id=1),
+            CourseActivity(
+                name="The Role of Balance in Layout Design",
+                module="assign",
+                cmid=2,
+                grade_item_id=2,
+            ),
+        ],
+    )
+
+    text = cm._format_categories(proposal, session)
+
+    assert "→ Projects" not in text
+    assert "→ Homework" not in text
+    assert "[Assignments > Projects] assignment1" in text
+    assert "[Assignments > Homework] The Role of Balance in Layout Design" in text
+    assert text.count("assignment1") == 1
+    assert text.count("The Role of Balance in Layout Design") == 1
+
+
+def test_chat_move_then_mapping_subcategory_does_not_duplicate_proposal_tree():
+    """Items moved into a subcategory via chat should stay put when mapping confirms the same sub."""
+    cm = ConversationManager()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=10.0,
+                items=[],
+                subcategories=[
+                    GradebookSubcategory(
+                        name="Projects",
+                        weight=15.0,
+                        items=["assignment1", "assignment2"],
+                    ),
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                ],
+            ),
+        ]
+    )
+    mapping = [
+        {
+            "category": "Assignments",
+            "confirmed_subcategory": "Projects",
+            "activity_name": "assignment1",
+            "itemtype": "mod",
+        },
+        {
+            "category": "Assignments",
+            "confirmed_subcategory": "Projects",
+            "activity_name": "assignment2",
+            "itemtype": "mod",
+        },
+    ]
+
+    changed = sync_proposal_items_from_mapping(proposal, mapping)
+
+    assert changed is False
+    projects = proposal.categories[0].subcategories[0]
+    assert projects.items == ["assignment1", "assignment2"]
+    assert proposal.categories[0].items == []
+
+    session = GradebookSessionRecord(
+        session_id="chat-then-mapping",
+        course_id="EECS-1000",
+        professor_id="prof",
+        bot_name="eecs-bot",
+        phase="ACCEPTED",
+        proposal=proposal,
+        content_mapping={"graded_activities": mapping},
+        course_activities=[
+            CourseActivity(name="assignment1", module="assign", cmid=1, grade_item_id=1),
+            CourseActivity(name="assignment2", module="assign", cmid=2, grade_item_id=2),
+        ],
+    )
+    text = cm._format_categories(proposal, session)
+
+    assert text.count("assignment1") == 1
+    assert text.count("assignment2") == 1
+    assert "→ Projects" not in text
+    assert "[Assignments > Projects] assignment1" in text
+    assert "[Assignments > Projects] assignment2" in text
+
+
+def test_chat_move_then_mapping_category_only_preserves_subcategory_placement():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=10.0,
+                items=[],
+                subcategories=[
+                    GradebookSubcategory(
+                        name="Projects",
+                        weight=15.0,
+                        items=["assignment1"],
+                    ),
+                ],
+            ),
+        ]
+    )
+    mapping = [
+        {
+            "category": "Assignments",
+            "activity_name": "assignment1",
+            "itemtype": "mod",
+        },
+    ]
+
+    changed = sync_proposal_items_from_mapping(proposal, mapping)
+
+    assert changed is False
+    assert proposal.categories[0].subcategories[0].items == ["assignment1"]
+    assert proposal.categories[0].items == []
+
+
+def test_chat_move_then_mapping_clears_stale_parent_duplicate():
+    cm = ConversationManager()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=10.0,
+                items=["assignment1", "assignment2"],
+                subcategories=[
+                    GradebookSubcategory(
+                        name="Projects",
+                        weight=15.0,
+                        items=["assignment1", "assignment2"],
+                    ),
+                ],
+            ),
+        ]
+    )
+    mapping = [
+        {
+            "category": "Assignments",
+            "confirmed_subcategory": "Projects",
+            "activity_name": "assignment1",
+            "itemtype": "mod",
+        },
+        {
+            "category": "Assignments",
+            "confirmed_subcategory": "Projects",
+            "activity_name": "assignment2",
+            "itemtype": "mod",
+        },
+    ]
+
+    changed = sync_proposal_items_from_mapping(proposal, mapping)
+
+    assert changed is True
+    assert proposal.categories[0].items == []
+    session = GradebookSessionRecord(
+        session_id="stale-parent-dup",
+        course_id="EECS-1000",
+        professor_id="prof",
+        bot_name="eecs-bot",
+        phase="ACCEPTED",
+        proposal=proposal,
+        content_mapping={"graded_activities": mapping},
+        course_activities=[
+            CourseActivity(name="assignment1", module="assign", cmid=1, grade_item_id=1),
+            CourseActivity(name="assignment2", module="assign", cmid=2, grade_item_id=2),
+        ],
+    )
+    text = cm._format_categories(proposal, session)
+    assert text.count("assignment1") == 1
+    assert text.count("assignment2") == 1
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -2673,6 +3327,290 @@ def test_rename_grade_item_phrase_updates_item_name():
     assert any("renamed 'fina' to 'final' in final exam" in str(n).lower() for n in (updated.notes or []))
 
 
+def test_rename_grade_item_in_subcategory_updates_subcategory_item_name():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=10.0,
+                subcategories=[
+                    GradebookSubcategory(
+                        name="Homework",
+                        weight=10.0,
+                        items=["assignment1", "assignment 2"],
+                    ),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            ),
+        ],
+        notes=[],
+    )
+
+    updated = generator.update_from_prompt(base, "rename assignment 2 to assignment2")
+
+    homework = updated.categories[0].subcategories[0]
+    assert homework.items == ["assignment1", "assignment2"]
+    assert "assignment 2" not in (homework.items or [])
+    assert any(
+        "renamed 'assignment 2' to 'assignment2' in assignments" in str(n).lower()
+        for n in (updated.notes or [])
+    )
+
+
+def test_remove_grade_item_from_subcategory_updates_subcategory_items():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=10.0,
+                subcategories=[
+                    GradebookSubcategory(
+                        name="Homework",
+                        weight=10.0,
+                        items=["assignment1", "report_manual"],
+                    ),
+                ],
+            ),
+        ],
+        notes=[],
+    )
+
+    for prompt in (
+        "remove report_manual",
+        "remove report_manual from Homework",
+        "remove report_manual from Assignments",
+    ):
+        updated = generator.update_from_prompt(base.model_copy(deep=True), prompt)
+        homework = updated.categories[0].subcategories[0]
+        assert homework.items == ["assignment1"], prompt
+        assert "report_manual" not in (homework.items or []), prompt
+
+
+def test_remove_moodle_activity_is_blocked_when_course_activities_are_known():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=10.0,
+                subcategories=[
+                    GradebookSubcategory(
+                        name="Homework",
+                        weight=10.0,
+                        items=["assignment1", "assignment2"],
+                    ),
+                ],
+            ),
+        ],
+        notes=[],
+    )
+    activities = [
+        CourseActivity(name="assignment1", module="assign", cmid=101),
+        CourseActivity(name="assignment 2", module="assign", cmid=102),
+    ]
+
+    updated = generator.update_from_prompt(
+        base,
+        "remove assignment2",
+        course_activities=activities,
+    )
+
+    homework = updated.categories[0].subcategories[0]
+    assert homework.items == ["assignment1", "assignment2"]
+    assert any("cannot remove moodle activity" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_set_activity_not_graded_removes_from_subcategory_tree():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(
+                        name="Homework",
+                        weight=10.0,
+                        items=["Homework 1", "Homework 2"],
+                    ),
+                ],
+            ),
+        ],
+        notes=[],
+    )
+    activities = [
+        CourseActivity(name="Homework 1", module="assign", cmid=101),
+        CourseActivity(name="Homework 2", module="assign", cmid=102),
+    ]
+
+    updated = generator.update_from_prompt(
+        base,
+        "set Homework 1 to not graded",
+        course_activities=activities,
+    )
+
+    homework = updated.categories[0].subcategories[0]
+    assert homework.items == ["Homework 2"]
+    assert "Homework 1" in (updated.not_graded_items or [])
+    assert any("set moodle activity 'homework 1' to not graded" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_set_activity_not_graded_syncs_mapping_rows():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=["Homework 2"],
+            ),
+        ],
+        not_graded_items=["Homework 1"],
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Homework 1",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+                "confirmed_subcategory": "Homework",
+            },
+            {
+                "moodle_cmid": 102,
+                "activity_name": "Homework 2",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+            },
+        ]
+    }
+
+    assert sync_mapping_not_graded_items(content_mapping, proposal) is True
+    row = content_mapping["graded_activities"][0]
+    assert row["confirmed_category"] == NOT_GRADED_CATEGORY
+    assert row.get("confirmed_subcategory", "x") == ""
+    assert row.get("not_graded") is True
+    assert content_mapping["graded_activities"][1]["confirmed_category"] == "Assignments"
+
+
+def test_move_from_not_graded_restores_graded_category():
+    generator = ProposalGenerator()
+    base = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Assignments", weight=25.0, items=[]),
+            GradebookCategory(name="Labs", weight=15.0, items=[]),
+        ],
+        not_graded_items=["Homework 1"],
+        notes=[],
+    )
+    activities = [CourseActivity(name="Homework 1", module="assign", cmid=101)]
+
+    updated = generator.update_from_prompt(
+        base,
+        "move Homework 1 to Assignments",
+        course_activities=activities,
+    )
+
+    assert updated.not_graded_items == []
+    assert "Homework 1" in (updated.categories[0].items or [])
+    assert any("moved 'homework 1'" in str(n).lower() for n in (updated.notes or []))
+
+
+def test_sync_proposal_not_graded_from_confirmed_mapping_adds_tracked_item():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=["Balance Activity"],
+            ),
+        ],
+        not_graded_items=[],
+    )
+    activities = [CourseActivity(name="Balance Activity", module="assign", cmid=201)]
+    confirmed_mapping = [
+        {
+            "activity_name": "Balance Activity",
+            "category": NOT_GRADED_CATEGORY,
+            "moodle_cmid": 201,
+        }
+    ]
+
+    assert sync_proposal_not_graded_from_confirmed_mapping(
+        proposal,
+        confirmed_mapping,
+        activities,
+    ) is True
+    assert "Balance Activity" in (proposal.not_graded_items or [])
+    assert "Balance Activity" not in (proposal.categories[0].items or [])
+
+
+def test_sync_confirmed_mapping_into_content_mapping_marks_not_graded():
+    proposal = GradebookProposal(
+        categories=[GradebookCategory(name="Assignments", weight=100.0, items=[])],
+        not_graded_items=["Balance Activity"],
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 201,
+                "activity_name": "Balance Activity",
+                "confirmed_category": "Assignments",
+                "confirmed_subcategory": "Homework",
+            }
+        ]
+    }
+    confirmed_mapping = [
+        {
+            "activity_name": "Balance Activity",
+            "category": NOT_GRADED_CATEGORY,
+            "moodle_cmid": 201,
+        }
+    ]
+
+    assert sync_confirmed_mapping_into_content_mapping(
+        content_mapping,
+        confirmed_mapping,
+        proposal,
+    ) is True
+    row = content_mapping["graded_activities"][0]
+    assert row["confirmed_category"] == NOT_GRADED_CATEGORY
+    assert row.get("confirmed_subcategory", "x") == ""
+    assert row.get("not_graded") is True
+
+
+def test_should_not_invalidate_content_mapping_when_marking_activity_not_graded():
+    before = GradebookProposal(
+        categories=[GradebookCategory(name="Assignments", weight=100.0, items=["Homework 1"])],
+        not_graded_items=[],
+    )
+    after = GradebookProposal(
+        categories=[GradebookCategory(name="Assignments", weight=100.0, items=[])],
+        not_graded_items=["Homework 1"],
+    )
+
+    assert should_invalidate_content_mapping(before, after) is False
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_build_mapping_respects_not_graded_items():
+    mapper = ContentMapper(criadex=None)
+    proposal = GradebookProposal(
+        categories=[GradebookCategory(name="Assignments", weight=100.0, items=["Homework 2"])],
+        not_graded_items=["Homework 1"],
+    )
+    activities = [
+        CourseActivity(name="Homework 1", module="assign", cmid=101),
+        CourseActivity(name="Homework 2", module="assign", cmid=102),
+    ]
+
+    mapping = await mapper.build_mapping(activities, proposal)
+    rows = {row["activity_name"]: row for row in mapping["graded_activities"]}
+    assert rows["Homework 1"]["confirmed_category"] == ContentMapper.NOT_GRADED
+    assert rows["Homework 2"]["confirmed_category"] == "Assignments"
+
+
 def test_remove_grade_item_prefix_phrase_removes_item():
     generator = ProposalGenerator()
     base = GradebookProposal(
@@ -2800,8 +3738,27 @@ def test_format_categories_shows_subcategories():
     ])
 
     text = cm._format_categories(proposal)
-    assert "Homework (20.0%)" in text
-    assert "Project (20.0%)" in text
+    assert text.startswith("  ├── **Assignments**") or text.startswith("  └── **Assignments**")
+    assert "**Homework** (20.0%)" in text
+    assert "**Project** (20.0%)" in text
+    assert "HW 1" in text
+    assert "├──" in text or "└──" in text
+
+
+def test_add_to_existing_category_creates_manual_item_not_subcategory():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Final Exam", weight=100.0, items=[]),
+        ]
+    )
+
+    updated = generator.update_from_prompt(proposal, "add test to Final exam")
+
+    assert [cat.name for cat in updated.categories] == ["Final Exam"]
+    assert updated.categories[0].items == ["test"]
+    assert updated.categories[0].subcategories == []
+    assert any("manual grade item 'test'" in str(note).lower() for note in (updated.notes or []))
 
 
 def test_proposal_formula_is_applied_to_target_category():
@@ -3186,6 +4143,1041 @@ def test_content_mapper_validate_mapping_detects_stale_categories():
     assert issues[0]["missing_category"] == "Quizzes"
 
 
+def test_infer_subcategory_rename_project_to_projects():
+    before = {"assignments": ["Homework", "Project"]}
+    after = {"assignments": ["Homework", "Projects"]}
+
+    renames = infer_subcategory_renames(before, after)
+
+    assert renames == [("assignments", "Project", "Projects")]
+
+
+def test_sync_mapping_preserves_item_on_subcategory_rename():
+    proposal_before = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Project", weight=15.0),
+                ],
+            )
+        ]
+    )
+    proposal_after = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            )
+        ]
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 201,
+                "activity_name": "Course Project",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+                "suggested_subcategory": "Project",
+                "confirmed_subcategory": "Project",
+                "subcategory": "Project",
+            }
+        ]
+    }
+    renames = infer_subcategory_renames(
+        snapshot_subcategories(proposal_before),
+        snapshot_subcategories(proposal_after),
+    )
+
+    assert is_subcategory_only_proposal_change(proposal_before, proposal_after) is True
+    assert sync_content_mapping_with_proposal_subcategory_changes(
+        content_mapping,
+        proposal_after,
+        renames,
+        [],
+    ) is True
+
+    row = content_mapping["graded_activities"][0]
+    assert row["confirmed_subcategory"] == "Projects"
+    assert row["subcategory"] == "Projects"
+
+
+def test_sync_content_mapping_clears_removed_subcategory():
+    proposal_after = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Midterm",
+                weight=20.0,
+                subcategories=[],
+            )
+        ]
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 55,
+                "activity_name": "Midterm Exam",
+                "suggested_category": "Midterm",
+                "confirmed_category": "Midterm",
+                "suggested_subcategory": "Written",
+                "confirmed_subcategory": "Written",
+                "subcategory": "Written",
+            }
+        ]
+    }
+
+    assert sync_content_mapping_with_proposal_subcategory_changes(
+        content_mapping,
+        proposal_after,
+        [],
+        [("midterm", "Written")],
+    ) is True
+
+    row = content_mapping["graded_activities"][0]
+    assert row["confirmed_subcategory"] == ""
+    assert row["subcategory"] == ""
+
+
+def test_sync_confirmed_mapping_updates_subcategory_on_rows():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            )
+        ]
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Homework 1",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+                "suggested_subcategory": "",
+                "confirmed_subcategory": "",
+                "subcategory": "",
+            }
+        ]
+    }
+    confirmed_mapping = [
+        {
+            "moodle_cmid": 101,
+            "activity_name": "Homework 1",
+            "category": "Assignments",
+            "subcategory": "Homework",
+        }
+    ]
+
+    assert sync_confirmed_mapping_into_content_mapping(
+        content_mapping,
+        confirmed_mapping,
+        proposal,
+    ) is True
+
+    row = content_mapping["graded_activities"][0]
+    assert row["confirmed_subcategory"] == "Homework"
+    assert row["subcategory"] == "Homework"
+
+
+def test_sync_confirmed_mapping_clears_invalid_subcategory():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[GradebookSubcategory(name="Homework", weight=25.0)],
+            )
+        ]
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Homework 1",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+                "confirmed_subcategory": "Projects",
+                "subcategory": "Projects",
+            }
+        ]
+    }
+    confirmed_mapping = [
+        {
+            "moodle_cmid": 101,
+            "category": "Assignments",
+            "subcategory": "Projects",
+        }
+    ]
+
+    assert sync_confirmed_mapping_into_content_mapping(
+        content_mapping,
+        confirmed_mapping,
+        proposal,
+    ) is True
+
+    row = content_mapping["graded_activities"][0]
+    assert row["confirmed_subcategory"] == ""
+    assert row["subcategory"] == ""
+
+
+def test_proposal_move_item_to_subcategory_updates_tree():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=["HW 1", "Term Project"],
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Project", weight=15.0),
+                ],
+            )
+        ]
+    )
+
+    moved_hw = generator.update_from_prompt(proposal, "move HW 1 to Homework")
+    assignments = moved_hw.categories[0]
+    homework_sub = next(sub for sub in assignments.subcategories if sub.name == "Homework")
+    assert "HW 1" in homework_sub.items
+    assert "HW 1" not in (assignments.items or [])
+
+    moved_project = generator.update_from_prompt(
+        moved_hw,
+        "move Term Project to Project in Assignments",
+    )
+    assignments = moved_project.categories[0]
+    project_sub = next(sub for sub in assignments.subcategories if sub.name == "Project")
+    assert "Term Project" in project_sub.items
+
+
+def test_proposal_move_multiple_items_to_subcategory_in_single_prompt():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=["assignment1", "assignment 2", "Essay"],
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            )
+        ]
+    )
+
+    updated = generator.update_from_prompt(
+        proposal,
+        "move assignment1 and assignment 2 to Homework",
+    )
+    assignments = updated.categories[0]
+    homework_sub = next(sub for sub in assignments.subcategories if sub.name == "Homework")
+    assert "assignment1" in (homework_sub.items or [])
+    assert "assignment 2" in (homework_sub.items or [])
+    assert "assignment1" not in (assignments.items or [])
+    assert "assignment 2" not in (assignments.items or [])
+
+
+def test_proposal_move_multiple_items_to_parent_category_in_single_prompt():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=["Essay"],
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0, items=["assignment1", "assignment 2"]),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            )
+        ]
+    )
+
+    updated = generator.update_from_prompt(
+        proposal,
+        "move assignment1 and assignment 2 to Assignments",
+    )
+    assignments = updated.categories[0]
+    homework_sub = next(sub for sub in assignments.subcategories if sub.name == "Homework")
+    assert "assignment1" in (assignments.items or [])
+    assert "assignment 2" in (assignments.items or [])
+    assert "assignment1" not in (homework_sub.items or [])
+    assert "assignment 2" not in (homework_sub.items or [])
+
+
+def test_add_manual_grade_item_to_subcategory_explicit():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Labs",
+                weight=15.0,
+                items=[],
+                subcategories=[
+                    GradebookSubcategory(name="Lab Reports", weight=10.0),
+                    GradebookSubcategory(name="In-Lab Work", weight=5.0),
+                ],
+            )
+        ]
+    )
+
+    updated = generator.update_from_prompt(proposal, "add grade item lab1 to subcategory In-Lab Work")
+    labs = updated.categories[0]
+    inlab = next(sub for sub in labs.subcategories if sub.name == "In-Lab Work")
+    assert "lab1" in (inlab.items or [])
+    assert "lab1" not in (labs.items or [])
+
+
+def test_add_manual_grade_item_to_subcategory_bare():
+    generator = ProposalGenerator()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Labs",
+                weight=15.0,
+                items=[],
+                subcategories=[
+                    GradebookSubcategory(name="Lab Reports", weight=10.0),
+                    GradebookSubcategory(name="In-Lab Work", weight=5.0),
+                ],
+            ),
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=[],
+                subcategories=[
+                    GradebookSubcategory(name="Projects", weight=25.0),
+                ],
+            ),
+        ]
+    )
+
+    updated = generator.update_from_prompt(proposal, "add grade item test to Projects")
+    assignments = updated.categories[1]
+    projects_sub = next(sub for sub in assignments.subcategories if sub.name == "Projects")
+    assert "test" in (projects_sub.items or [])
+    assert "test" not in (assignments.items or [])
+
+
+def test_sync_mapping_subcategories_from_proposal():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0, items=["Quiz 1"]),
+                ],
+            )
+        ]
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Quiz 1",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+            }
+        ]
+    }
+
+    assert sync_mapping_subcategories_from_proposal(content_mapping, proposal) is True
+    row = content_mapping["graded_activities"][0]
+    assert row["confirmed_subcategory"] == "Homework"
+
+
+def test_apply_mapping_subcategory_operations_syncs_from_proposal():
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Quizzes",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=25.0, items=["Quiz 1"]),
+                ],
+            )
+        ]
+    )
+    content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Quiz 1",
+                "suggested_category": "Quizzes",
+                "confirmed_category": "Quizzes",
+            }
+        ]
+    }
+
+    assert apply_mapping_subcategory_operations(content_mapping, proposal, "") is True
+    row = content_mapping["graded_activities"][0]
+    assert row["confirmed_subcategory"] == "Homework"
+
+
+def test_format_categories_shows_items_under_subcategories_without_unassigned():
+    cm = ConversationManager()
+    proposal = GradebookProposal(categories=[
+        GradebookCategory(
+            name="Assignments",
+            weight=25.0,
+            items=["HW 2"],
+            subcategories=[
+                GradebookSubcategory(name="Homework", weight=10.0, items=["HW 1"]),
+                GradebookSubcategory(name="Project", weight=15.0, items=["Term Project"]),
+            ],
+        ),
+    ])
+
+    text = cm._format_categories(proposal)
+    assert "unassigned" not in text.lower()
+    assert "HW 1" in text
+    assert "Term Project" in text
+
+
+def test_format_mapping_sync_status_includes_subcategory_counts():
+    manager = ConversationManager()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[GradebookSubcategory(name="Homework", weight=25.0)],
+            )
+        ]
+    )
+    session = GradebookSessionRecord(
+        session_id="sub-sync-status",
+        course_id="EECS-1000",
+        professor_id="prof",
+        bot_name="eecs-bot",
+        phase="ACCEPTED",
+        proposal=proposal,
+        content_mapping={
+            "graded_activities": [
+                {
+                    "moodle_cmid": 101,
+                    "activity_name": "Homework 1",
+                    "suggested_category": "Assignments",
+                    "confirmed_category": "Assignments",
+                    "confirmed_subcategory": "Homework",
+                },
+                {
+                    "moodle_cmid": 102,
+                    "activity_name": "Homework 2",
+                    "suggested_category": "Assignments",
+                    "confirmed_category": "Assignments",
+                    "confirmed_subcategory": "Homework",
+                },
+            ],
+            "validation_errors": [
+                {
+                    "activity_name": "Stale Item",
+                    "missing_subcategory": "Old Sub",
+                    "parent_category": "Assignments",
+                }
+            ],
+        },
+    )
+
+    text = manager._format_mapping_sync_status(session, proposal)
+    assert "Rows by subcategory" in text
+    assert "Assignments/Homework: 2" in text
+    assert "subcategories not present" in text
+
+
+def test_should_invalidate_content_mapping_allows_weight_and_subcategory_changes():
+    proposal_before = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Midterm",
+                weight=30.0,
+                subcategories=[GradebookSubcategory(name="Written", weight=20.0)],
+            ),
+            GradebookCategory(name="Final", weight=30.0),
+        ]
+    )
+    proposal_after = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Midterm", weight=20.0, subcategories=[]),
+            GradebookCategory(name="Final", weight=40.0),
+        ]
+    )
+
+    assert should_invalidate_content_mapping(proposal_before, proposal_after) is False
+    assert is_subcategory_only_proposal_change(proposal_before, proposal_after) is True
+
+
+@pytest.mark.asyncio
+async def test_chat_subcategory_removal_with_weight_change_preserves_mapping():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_sub_remove",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Midterm 30%")],
+        course_activities=[CourseActivity(name="Midterm Exam", module="quiz", cmid=55)],
+    )
+    session.proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Midterm",
+                weight=30.0,
+                subcategories=[GradebookSubcategory(name="Written", weight=20.0)],
+            ),
+            GradebookCategory(name="Final", weight=30.0),
+        ]
+    )
+    session.content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 55,
+                "activity_name": "Midterm Exam",
+                "suggested_category": "Midterm",
+                "confirmed_category": "Midterm",
+                "suggested_subcategory": "Written",
+                "confirmed_subcategory": "Written",
+                "subcategory": "Written",
+            }
+        ],
+        "validation_errors": [],
+    }
+    session.phase = "ACCEPTED"
+    engine._active_sessions[session.session_id] = session
+
+    updated = await engine.chat(
+        session.session_id,
+        "remove Written from Midterm, set Midterm to 20%, set Final to 40%",
+    )
+
+    assert updated.content_mapping is not None
+    row = (updated.content_mapping or {}).get("graded_activities", [])[0]
+    assert row["confirmed_subcategory"] == ""
+    assert row["subcategory"] == ""
+
+
+@pytest.mark.asyncio
+async def test_chat_move_item_to_subcategory_updates_mapping():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_sub_move",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Quiz 1", module="quiz", cmid=101)],
+    )
+    session.proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=["Quiz 1"],
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            )
+        ]
+    )
+    session.content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Quiz 1",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+            }
+        ],
+        "validation_errors": [],
+    }
+    session.phase = "ACCEPTED"
+    engine._active_sessions[session.session_id] = session
+
+    updated = await engine.chat(session.session_id, "move Quiz 1 to Projects")
+
+    assert updated.content_mapping is not None
+    row = (updated.content_mapping or {}).get("graded_activities", [])[0]
+    assert row["confirmed_subcategory"] == "Projects"
+    assert row["subcategory"] == "Projects"
+
+
+@pytest.mark.asyncio
+async def test_sync_moodle_context_merges_confirmed_subcategory():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_sync_sub",
+        bot_name="eecs-bot",
+        moodle_resources=[],
+        course_activities=[CourseActivity(name="Quiz 1", module="quiz", cmid=101)],
+    )
+    session.proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[GradebookSubcategory(name="Homework", weight=25.0)],
+            )
+        ]
+    )
+    session.content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Quiz 1",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+            }
+        ],
+        "validation_errors": [],
+    }
+    session.phase = "ACCEPTED"
+    engine._active_sessions[session.session_id] = session
+
+    updated = await engine.sync_moodle_context(
+        session.session_id,
+        confirmed_mapping=[
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Quiz 1",
+                "category": "Assignments",
+                "subcategory": "Homework",
+            }
+        ],
+    )
+
+    row = (updated.content_mapping or {}).get("graded_activities", [])[0]
+    assert row["confirmed_subcategory"] == "Homework"
+    assert row["subcategory"] == "Homework"
+
+
+@pytest.mark.asyncio
+async def test_chat_subcategory_rename_preserves_existing_content_mapping():
+    engine = GradebookSessionEngine()
+    session = await engine.start(
+        course_id="EECS-1000",
+        professor_id="prof_sub_rename",
+        bot_name="eecs-bot",
+        moodle_resources=[MoodleResource(name="Course Syllabus.pdf", content_preview="Assignments 25%")],
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+    )
+    session.proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Project", weight=15.0),
+                ],
+            )
+        ]
+    )
+    session.content_mapping = {
+        "graded_activities": [
+            {
+                "moodle_cmid": 10,
+                "activity_name": "Homework 1",
+                "suggested_category": "Assignments",
+                "confirmed_category": "Assignments",
+                "suggested_subcategory": "Homework",
+                "confirmed_subcategory": "Homework",
+                "subcategory": "Homework",
+            }
+        ],
+        "validation_errors": [],
+    }
+    session.phase = "ACCEPTED"
+    engine._active_sessions[session.session_id] = session
+
+    updated = await engine.chat(session.session_id, "rename Homework to Homework Tasks")
+
+    row = (updated.content_mapping or {}).get("graded_activities", [])[0]
+    assert row["confirmed_subcategory"] == "Homework Tasks"
+    assert updated.content_mapping is not None
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_respects_proposal_item_placement():
+    """Items already placed in the proposal tree should map with proposal placement, not LLM/deterministic."""
+    mapper = ContentMapper()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0, items=["assignment1", "assignment 2"]),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            ),
+            GradebookCategory(
+                name="Quizzes",
+                weight=15.0,
+                items=["quiz 1", "quiz 2"],
+            ),
+        ]
+    )
+    activities = [
+        CourseActivity(name="assignment1", module="assign", cmid=101),
+        CourseActivity(name="assignment 2", module="assign", cmid=102),
+        CourseActivity(name="quiz 1", module="quiz", cmid=103),
+    ]
+    result = await mapper.build_mapping(course_activities=activities, proposal=proposal)
+    rows = {r["activity_name"]: r for r in result["graded_activities"]}
+
+    assert rows["assignment1"]["confirmed_category"] == "Assignments"
+    assert rows["assignment1"]["confirmed_subcategory"] == "Homework"
+    assert rows["assignment 2"]["confirmed_category"] == "Assignments"
+    assert rows["assignment 2"]["confirmed_subcategory"] == "Homework"
+    assert rows["quiz 1"]["confirmed_category"] == "Quizzes"
+    assert rows["quiz 1"]["confirmed_subcategory"] == ""
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_includes_manual_grade_items_from_proposal():
+    """Manual grade items added to proposal should appear in mapping with item_source: manual."""
+    mapper = ContentMapper()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Labs",
+                weight=15.0,
+                items=["lab_manual_parent"],
+                subcategories=[
+                    GradebookSubcategory(name="Lab Reports", weight=10.0, items=["report_manual"]),
+                    GradebookSubcategory(name="In-Lab Work", weight=5.0, items=["lab1_manual"]),
+                ],
+            ),
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                items=["hw_ungraded"],
+            ),
+        ]
+    )
+    activities = [
+        CourseActivity(name="assignment1", module="assign", cmid=101),
+    ]
+    result = await mapper.build_mapping(course_activities=activities, proposal=proposal)
+    rows = {r["activity_name"]: r for r in result["graded_activities"]}
+
+    # Manual item at parent level
+    assert "lab_manual_parent" in rows
+    assert rows["lab_manual_parent"]["item_source"] == "manual"
+    assert rows["lab_manual_parent"]["confirmed_category"] == "Labs"
+    assert rows["lab_manual_parent"]["confirmed_subcategory"] == ""
+    assert rows["lab_manual_parent"]["itemtype"] == "manual"
+
+    # Manual item in subcategory
+    assert "report_manual" in rows
+    assert rows["report_manual"]["item_source"] == "manual"
+    assert rows["report_manual"]["confirmed_category"] == "Labs"
+    assert rows["report_manual"]["confirmed_subcategory"] == "Lab Reports"
+    assert rows["report_manual"]["itemtype"] == "manual"
+
+    # Another manual item in different subcategory
+    assert "lab1_manual" in rows
+    assert rows["lab1_manual"]["item_source"] == "manual"
+    assert rows["lab1_manual"]["confirmed_category"] == "Labs"
+    assert rows["lab1_manual"]["confirmed_subcategory"] == "In-Lab Work"
+    assert rows["lab1_manual"]["itemtype"] == "manual"
+
+    # Manual item in Assignments parent
+    assert "hw_ungraded" in rows
+    assert rows["hw_ungraded"]["item_source"] == "manual"
+    assert rows["hw_ungraded"]["confirmed_category"] == "Assignments"
+    assert rows["hw_ungraded"]["confirmed_subcategory"] == ""
+    assert rows["hw_ungraded"]["itemtype"] == "manual"
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_suggests_subcategory_by_token_match():
+    mapper = ContentMapper()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            )
+        ]
+    )
+    result = await mapper.build_mapping(
+        course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=10)],
+        proposal=proposal,
+    )
+
+    row = result["graded_activities"][0]
+    assert row["suggested_category"] == "Assignments"
+    assert row["suggested_subcategory"] == "Homework"
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_subcategory_empty_when_llm_unsure():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(return_value={
+        "agent_response": {
+            "chat_response": {
+                "message": {
+                    "content": (
+                        '[{"activity_key": "gradeitem:10:0", "category": "Assignments", "subcategory": "Projects", '
+                        '"confidence": 0.55, "reasoning": "loose assignment fit", "subcategory_reasoning": "guess"}]'
+                    )
+                }
+            }
+        }
+    })
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            )
+        ]
+    )
+    result = await mapper.build_mapping(
+        course_activities=[CourseActivity(name="Weekly Journal", grade_item_id=10, itemtype="manual")],
+        proposal=proposal,
+    )
+
+    row = result["graded_activities"][0]
+    assert row["suggested_category"] == "Assignments"
+    assert row["suggested_subcategory"] == ""
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_skips_subcategory_when_parent_has_no_subcategories():
+    mapper = ContentMapper()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(name="Midterm", weight=30.0),
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[GradebookSubcategory(name="Homework", weight=25.0)],
+            ),
+        ]
+    )
+    result = await mapper.build_mapping(
+        course_activities=[CourseActivity(name="Midterm Exam", module="quiz", cmid=102)],
+        proposal=proposal,
+    )
+
+    row = next(item for item in result["graded_activities"] if item.get("moodle_cmid") == 102)
+    assert row["suggested_category"] == "Midterm"
+    assert row["suggested_subcategory"] == ""
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_skips_subcategory_when_category_uncertain():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(return_value={
+        "agent_response": {
+            "chat_response": {
+                "message": {
+                    "content": (
+                        '[{"activity_key": "gradeitem:10:0", "category": "__uncategorized__", "subcategory": "Homework", '
+                        '"confidence": 0.55, "subcategory_confidence": 0.95, "reasoning": "unclear fit", '
+                        '"subcategory_reasoning": "should be ignored"}]'
+                    )
+                }
+            }
+        }
+    })
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[GradebookSubcategory(name="Homework", weight=25.0)],
+            )
+        ]
+    )
+    result = await mapper.build_mapping(
+        course_activities=[CourseActivity(name="Weekly Journal", grade_item_id=10, itemtype="manual")],
+        proposal=proposal,
+    )
+
+    row = result["graded_activities"][0]
+    assert row["suggested_category"] == ContentMapper.UNCATEGORIZED
+    assert row["suggested_subcategory"] == ""
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_rejects_llm_subcategory_from_wrong_parent():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(return_value={
+        "agent_response": {
+            "chat_response": {
+                "message": {
+                    "content": (
+                        '[{"activity_key": "gradeitem:10:0", "category": "Assignments", "subcategory": "Lab Reports", '
+                        '"confidence": 0.92, "subcategory_confidence": 0.9, "reasoning": "assignment fit", '
+                        '"subcategory_reasoning": "wrong parent sub"}]'
+                    )
+                }
+            }
+        }
+    })
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            ),
+            GradebookCategory(
+                name="Labs",
+                weight=15.0,
+                subcategories=[GradebookSubcategory(name="Lab Reports", weight=15.0)],
+            ),
+        ]
+    )
+    result = await mapper.build_mapping(
+        course_activities=[CourseActivity(name="Weekly Journal", grade_item_id=10, itemtype="manual")],
+        proposal=proposal,
+    )
+
+    row = result["graded_activities"][0]
+    assert row["suggested_category"] == "Assignments"
+    assert row["suggested_subcategory"] == ""
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_skips_subcategory_when_no_token_match_under_confident_parent():
+    mapper = ContentMapper()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            )
+        ]
+    )
+    result = await mapper.build_mapping(
+        course_activities=[CourseActivity(name="Weekly Reflection", module="assign", cmid=10)],
+        proposal=proposal,
+    )
+
+    row = result["graded_activities"][0]
+    assert row["suggested_category"] == "Assignments"
+    assert row["suggested_subcategory"] == ""
+
+
+@pytest.mark.asyncio
+async def test_content_mapper_llm_assigns_subcategory_when_confident():
+    sdk = MagicMock()
+    sdk.agents = MagicMock()
+    sdk.agents.azure = MagicMock()
+    sdk.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+    sdk.agents.azure.chat = AsyncMock(return_value={
+        "agent_response": {
+            "chat_response": {
+                "message": {
+                    "content": (
+                        '[{"activity_key": "gradeitem:11:0", "category": "Assignments", "subcategory": "Projects", '
+                        '"confidence": 0.92, "subcategory_confidence": 0.9, "reasoning": "project keyword", '
+                        '"subcategory_reasoning": "name match"}]'
+                    )
+                }
+            }
+        }
+    })
+
+    mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[
+                    GradebookSubcategory(name="Homework", weight=10.0),
+                    GradebookSubcategory(name="Projects", weight=15.0),
+                ],
+            )
+        ]
+    )
+    result = await mapper.build_mapping(
+        course_activities=[CourseActivity(name="Capstone Project Draft", grade_item_id=11, itemtype="manual")],
+        proposal=proposal,
+    )
+
+    row = result["graded_activities"][0]
+    assert row["suggested_category"] == "Assignments"
+    assert row["suggested_subcategory"] == "Projects"
+
+
+def test_content_mapper_validate_mapping_detects_stale_subcategory():
+    mapper = ContentMapper()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=25.0,
+                subcategories=[GradebookSubcategory(name="Homework", weight=25.0)],
+            )
+        ]
+    )
+    mapping_rows = [
+        {
+            "moodle_cmid": 10,
+            "activity_name": "Homework 1",
+            "suggested_category": "Assignments",
+            "confirmed_category": "Assignments",
+            "suggested_subcategory": "Projects",
+            "confirmed_subcategory": "Projects",
+        }
+    ]
+
+    issues = mapper.validate_mapping(mapping_rows, proposal)
+
+    assert len(issues) == 1
+    assert issues[0]["missing_subcategory"] == "Projects"
+
+
 def test_formula_error_reply_deduplicates_unresolved_warning_lines():
     cm = ConversationManager()
     proposal = GradebookProposal(
@@ -3220,8 +5212,9 @@ def test_format_categories_includes_formula_setting():
     ])
 
     text = cm._format_categories(proposal)
-    assert "formula:" in text
-    assert "([[midterm]]*0.4)+([[final]]*0.6)" in text
+    assert "📐" in text
+    assert "formula:" not in text.lower()
+    assert "([[midterm]]*0.4)+([[final]]*0.6)" not in text
 
 
 def test_conversation_help_request_returns_supported_instruction_list():
@@ -3245,6 +5238,143 @@ def test_conversation_help_request_returns_supported_instruction_list():
     assert "show activities and grade items" in reply.lower()
     assert "show all activities" in reply.lower()
     assert "show all grade items" in reply.lower()
+    assert "subcategory edits" in reply.lower()
+    assert "drop projects" in reply.lower()
+    assert "rename projects to project" in reply.lower()
+    assert "add subcategory reflection" in reply.lower()
+    assert "grouping bucket" in reply.lower()
+    assert "concrete scored row" in reply.lower()
+    assert "moodle activities cannot be removed" in reply.lower()
+    assert "show proposal as markdown" in reply.lower()
+    assert "show mapping sync status" in reply.lower()
+    assert "show mapping rows before finalize" in reply.lower()
+    assert "manual grade items" in reply.lower()
+    assert "moodle activities" in reply.lower()
+    assert "set homework 1 to not graded" in reply.lower()
+    assert "don't grade" not in reply.lower()
+
+
+def test_conversation_proposal_view_commands_return_distinct_outputs():
+    cm = ConversationManager()
+    proposal = GradebookProposal(
+        categories=[
+            GradebookCategory(
+                name="Assignments",
+                weight=60.0,
+                items=["HW 1"],
+                subcategories=[GradebookSubcategory(name="Homework", weight=60.0, items=["HW 2"])],
+            ),
+            GradebookCategory(name="Final Exam", weight=40.0, items=["Final"]),
+        ],
+        notes=["Effect: Added manual grade item 'Final' to Final Exam"],
+    )
+    session = GradebookSessionRecord(
+        session_id="s_views",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="REFINEMENT",
+        proposal=proposal,
+        course_activities=[CourseActivity(name="HW 1", module="assign")],
+        content_mapping={
+            "graded_activities": [
+                {
+                    "moodle_cmid": 101,
+                    "activity_name": "HW 1",
+                    "confirmed_category": "Assignments",
+                    "confirmed_subcategory": "Homework",
+                    "itemtype": "mod",
+                },
+                {
+                    "moodle_cmid": None,
+                    "activity_name": "Final",
+                    "confirmed_category": "Final Exam",
+                    "itemtype": "manual",
+                    "grade_item_id": 501,
+                },
+            ],
+            "validation_errors": [],
+        },
+    )
+
+    full_reply = cm.make_reply(session, proposal, prompt="show proposal")
+    markdown_reply = cm.make_reply(session, proposal, prompt="show proposal as markdown")
+    listing_reply = cm.make_reply(session, proposal, prompt="show activities and grade items")
+    sync_reply = cm.make_reply(session, proposal, prompt="show mapping sync status")
+    rows_reply = cm.make_reply(session, proposal, prompt="show mapping rows before finalize")
+
+    assert "Updated proposal:" in full_reply or "Current proposal:" in full_reply
+    assert "**Grade Aggregation Method**" in full_reply
+    assert "**Effects:**" in full_reply
+
+    assert "**Proposal hierarchy:**" in markdown_reply
+    assert "Grade Aggregation Method" not in markdown_reply
+    assert "activity and grade-item summary" in listing_reply.lower()
+
+    assert "mapping sync status" in sync_reply.lower()
+    assert "Mapped rows:" in sync_reply
+    assert "cmid 101" not in sync_reply
+
+    assert "**Mapping rows**" in rows_reply
+    assert "cmid 101" in rows_reply
+    assert "Assignments > Homework" in rows_reply
+    assert "Grade Aggregation Method" not in rows_reply
+
+    assert len({full_reply, markdown_reply, listing_reply, sync_reply, rows_reply}) == 5
+
+
+def test_conversation_mapping_prompt_shows_mapping_rows_in_accepted_phase():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s2b",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="ACCEPTED",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+        content_mapping={
+            "graded_activities": [
+                {
+                    "moodle_cmid": 55,
+                    "activity_name": "Quiz 1",
+                    "confirmed_category": "Assignments",
+                }
+            ]
+        },
+    )
+
+    reply = cm.make_reply(session, session.proposal, prompt="show mapping rows before finalize")
+
+    assert "**Mapping rows**" in reply
+    assert "Quiz 1" in reply
+    assert "cmid 55" in reply
+    assert "proposal accepted" not in reply.lower()
+
+
+def test_conversation_help_and_formula_text_avoids_markdown_backticks():
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s_help_style",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="PROPOSAL",
+        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
+    )
+
+    help_reply = cm.make_reply(session, session.proposal, prompt="help")
+    formula_reply = cm.make_reply(session, session.proposal, prompt="what excel formula we support")
+    unsupported_reply = cm.make_reply(session, session.proposal, prompt="dada")
+
+    assert "`" not in unsupported_reply
+
+    assert "`[[item_id]]`" in help_reply
+    assert "`=average([[hw1]],[[hw2]],[[project]])`" in help_reply
+    assert "- Show proposal as markdown" in help_reply
+    assert "- Show proposal —" in help_reply
+    assert "- 'Show proposal as markdown'" not in help_reply
+    assert "`=average([[hw1]],[[hw2]],[[hw3]])`" in formula_reply
+    assert "`+` (addition)" in formula_reply
 
 
 def test_conversation_lists_grade_items_and_activities_together():
@@ -3305,6 +5435,64 @@ def test_conversation_show_grade_items_lists_all_items_by_default():
     assert "moodle activities" not in reply.lower()
     assert "a6 [activity]" in reply.lower()
     assert "... and" not in reply.lower()
+
+
+def test_format_categories_treats_post_finalize_manual_items_as_grade_items():
+    """Manual items synced into course_activities after finalize must not be labeled activity."""
+    cm = ConversationManager()
+    session = GradebookSessionRecord(
+        session_id="s1-post-finalize",
+        course_id="c1",
+        professor_id="p1",
+        bot_name="b1",
+        phase="COMPLETED",
+        course_activities=[
+            CourseActivity(name="quiz 1", module="quiz", cmid=101, itemtype="mod"),
+            CourseActivity(name="final", itemtype="manual", grade_item_id=501),
+            CourseActivity(name="Labs Manual Item", itemtype="manual", grade_item_id=502),
+            CourseActivity(name="Midterm Manual Item", itemtype="manual", grade_item_id=503),
+        ],
+        content_mapping={
+            "graded_activities": [
+                {
+                    "activity_name": "final",
+                    "confirmed_category": "Final Exam",
+                    "itemtype": "manual",
+                    "item_source": "proposal_manual",
+                },
+                {
+                    "activity_name": "Labs Manual Item",
+                    "confirmed_category": "Labs",
+                    "itemtype": "manual",
+                    "item_source": "manual",
+                },
+                {
+                    "activity_name": "Midterm Manual Item",
+                    "confirmed_category": "Midterm",
+                    "itemtype": "manual",
+                    "item_source": "manual",
+                },
+            ]
+        },
+        proposal=GradebookProposal(
+            categories=[
+                GradebookCategory(name="Labs", weight=15.0, items=["Labs Manual Item"]),
+                GradebookCategory(name="Midterm", weight=30.0, items=["Midterm Manual Item"]),
+                GradebookCategory(name="Final Exam", weight=30.0, items=["final"]),
+                GradebookCategory(name="Quizzes", weight=15.0, items=["quiz 1"]),
+            ],
+        ),
+    )
+
+    tree = cm._format_categories(session.proposal, session)
+    reply = cm.make_reply(session, session.proposal, prompt="show all activities")
+
+    assert "[grade item] [Final Exam] final" in tree
+    assert "[grade item] [Labs] Labs Manual Item" in tree
+    assert "[grade item] [Midterm] Midterm Manual Item" in tree
+    assert "[activity] [Quizzes] quiz 1" in tree
+    assert "final" not in reply.lower().split("moodle activities:")[-1].split("proposal grade items")[0]
+    assert "labs manual item" not in reply.lower().split("moodle activities:")[-1].split("proposal grade items")[0]
 
 
 def test_conversation_listing_shows_show_all_hints_when_truncated():
@@ -3380,23 +5568,6 @@ def test_conversation_offtopic_prompt_returns_unsupported_warning_in_accepted_ph
     assert "manual grade item" in reply.lower()
 
 
-def test_conversation_mapping_prompt_keeps_accepted_phase_guidance():
-    cm = ConversationManager()
-    session = GradebookSessionRecord(
-        session_id="s2b",
-        course_id="c1",
-        professor_id="p1",
-        bot_name="b1",
-        phase="ACCEPTED",
-        proposal=GradebookProposal(categories=[GradebookCategory(name="Assignments", weight=100.0)]),
-    )
-
-    reply = cm.make_reply(session, session.proposal, prompt="show mapping rows before finalize")
-
-    assert "proposal accepted" in reply.lower()
-    assert "mapping" in reply.lower()
-
-
 def test_conversation_offtopic_prompt_returns_unsupported_warning_in_refinement():
     cm = ConversationManager()
     session = GradebookSessionRecord(
@@ -3411,7 +5582,7 @@ def test_conversation_offtopic_prompt_returns_unsupported_warning_in_refinement(
     reply = cm.make_reply(session, session.proposal, prompt="make me a pizza")
 
     assert "couldn't understand" in reply.lower()
-    assert "type 'help'" in reply.lower()
+    assert "type **help**" in reply.lower()
 
 
 def test_conversation_formula_only_prompt_is_not_rejected_in_refinement():
@@ -4371,7 +6542,7 @@ async def test_content_mapper_retries_with_new_chat_id_on_chat_ownership_conflic
     mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
     result = await mapper._llm_assignments(
         course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=301)],
-        category_names=["Assignments"],
+        proposal=_mapper_proposal_with_categories("Assignments"),
     )
 
     assert result[301]["category"] == "Assignments"
@@ -4402,7 +6573,7 @@ async def test_content_mapper_keeps_chat_id_on_all_retries_after_ownership_confl
     mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
     result = await mapper._llm_assignments(
         course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=301)],
-        category_names=["Assignments"],
+        proposal=_mapper_proposal_with_categories("Assignments"),
     )
 
     assert result[301]["category"] == "Assignments"
@@ -4435,7 +6606,7 @@ async def test_content_mapper_reuses_preferred_chat_id_on_first_attempt():
     mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
     result, resolved_chat_id = await mapper._llm_assignments(
         course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=301)],
-        category_names=["Assignments"],
+        proposal=_mapper_proposal_with_categories("Assignments"),
         preferred_chat_id="gradebook-mapper-session123",
         return_chat_id=True,
     )
@@ -4472,7 +6643,7 @@ async def test_content_mapper_rotates_chat_id_after_ownership_conflict_when_pref
     mapper = ContentMapper(criadex=sdk, llm_model_id="gpt-3.5-turbo")
     result, resolved_chat_id = await mapper._llm_assignments(
         course_activities=[CourseActivity(name="Homework 1", module="assign", cmid=301)],
-        category_names=["Assignments"],
+        proposal=_mapper_proposal_with_categories("Assignments"),
         preferred_chat_id="gradebook-mapper-session123",
         return_chat_id=True,
     )

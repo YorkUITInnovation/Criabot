@@ -58,6 +58,77 @@ def validate_proposal_weights(proposal: GradebookProposal) -> List[Dict[str, obj
 
 
 NOT_GRADED_MAPPING_CATEGORIES = frozenset({"__not_graded__", "not graded", ""})
+NOT_GRADED_CATEGORY = "__not_graded__"
+
+
+def _find_subcategory_in_category(
+    category: GradebookCategory,
+    subcategory_name: str,
+) -> GradebookSubcategory | None:
+    """Return a subcategory on *category* whose name matches *subcategory_name*."""
+    key = str(subcategory_name or "").strip().lower()
+    if not key:
+        return None
+    for sub in (category.subcategories or []):
+        if str(sub.name).strip().lower() == key:
+            return sub
+    return None
+
+
+def _find_item_location_in_category(
+    category: GradebookCategory,
+    item_key: str,
+) -> Tuple[str, GradebookSubcategory | None]:
+    """Return ('parent', None), ('sub', sub), or ('none', None) for a case-insensitive item key."""
+    key = str(item_key or "").strip().lower()
+    if not key:
+        return "none", None
+    for item in (category.items or []):
+        if str(item).strip().lower() == key:
+            return "parent", None
+    for sub in (category.subcategories or []):
+        for item in (sub.items or []):
+            if str(item).strip().lower() == key:
+                return "sub", sub
+    return "none", None
+
+
+def _remove_all_item_instances_from_category_tree(
+    category: GradebookCategory,
+    item_key: str,
+) -> str | None:
+    """Remove every parent/subcategory copy of *item_key*; return the first canonical name removed."""
+    key = str(item_key or "").strip().lower()
+    if not key:
+        return None
+
+    canonical: str | None = None
+
+    if category.items:
+        kept_parent: List[str] = []
+        for item in category.items:
+            if str(item).strip().lower() == key:
+                canonical = canonical or str(item).strip()
+                if category.item_weights:
+                    category.item_weights.pop(item, None)
+            else:
+                kept_parent.append(item)
+        category.items = kept_parent
+
+    for sub in (category.subcategories or []):
+        if not sub.items:
+            continue
+        kept_sub: List[str] = []
+        for item in sub.items:
+            if str(item).strip().lower() == key:
+                canonical = canonical or str(item).strip()
+                if sub.item_weights:
+                    sub.item_weights.pop(item, None)
+            else:
+                kept_sub.append(item)
+        sub.items = kept_sub
+
+    return canonical
 
 
 def sync_proposal_items_from_mapping(
@@ -110,12 +181,112 @@ def sync_proposal_items_from_mapping(
         if not item_name:
             continue
 
+        subcategory_name = str(
+            row.get("subcategory")
+            or row.get("confirmed_subcategory")
+            or row.get("suggested_subcategory")
+            or ""
+        ).strip()
+        item_key = item_name.strip().lower()
+
+        location, current_sub = _find_item_location_in_category(target, item_key)
+        target_sub = (
+            _find_subcategory_in_category(target, subcategory_name)
+            if subcategory_name
+            else None
+        )
+
+        if target_sub is not None:
+            if location == "sub" and current_sub is target_sub:
+                stale_in_parent = any(
+                    str(item).strip().lower() == item_key
+                    for item in (target.items or [])
+                )
+                if stale_in_parent:
+                    target.items = [
+                        item
+                        for item in (target.items or [])
+                        if str(item).strip().lower() != item_key
+                    ]
+                    changed = True
+                continue
+        elif location != "none":
+            continue
+
+        canonical_name = _remove_all_item_instances_from_category_tree(target, item_key)
+        place_name = canonical_name or item_name
+
+        if target_sub is not None:
+            if target_sub.items is None:
+                target_sub.items = []
+            existing_sub = {str(i).strip().lower() for i in target_sub.items}
+            if item_key not in existing_sub:
+                target_sub.items.append(place_name)
+            changed = True
+            continue
+
         if target.items is None:
             target.items = []
 
         existing = {str(item).strip().lower() for item in target.items}
-        if item_name.strip().lower() not in existing:
-            target.items.append(item_name)
+        if item_key not in existing:
+            target.items.append(place_name)
+        changed = True
+
+    return changed
+
+
+def sync_proposal_not_graded_from_confirmed_mapping(
+    proposal: GradebookProposal | None,
+    confirmed_mapping: List[dict] | None,
+    course_activities: List[CourseActivity] | None = None,
+) -> bool:
+    """Sync proposal.not_graded_items from mapping UI rows marked Not graded."""
+    if proposal is None or not confirmed_mapping:
+        return False
+
+    generator = ProposalGenerator()
+    changed = False
+    tracked_not_graded = {
+        str(name).strip().lower()
+        for name in (proposal.not_graded_items or [])
+        if str(name).strip()
+    }
+
+    for row in confirmed_mapping:
+        if not isinstance(row, dict):
+            continue
+
+        category_name = str(row.get("category") or row.get("confirmed_category") or "").strip()
+        category_key = category_name.lower()
+        item_name = str(row.get("activity_name") or row.get("grade_item_name") or "").strip()
+        if not item_name:
+            continue
+
+        name_key = item_name.lower()
+        is_not_graded_row = (
+            category_key in NOT_GRADED_MAPPING_CATEGORIES
+            or category_key == NOT_GRADED_CATEGORY
+            or bool(row.get("not_graded"))
+        )
+
+        if is_not_graded_row:
+            if not generator._is_moodle_activity_item(item_name, course_activities):
+                continue
+            for category in proposal.categories or []:
+                if generator._remove_item_from_category_tree(category, item_name):
+                    changed = True
+            if name_key not in tracked_not_graded:
+                if proposal.not_graded_items is None:
+                    proposal.not_graded_items = []
+                proposal.not_graded_items.append(item_name)
+                tracked_not_graded.add(name_key)
+                changed = True
+            continue
+
+        if name_key in tracked_not_graded:
+            generator._remove_from_not_graded_items(proposal, item_name)
+            tracked_not_graded.discard(name_key)
             changed = True
 
     return changed
@@ -243,6 +414,678 @@ def sync_mapping_from_proposal_manual_items(
     return changed
 
 
+def _collapse_subcategory_label_for_mapping(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (label or "").strip().lower())
+
+
+def subcategory_labels_match_for_mapping(candidate: str, query: str) -> bool:
+    """Fuzzy subcategory label match used when syncing content mapping after renames."""
+    candidate_norm = re.sub(r"\s+", " ", (candidate or "").strip().lower())
+    query_norm = re.sub(r"\s+", " ", (query or "").strip().lower())
+    if not candidate_norm or not query_norm:
+        return False
+    if candidate_norm == query_norm:
+        return True
+
+    candidate_collapsed = _collapse_subcategory_label_for_mapping(candidate)
+    query_collapsed = _collapse_subcategory_label_for_mapping(query)
+    if candidate_collapsed and candidate_collapsed == query_collapsed:
+        return True
+
+    def _variants(name: str) -> set[str]:
+        variants = {name}
+        if name.endswith("ies") and len(name) > 3:
+            variants.add(name[:-3] + "y")
+        if name.endswith("s") and len(name) > 1:
+            variants.add(name[:-1])
+        if name.endswith("y") and len(name) > 1:
+            variants.add(name[:-1] + "ies")
+        return variants
+
+    if _variants(candidate_norm) & _variants(query_norm):
+        return True
+    if difflib.SequenceMatcher(None, candidate_norm, query_norm).ratio() >= 0.84:
+        return True
+    return False
+
+
+def _category_item_names_union(category: GradebookCategory) -> set[str]:
+    names = {str(item).strip().lower() for item in (category.items or []) if str(item).strip()}
+    for sub in category.subcategories or []:
+        names.update(
+            str(item).strip().lower()
+            for item in (sub.items or [])
+            if str(item).strip()
+        )
+    return names
+
+
+def _proposal_tracked_item_names(proposal: GradebookProposal | None) -> set[str]:
+    """All grade items tracked in the proposal tree plus explicit not-graded activities."""
+    if proposal is None:
+        return set()
+    names: set[str] = set()
+    for category in proposal.categories or []:
+        names.update(_category_item_names_union(category))
+    names.update(
+        str(item).strip().lower()
+        for item in (proposal.not_graded_items or [])
+        if str(item).strip()
+    )
+    return names
+
+
+def _set_row_not_graded(row: dict) -> None:
+    row["suggested_category"] = NOT_GRADED_CATEGORY
+    row["confirmed_category"] = NOT_GRADED_CATEGORY
+    _set_row_subcategory(row, "")
+    row["not_graded"] = True
+
+
+def snapshot_subcategories(proposal: GradebookProposal | None) -> Dict[str, List[str]]:
+    out: Dict[str, List[str]] = {}
+    if proposal is None:
+        return out
+    for category in proposal.categories or []:
+        parent = str(category.name or "").strip()
+        if not parent:
+            continue
+        out[parent.lower()] = [
+            str(sub.name).strip()
+            for sub in (category.subcategories or [])
+            if str(sub.name).strip()
+        ]
+    return out
+
+
+def infer_subcategory_renames(
+    before: Dict[str, List[str]],
+    after: Dict[str, List[str]],
+) -> List[Tuple[str, str, str]]:
+    """Infer subcategory renames as (parent_key_lower, old_name, new_name)."""
+    renames: List[Tuple[str, str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+
+    for parent_key in set(before.keys()) | set(after.keys()):
+        old_names = before.get(parent_key, [])
+        new_names = after.get(parent_key, [])
+        old_by_lower = {name.lower(): name for name in old_names}
+        new_by_lower = {name.lower(): name for name in new_names}
+        removed = [old_by_lower[key] for key in old_by_lower if key not in new_by_lower]
+        added = [new_by_lower[key] for key in new_by_lower if key not in old_by_lower]
+        if not removed or not added:
+            continue
+
+        matched_added: set[str] = set()
+        for old_name in removed:
+            for new_name in added:
+                if new_name in matched_added:
+                    continue
+                if (
+                    len(removed) == 1
+                    and len(added) == 1
+                ) or subcategory_labels_match_for_mapping(old_name, new_name):
+                    pair_key = (parent_key, old_name.lower())
+                    if pair_key in seen:
+                        continue
+                    renames.append((parent_key, old_name, new_name))
+                    seen.add(pair_key)
+                    matched_added.add(new_name)
+                    break
+
+    return renames
+
+
+def infer_subcategory_removals(
+    before: Dict[str, List[str]],
+    after: Dict[str, List[str]],
+    renames: List[Tuple[str, str, str]] | None = None,
+) -> List[Tuple[str, str]]:
+    """Infer removed subcategories as (parent_key_lower, removed_name)."""
+    renamed_old = {
+        (parent_key, old_name.strip().lower())
+        for parent_key, old_name, _new_name in (renames or [])
+    }
+    removals: List[Tuple[str, str]] = []
+
+    for parent_key in set(before.keys()) | set(after.keys()):
+        old_names = before.get(parent_key, [])
+        new_names = after.get(parent_key, [])
+        old_by_lower = {name.lower(): name for name in old_names}
+        new_by_lower = {name.lower(): name for name in new_names}
+        for key, old_name in old_by_lower.items():
+            if key in new_by_lower:
+                continue
+            if (parent_key, key) in renamed_old:
+                continue
+            if any(subcategory_labels_match_for_mapping(old_name, added) for added in new_names):
+                continue
+            removals.append((parent_key, old_name))
+
+    return removals
+
+
+def is_subcategory_only_proposal_change(
+    before: GradebookProposal | None,
+    after: GradebookProposal | None,
+) -> bool:
+    """True when only subcategory labels/weights changed (top-level categories stable)."""
+    if before is None or after is None:
+        return False
+    if snapshot_subcategories(before) == snapshot_subcategories(after):
+        return False
+    return not should_invalidate_content_mapping(before, after)
+
+
+def should_invalidate_content_mapping(
+    before: GradebookProposal | None,
+    after: GradebookProposal | None,
+) -> bool:
+    """True when content mapping should be rebuilt (category add/remove or grade-item structure change)."""
+    if before is None or after is None:
+        return True
+
+    before_by = {
+        str(category.name).strip().lower(): category
+        for category in (before.categories or [])
+        if str(category.name).strip()
+    }
+    after_by = {
+        str(category.name).strip().lower(): category
+        for category in (after.categories or [])
+        if str(category.name).strip()
+    }
+    if set(before_by) != set(after_by):
+        return True
+
+    if _proposal_tracked_item_names(before) != _proposal_tracked_item_names(after):
+        return True
+
+    for key in before_by:
+        before_cat = before_by[key]
+        after_cat = after_by[key]
+        if (before_cat.calculation_formula or None) != (after_cat.calculation_formula or None):
+            return True
+        if dict(before_cat.item_weights or {}) != dict(after_cat.item_weights or {}):
+            return True
+
+    return False
+
+
+def _row_subcategory_label(row: dict) -> str:
+    return str(
+        row.get("confirmed_subcategory")
+        or row.get("suggested_subcategory")
+        or row.get("subcategory")
+        or ""
+    ).strip()
+
+
+def _set_row_subcategory(row: dict, subcategory_name: str) -> None:
+    value = str(subcategory_name or "").strip()
+    row["suggested_subcategory"] = value
+    row["confirmed_subcategory"] = value
+    row["subcategory"] = value
+
+
+def sync_content_mapping_with_proposal_subcategory_changes(
+    content_mapping: dict,
+    proposal: GradebookProposal | None,
+    renames: List[Tuple[str, str, str]] | None = None,
+    removals: List[Tuple[str, str]] | None = None,
+) -> bool:
+    """Update mapping rows when subcategories are renamed or removed."""
+    if proposal is None or not isinstance(content_mapping, dict):
+        return False
+
+    graded_activities = content_mapping.get("graded_activities") or []
+    if not graded_activities:
+        return False
+
+    rename_lookup: Dict[Tuple[str, str], str] = {}
+    for parent_key, old_name, new_name in (renames or []):
+        rename_lookup[(parent_key, old_name.strip().lower())] = new_name
+
+    removal_lookup = {
+        (parent_key, removed.strip().lower())
+        for parent_key, removed in (removals or [])
+    }
+
+    valid_subs_by_parent: Dict[str, Dict[str, str]] = {}
+    for category in proposal.categories or []:
+        parent_key = str(category.name or "").strip().lower()
+        if not parent_key:
+            continue
+        valid_subs_by_parent[parent_key] = {
+            str(sub.name).strip().lower(): str(sub.name).strip()
+            for sub in (category.subcategories or [])
+            if str(sub.name).strip()
+        }
+
+    changed = False
+    for row in graded_activities:
+        if not isinstance(row, dict):
+            continue
+
+        parent_name = str(row.get("confirmed_category") or row.get("suggested_category") or "").strip()
+        if not parent_name:
+            continue
+        parent_key = parent_name.lower()
+        sub_name = _row_subcategory_label(row)
+        if not sub_name:
+            continue
+
+        sub_key = sub_name.lower()
+        new_sub_name: str | None = None
+
+        direct = rename_lookup.get((parent_key, sub_key))
+        if direct:
+            new_sub_name = direct
+        else:
+            for (rename_parent, old_key), renamed in rename_lookup.items():
+                if rename_parent == parent_key and subcategory_labels_match_for_mapping(sub_name, old_key):
+                    new_sub_name = renamed
+                    break
+
+        if new_sub_name is not None:
+            _set_row_subcategory(row, new_sub_name)
+            changed = True
+            continue
+
+        if (parent_key, sub_key) in removal_lookup or any(
+            parent == parent_key and subcategory_labels_match_for_mapping(sub_name, removed)
+            for parent, removed in removal_lookup
+        ):
+            _set_row_subcategory(row, "")
+            changed = True
+            continue
+
+        valid_subs = valid_subs_by_parent.get(parent_key, {})
+        if sub_key not in valid_subs:
+            resolved = None
+            for candidate_key, candidate_name in valid_subs.items():
+                if subcategory_labels_match_for_mapping(sub_name, candidate_key):
+                    resolved = candidate_name
+                    break
+            if resolved:
+                _set_row_subcategory(row, resolved)
+                changed = True
+            else:
+                _set_row_subcategory(row, "")
+                changed = True
+
+    if changed:
+        content_mapping["graded_activities"] = graded_activities
+
+    return changed
+
+
+def _valid_subcategories_by_parent(proposal: GradebookProposal | None) -> Dict[str, Dict[str, str]]:
+    valid_subs_by_parent: Dict[str, Dict[str, str]] = {}
+    for category in (proposal.categories or []) if proposal else []:
+        parent_key = str(category.name or "").strip().lower()
+        if not parent_key:
+            continue
+        valid_subs_by_parent[parent_key] = {
+            str(sub.name).strip().lower(): str(sub.name).strip()
+            for sub in (category.subcategories or [])
+            if str(sub.name).strip()
+        }
+    return valid_subs_by_parent
+
+
+def _canonicalize_subcategory_for_parent(
+    subcategory: str,
+    parent_name: str,
+    valid_subs_by_parent: Dict[str, Dict[str, str]],
+) -> str:
+    sub_name = str(subcategory or "").strip()
+    if not sub_name:
+        return ""
+    parent_key = str(parent_name or "").strip().lower()
+    valid_subs = valid_subs_by_parent.get(parent_key, {})
+    sub_key = sub_name.lower()
+    if sub_key in valid_subs:
+        return valid_subs[sub_key]
+    for candidate_key, candidate_name in valid_subs.items():
+        if subcategory_labels_match_for_mapping(sub_name, candidate_key):
+            return candidate_name
+    return ""
+
+
+def _normalize_mapping_cmid(value) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _match_confirmed_row_to_mapping_item(
+    confirmed: dict,
+    graded_activities: List[dict],
+    activity_by_cmid: Dict[int, dict],
+    activity_by_grade_item_id: Dict[int, dict],
+) -> dict | None:
+    confirmed_grade_item_id = confirmed.get("grade_item_id")
+    if confirmed_grade_item_id is not None and str(confirmed_grade_item_id).strip() != "":
+        try:
+            existing = activity_by_grade_item_id.get(int(confirmed_grade_item_id))
+            if existing is not None:
+                return existing
+        except (TypeError, ValueError):
+            pass
+
+    confirmed_cmid = _normalize_mapping_cmid(confirmed.get("moodle_cmid"))
+    if confirmed_cmid is not None:
+        existing = activity_by_cmid.get(confirmed_cmid)
+        if existing is not None:
+            return existing
+
+    confirmed_name = str(
+        confirmed.get("activity_name") or confirmed.get("grade_item_name") or ""
+    ).strip().lower()
+    if confirmed_name:
+        for item in graded_activities:
+            if str(item.get("activity_name") or "").strip().lower() == confirmed_name:
+                return item
+    return None
+
+
+def sync_confirmed_mapping_into_content_mapping(
+    content_mapping: dict,
+    confirmed_mapping: List[dict],
+    proposal: GradebookProposal | None,
+) -> bool:
+    """Merge UI-confirmed mapping rows (incl. subcategory) into session content_mapping."""
+    if not isinstance(content_mapping, dict) or not confirmed_mapping:
+        return False
+
+    graded_activities = list(content_mapping.get("graded_activities") or [])
+    if not graded_activities:
+        return False
+
+    activity_by_cmid = {}
+    for item in graded_activities:
+        cmid = _normalize_mapping_cmid(item.get("moodle_cmid"))
+        if cmid is not None:
+            activity_by_cmid[cmid] = item
+    activity_by_grade_item_id = {
+        int(item.get("grade_item_id")): item
+        for item in graded_activities
+        if item.get("grade_item_id") is not None
+        and str(item.get("grade_item_id")).strip() != ""
+    }
+    valid_subs_by_parent = _valid_subcategories_by_parent(proposal)
+    changed = False
+
+    for confirmed in confirmed_mapping:
+        if not isinstance(confirmed, dict):
+            continue
+        existing = _match_confirmed_row_to_mapping_item(
+            confirmed,
+            graded_activities,
+            activity_by_cmid,
+            activity_by_grade_item_id,
+        )
+        if existing is None:
+            continue
+
+        category_name = str(
+            confirmed.get("category")
+            or confirmed.get("confirmed_category")
+            or existing.get("confirmed_category")
+            or existing.get("suggested_category")
+            or ""
+        ).strip()
+        category_key = category_name.lower()
+        previous_category = str(existing.get("confirmed_category") or existing.get("suggested_category") or "")
+        previous_subcategory = _row_subcategory_label(existing)
+
+        if category_key in NOT_GRADED_MAPPING_CATEGORIES or category_key == NOT_GRADED_CATEGORY:
+            if previous_category != NOT_GRADED_CATEGORY or previous_subcategory:
+                _set_row_not_graded(existing)
+                changed = True
+            continue
+
+        raw_subcategory = str(
+            confirmed.get("subcategory")
+            or confirmed.get("confirmed_subcategory")
+            or ""
+        ).strip()
+        parent_name = str(
+            existing.get("confirmed_category") or existing.get("suggested_category") or category_name
+        ).strip()
+        canonical_sub = _canonicalize_subcategory_for_parent(
+            raw_subcategory,
+            parent_name,
+            valid_subs_by_parent,
+        ) if raw_subcategory else ""
+
+        if category_name:
+            existing["suggested_category"] = category_name
+            existing["confirmed_category"] = category_name
+        _set_row_subcategory(existing, canonical_sub)
+
+        if (
+            (category_name and previous_category != category_name)
+            or previous_subcategory != canonical_sub
+        ):
+            changed = True
+
+    if changed:
+        content_mapping["graded_activities"] = graded_activities
+    return changed
+
+
+def _find_mapping_row_by_activity_query(graded_activities: List[dict], item_query: str) -> dict | None:
+    query_lower = str(item_query or "").strip().lower()
+    if not query_lower:
+        return None
+
+    best_row: dict | None = None
+    best_score = 0.0
+    for row in graded_activities:
+        if not isinstance(row, dict):
+            continue
+        activity_name = str(row.get("activity_name") or "").strip().lower()
+        if not activity_name:
+            continue
+        if query_lower == activity_name:
+            return row
+        if query_lower in activity_name or activity_name in query_lower:
+            score = min(len(query_lower), len(activity_name)) / max(len(query_lower), len(activity_name))
+            if score > best_score:
+                best_score = score
+                best_row = row
+    return best_row if best_score >= 0.5 else None
+
+
+def _extract_scoped_parent_label(prompt: str) -> str:
+    match = re.search(
+        r"\b(?:in|under|within)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\s*(?:[.,]|$)",
+        prompt,
+        re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _resolve_subcategory_target(
+    proposal: GradebookProposal,
+    parent_name: str,
+    target_hint: str,
+) -> str:
+    parent_key = str(parent_name or "").strip().lower()
+    target_hint = str(target_hint or "").strip()
+    if not parent_key or not target_hint:
+        return ""
+
+    valid_subs = _valid_subcategories_by_parent(proposal).get(parent_key, {})
+    target_key = target_hint.lower()
+    if target_key in valid_subs:
+        return valid_subs[target_key]
+    for candidate_key, candidate_name in valid_subs.items():
+        if subcategory_labels_match_for_mapping(target_hint, candidate_key):
+            return candidate_name
+    return ""
+
+
+def sync_mapping_subcategories_from_proposal(
+    content_mapping: dict,
+    proposal: GradebookProposal,
+) -> bool:
+    """Align mapping rows with subcategory item placement in the proposal tree."""
+    if not isinstance(content_mapping, dict) or proposal is None:
+        return False
+
+    graded_activities = list(content_mapping.get("graded_activities") or [])
+    if not graded_activities:
+        return False
+
+    changed = False
+    for row in graded_activities:
+        if not isinstance(row, dict):
+            continue
+        activity_name = str(row.get("activity_name") or "").strip()
+        if not activity_name:
+            continue
+
+        matched_parent = ""
+        matched_sub = ""
+        valid_subs_by_parent = _valid_subcategories_by_parent(proposal)
+        for category in proposal.categories or []:
+            for sub in category.subcategories or []:
+                if activity_name in (sub.items or []):
+                    matched_parent = category.name
+                    matched_sub = sub.name
+                    break
+            if matched_parent:
+                break
+            if activity_name in (category.items or []):
+                matched_parent = category.name
+                # Keep mapping subcategory when the item is still listed on the parent
+                # but mapping already points at a valid child subcategory (e.g. after accept).
+                matched_sub = _canonicalize_subcategory_for_parent(
+                    _row_subcategory_label(row),
+                    category.name,
+                    valid_subs_by_parent,
+                )
+                break
+
+        if not matched_parent:
+            continue
+
+        row_parent = str(row.get("confirmed_category") or row.get("suggested_category") or "").strip()
+        row_sub = _row_subcategory_label(row)
+        if row_parent != matched_parent:
+            row["suggested_category"] = matched_parent
+            row["confirmed_category"] = matched_parent
+            changed = True
+        if row_sub != matched_sub:
+            _set_row_subcategory(row, matched_sub)
+            changed = True
+
+    if changed:
+        content_mapping["graded_activities"] = graded_activities
+    return changed
+
+
+def sync_mapping_not_graded_items(
+    content_mapping: dict,
+    proposal: GradebookProposal,
+    course_activities: List[CourseActivity] | None = None,
+) -> bool:
+    """Align mapping rows with proposal.not_graded_items and create rows when missing."""
+    if not isinstance(content_mapping, dict) or proposal is None:
+        return False
+
+    graded_activities = list(content_mapping.get("graded_activities") or [])
+    not_graded_by_key = {
+        str(name).strip().lower(): str(name).strip()
+        for name in (proposal.not_graded_items or [])
+        if str(name).strip()
+    }
+    if not not_graded_by_key and not graded_activities:
+        return False
+
+    graded_in_tree = set()
+    for category in proposal.categories or []:
+        graded_in_tree.update(_category_item_names_union(category))
+
+    changed = False
+    existing_keys: set[str] = set()
+    for row in graded_activities:
+        if not isinstance(row, dict):
+            continue
+        activity_name = str(row.get("activity_name") or row.get("grade_item_name") or "").strip()
+        if not activity_name:
+            continue
+        name_key = activity_name.lower()
+        existing_keys.add(name_key)
+
+        if name_key in graded_in_tree:
+            mapped = str(row.get("confirmed_category") or row.get("suggested_category") or "").strip()
+            if mapped == NOT_GRADED_CATEGORY:
+                row.pop("not_graded", None)
+                changed = True
+            continue
+
+        if name_key in not_graded_by_key:
+            mapped = str(row.get("confirmed_category") or row.get("suggested_category") or "").strip()
+            if mapped != NOT_GRADED_CATEGORY:
+                _set_row_not_graded(row)
+                changed = True
+
+    generator = ProposalGenerator()
+    for name_key, canonical_name in not_graded_by_key.items():
+        if name_key in graded_in_tree or name_key in existing_keys:
+            continue
+        activity = generator._match_course_activity(canonical_name, course_activities)
+        if activity is None:
+            continue
+        graded_activities.append(
+            {
+                "moodle_cmid": activity.cmid,
+                "grade_item_id": activity.grade_item_id,
+                "module_type": activity.module,
+                "itemtype": activity.itemtype or "mod",
+                "activity_name": activity.name,
+                "activity_key": f"cmid:{activity.cmid}" if activity.cmid is not None else activity.name,
+                "item_source": "activity",
+                "suggested_category": NOT_GRADED_CATEGORY,
+                "confirmed_category": NOT_GRADED_CATEGORY,
+                "suggested_subcategory": "",
+                "confirmed_subcategory": "",
+                "subcategory": "",
+                "finalized": False,
+                "confidence": 1.0,
+                "reasoning": "Marked not graded per instructor instruction.",
+                "mapping_method": "proposal_not_graded",
+                "not_graded": True,
+            }
+        )
+        changed = True
+
+    if changed:
+        content_mapping["graded_activities"] = graded_activities
+    return changed
+
+
+def apply_mapping_subcategory_operations(
+    content_mapping: dict,
+    proposal: GradebookProposal,
+    prompt: str,
+    course_activities: List[CourseActivity] | None = None,
+) -> bool:
+    """Keep mapping rows aligned after proposal item placement changes."""
+    _ = prompt
+    changed = sync_mapping_subcategories_from_proposal(content_mapping, proposal)
+    changed = sync_mapping_not_graded_items(content_mapping, proposal, course_activities) or changed
+    return changed
+
+
 class ProposalGenerator:
     DEFAULT_CATEGORIES = [
         ("Assignments", 25.0),
@@ -270,7 +1113,7 @@ class ProposalGenerator:
     }
     CATEGORY_ALIAS_PATTERNS = (
         (re.compile(r"\b(assign(?:ment)?s?|home\s*work|hw)\b", flags=re.IGNORECASE), "Assignments"),
-        (re.compile(r"\b(quiz(?:zes)?|quize(?:s)?|test(?:s)?)\b", flags=re.IGNORECASE), "Quizzes"),
+        (re.compile(r"\b(quiz(?:zes)?|quize(?:s)?)\b", flags=re.IGNORECASE), "Quizzes"),
         (re.compile(r"\b(lab(?:s)?|lap(?:s)?|laboratory)\b", flags=re.IGNORECASE), "Labs"),
         (re.compile(r"\b(mid\s*term|midterm)\b", flags=re.IGNORECASE), "Midterm"),
         (re.compile(r"\b(final(?:\s*exam)?|exam)\b", flags=re.IGNORECASE), "Final Exam"),
@@ -350,11 +1193,11 @@ class ProposalGenerator:
         return 0.0
 
     def _collect_baseline_item_names(self, node: dict) -> List[str]:
+        """Collect grade items that are direct children of this category node only."""
         names: List[str] = []
         for child in self._iter_tree_children(node):
             child_type = str(child.get("type") or "").strip().lower()
             if child_type == "category":
-                names.extend(self._collect_baseline_item_names(child))
                 continue
 
             # Skip synthetic category-total rows; only keep real gradable items.
@@ -365,7 +1208,6 @@ class ProposalGenerator:
             name = str(child.get("name") or "").strip()
             if name:
                 names.append(name)
-        # Preserve order and drop duplicates.
         return list(dict.fromkeys(names))
 
     def _extract_baseline_category_grade_max(self, node: dict) -> Optional[float]:
@@ -661,10 +1503,13 @@ class ProposalGenerator:
                 if sub_key in seen_subcategories:
                     continue
                 seen_subcategories.add(sub_key)
+                sub_agg = int(child.get("aggregation")) if child.get("aggregation") is not None else root_aggregation_method
                 subcategories.append(
                     GradebookSubcategory(
                         name=sub_name,
                         weight=self._extract_baseline_weight_percent(child, root_aggregation_method),
+                        items=self._collect_baseline_item_names(child),
+                        item_weights=self._collect_baseline_item_weights(child, sub_agg),
                         aggregation_method=int(child.get("aggregation")) if child.get("aggregation") is not None else None,
                     )
                 )
@@ -848,6 +1693,14 @@ class ProposalGenerator:
         return "category was not found" in low and "tried to" in low
 
     @staticmethod
+    def _is_subcategory_not_found_effect_note(note: str) -> bool:
+        text = str(note or "")
+        if not text.startswith("Effect:"):
+            return False
+        low = text.lower()
+        return "subcategory" in low and "was not found" in low and "tried to" in low
+
+    @staticmethod
     def _append_unique_note(proposal: GradebookProposal, note: str) -> None:
         notes = proposal.notes or []
         if note not in notes:
@@ -956,8 +1809,12 @@ class ProposalGenerator:
 
         # Strip ephemeral per-turn notes so they don't accumulate.
         updated.notes = [n for n in (updated.notes or []) if not self._is_ephemeral_note(n)]
-        # Category-not-found effects are per-turn; guard re-adds only for the current prompt.
-        updated.notes = [n for n in (updated.notes or []) if not self._is_category_not_found_effect_note(n)]
+        # Category/subcategory-not-found effects are per-turn; guard re-adds only for the current prompt.
+        updated.notes = [
+            n for n in (updated.notes or [])
+            if not self._is_category_not_found_effect_note(n)
+            and not self._is_subcategory_not_found_effect_note(n)
+        ]
 
         # Detect split context early so weight extraction skips subcategory names.
         # Support both:
@@ -965,13 +1822,27 @@ class ProposalGenerator:
         # - "add subcategories: ..."
         is_split_prompt = bool(re.search(r"\b(?:split|divide)\b.+\binto\b|\badd\s+subcategories\b", prompt_lower))
 
+        # Subcategory rename before item rename so "rename Projects to Project" targets splits.
+        renamed_subcategory_sources = self._apply_subcategory_renames(updated, prompt)
+
         # Apply explicit grade-item remove/rename intents before category removal
         # so phrases like "remove fina grade item" do not remove a whole category.
-        self._apply_item_remove_rename(updated, prompt)
+        self._apply_item_remove_rename(
+            updated,
+            prompt,
+            renamed_subcategory_sources=renamed_subcategory_sources,
+            course_activities=course_activities,
+        )
+        self._apply_not_graded_operations(updated, prompt, course_activities=course_activities)
 
         self._apply_removals(updated, prompt)
 
-        weights = self._parse_weight_assignments(updated, prompt, skip_split_pieces=is_split_prompt)
+        prompt_for_category_weights, subcategory_weight_intents = self._extract_subcategory_weight_intents(prompt)
+        weights = self._parse_weight_assignments(
+            updated,
+            prompt_for_category_weights,
+            skip_split_pieces=is_split_prompt,
+        )
 
         # Creation-style prompts that provide a full category set should replace categories,
         # not mutate previous defaults in-place.
@@ -1006,13 +1877,9 @@ class ProposalGenerator:
         if is_split_prompt:
             self._apply_split_request(updated, prompt)
 
-        self._apply_subcategory_weight_updates(updated, prompt)
-
-        self._post_update_checks(updated, prompt)
-        if is_split_prompt:
-            self._apply_split_request(updated, prompt)
-
-        self._apply_subcategory_weight_updates(updated, prompt)
+        self._apply_subcategory_additions(updated, prompt)
+        self._apply_subcategory_weight_intents(updated, subcategory_weight_intents)
+        self._apply_subcategory_weight_updates(updated, prompt_for_category_weights)
         self._apply_item_additions(updated, prompt)
         self._apply_item_operations(updated, prompt)
 
@@ -1502,16 +2369,24 @@ class ProposalGenerator:
                 cat.hidden = True
                 self._append_effect_note(proposal, f"{cat.name} hidden from students")
 
-        for m in re.finditer(
-            r"\b(?:show|unhide|reveal)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?:\s+category)?(?:\b|$)",
-            prompt_lower,
-        ):
-            cat_hint = m.group(1).strip()
-            targets = self._resolve_category_targets(proposal, cat_hint)
-            for cat in targets:
-                cat.hidden = False
-                cat.hidden_until = None
-                self._append_effect_note(proposal, f"{cat.name} is visible to students")
+        is_proposal_view_prompt = bool(
+            re.search(r"\bshow\s+proposal\b", prompt_lower)
+            or re.search(
+                r"\b(?:show|display|list|print)\b.*\b(?:full\s+)?(?:proposal|gradebook\s+structure)\b",
+                prompt_lower,
+            )
+        )
+        if not is_proposal_view_prompt:
+            for m in re.finditer(
+                r"\b(?:show|unhide|reveal)\s+(?:the\s+)?([a-zA-Z][a-zA-Z ]{1,30}?)(?:\s+category)?(?:\b|$)",
+                prompt_lower,
+            ):
+                cat_hint = m.group(1).strip()
+                targets = self._resolve_category_targets(proposal, cat_hint)
+                for cat in targets:
+                    cat.hidden = False
+                    cat.hidden_until = None
+                    self._append_effect_note(proposal, f"{cat.name} is visible to students")
 
         # locked: "lock the final exam" / "unlock assignments"
         for m in re.finditer(
@@ -1856,28 +2731,543 @@ class ProposalGenerator:
     def _find_item_in_proposal(
         self, proposal: GradebookProposal, item_query: str
     ) -> Tuple[Optional[GradebookCategory], Optional[str]]:
-        """Fuzzy search for a grade item name across all category items lists."""
-        query_lower = item_query.lower().strip()
+        """Fuzzy search for a grade item name across parent and subcategory item lists."""
+        query_lower = self._normalize_item_query(item_query).lower()
         if not query_lower:
             return None, None
         best_cat: Optional[GradebookCategory] = None
         best_item: Optional[str] = None
         best_score = 0.0
+
+        def _consider(cat: GradebookCategory, item: str) -> None:
+            nonlocal best_cat, best_item, best_score
+            item_lower = item.lower()
+            if query_lower == item_lower:
+                best_cat = cat
+                best_item = item
+                best_score = 1.0
+                return
+            if query_lower in item_lower or item_lower in query_lower:
+                score = min(len(query_lower), len(item_lower)) / max(len(query_lower), len(item_lower))
+                if score > best_score:
+                    best_score = score
+                    best_cat = cat
+                    best_item = item
+
         for cat in proposal.categories:
+            for sub in (cat.subcategories or []):
+                for item in (sub.items or []):
+                    _consider(cat, item)
+                    if best_score >= 1.0:
+                        return best_cat, best_item
             for item in (cat.items or []):
-                item_lower = item.lower()
-                if query_lower == item_lower:
-                    return cat, item
-                if query_lower in item_lower or item_lower in query_lower:
-                    score = min(len(query_lower), len(item_lower)) / max(len(query_lower), len(item_lower))
-                    if score > best_score:
-                        best_score = score
-                        best_cat = cat
-                        best_item = item
-        return (best_cat, best_item) if best_score >= 0.5 else (None, None)
+                _consider(cat, item)
+                if best_score >= 1.0:
+                    return best_cat, best_item
+        result = (best_cat, best_item) if best_score >= 0.5 else (None, None)
+        return result
+
+    @staticmethod
+    def _normalize_activity_match_key(name: str) -> str:
+        return re.sub(r"\s+", "", str(name or "").strip().lower())
+
+    def _match_course_activity(
+        self,
+        item_name: str,
+        course_activities: Optional[List[CourseActivity]] = None,
+    ) -> Optional[CourseActivity]:
+        if not item_name or not course_activities:
+            return None
+
+        query_lower = self._normalize_item_query(item_name).lower()
+        query_key = self._normalize_activity_match_key(item_name)
+        if not query_lower:
+            return None
+
+        best_activity: Optional[CourseActivity] = None
+        best_score = 0.0
+        for activity in course_activities:
+            name_lower = str(getattr(activity, "name", "") or "").strip().lower()
+            name_key = self._normalize_activity_match_key(name_lower)
+            if not name_lower:
+                continue
+            if query_lower == name_lower or (query_key and query_key == name_key):
+                return activity
+            if query_lower in name_lower or name_lower in query_lower:
+                score = min(len(query_lower), len(name_lower)) / max(len(query_lower), len(name_lower))
+                if score > best_score:
+                    best_score = score
+                    best_activity = activity
+            elif query_key and name_key and (query_key in name_key or name_key in query_key):
+                score = min(len(query_key), len(name_key)) / max(len(query_key), len(name_key))
+                if score > best_score:
+                    best_score = score
+                    best_activity = activity
+        return best_activity if best_score >= 0.5 else None
+
+    def _is_moodle_activity_item(
+        self,
+        item_name: str,
+        course_activities: Optional[List[CourseActivity]] = None,
+    ) -> bool:
+        activity = self._match_course_activity(item_name, course_activities)
+        if activity is None:
+            return False
+
+        module = str(getattr(activity, "module", None) or "").strip()
+        cmid = getattr(activity, "cmid", None)
+        itemtype = str(getattr(activity, "itemtype", None) or "mod").strip().lower()
+        if itemtype == "manual" and not module and cmid in (None, "", 0):
+            return False
+        return bool(
+            module
+            or itemtype == "mod"
+            or (cmid is not None and str(cmid).strip() not in {"", "0"})
+        )
+
+    def _find_not_graded_item(
+        self,
+        proposal: GradebookProposal,
+        item_query: str,
+    ) -> Optional[str]:
+        query_lower = self._normalize_item_query(item_query).lower()
+        if not query_lower:
+            return None
+
+        best_name: Optional[str] = None
+        best_score = 0.0
+        for item_name in (proposal.not_graded_items or []):
+            name_lower = str(item_name).strip().lower()
+            if not name_lower:
+                continue
+            if query_lower == name_lower:
+                return str(item_name).strip()
+            if query_lower in name_lower or name_lower in query_lower:
+                score = min(len(query_lower), len(name_lower)) / max(len(query_lower), len(name_lower))
+                if score > best_score:
+                    best_score = score
+                    best_name = str(item_name).strip()
+        return best_name if best_score >= 0.5 else None
+
+    def _resolve_item_for_placement(
+        self,
+        proposal: GradebookProposal,
+        item_query: str,
+    ) -> Tuple[Optional[GradebookCategory], Optional[str], bool]:
+        src_cat, item_name = self._find_item_in_proposal(proposal, item_query)
+        if item_name:
+            return src_cat, item_name, False
+        not_graded_name = self._find_not_graded_item(proposal, item_query)
+        if not_graded_name:
+            return None, not_graded_name, True
+        return None, None, False
+
+    def _remove_from_not_graded_items(self, proposal: GradebookProposal, item_name: str) -> None:
+        if not proposal.not_graded_items:
+            return
+        target = str(item_name or "").strip().lower()
+        proposal.not_graded_items = [
+            name
+            for name in proposal.not_graded_items
+            if str(name).strip().lower() != target
+        ]
+
+    def _set_activity_not_graded(
+        self,
+        proposal: GradebookProposal,
+        item_query: str,
+        course_activities: Optional[List[CourseActivity]] = None,
+    ) -> bool:
+        activity = self._match_course_activity(item_query, course_activities)
+        resolved_name: Optional[str] = None
+        if activity is not None and getattr(activity, "name", None):
+            resolved_name = str(activity.name).strip()
+        else:
+            _cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if item_name and self._is_moodle_activity_item(item_name, course_activities):
+                resolved_name = item_name
+            else:
+                not_graded_name = self._find_not_graded_item(proposal, item_query)
+                if not_graded_name and self._is_moodle_activity_item(not_graded_name, course_activities):
+                    resolved_name = not_graded_name
+
+        if not resolved_name:
+            return False
+
+        for category in proposal.categories or []:
+            self._remove_item_from_category_tree(category, resolved_name)
+
+        if proposal.not_graded_items is None:
+            proposal.not_graded_items = []
+        existing = {str(name).strip().lower() for name in proposal.not_graded_items}
+        if resolved_name.lower() not in existing:
+            proposal.not_graded_items.append(resolved_name)
+
+        self._append_effect_note(
+            proposal,
+            f"Set Moodle activity '{resolved_name}' to Not graded (removed from proposal categories).",
+        )
+        return True
+
+    def _apply_not_graded_operations(
+        self,
+        proposal: GradebookProposal,
+        prompt: str,
+        course_activities: Optional[List[CourseActivity]] = None,
+    ) -> None:
+        patterns = (
+            r"\b(?:set|mark|make)\s+(.+?)\s+(?:to|as)\s+(?:not\s+graded|ungraded|non[- ]graded)\b",
+            r"\b(?:don'?t|do\s+not)\s+grade\s+(.+?)(?:[.,]|$)",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, prompt, re.IGNORECASE):
+                item_query = match.group(1).strip().rstrip("., ")
+                if not item_query:
+                    continue
+                for query in self._expand_item_queries(proposal, item_query):
+                    self._set_activity_not_graded(proposal, query, course_activities=course_activities)
+
+    def _pop_item_from_category_tree(
+        self,
+        parent: GradebookCategory,
+        item_name: str,
+    ) -> Optional[float]:
+        """Remove an item from a parent or one of its subcategories; return prior weight if any."""
+        if parent.items and item_name in parent.items:
+            parent.items = [item for item in parent.items if item != item_name]
+            return (parent.item_weights or {}).pop(item_name, None)
+        for sub in (parent.subcategories or []):
+            if sub.items and item_name in sub.items:
+                sub.items = [item for item in sub.items if item != item_name]
+                return (sub.item_weights or {}).pop(item_name, None)
+        return None
+
+    def _remove_item_from_category_tree(
+        self,
+        parent: GradebookCategory,
+        item_name: str,
+    ) -> bool:
+        """Remove an item from a parent category or one of its subcategories."""
+        if parent.items and item_name in parent.items:
+            parent.items = [item for item in parent.items if item != item_name]
+            if parent.item_weights:
+                parent.item_weights.pop(item_name, None)
+            return True
+        for sub in (parent.subcategories or []):
+            if sub.items and item_name in sub.items:
+                sub.items = [item for item in sub.items if item != item_name]
+                if sub.item_weights:
+                    sub.item_weights.pop(item_name, None)
+                return True
+        return False
+
+    def _remove_grade_item(
+        self,
+        proposal: GradebookProposal,
+        item_query: str,
+        location_hint: Optional[str] = None,
+        course_activities: Optional[List[CourseActivity]] = None,
+    ) -> bool:
+        cat, item_name = self._find_item_in_proposal(proposal, item_query)
+        if not cat or not item_name:
+            return False
+
+        if self._is_moodle_activity_item(item_name, course_activities):
+            self._append_effect_note(
+                proposal,
+                (
+                    f"Cannot remove Moodle activity '{item_name}'. "
+                    "Move it, reassign it, or set it to Not graded instead."
+                ),
+            )
+            return False
+
+        removed = False
+        if location_hint:
+            sub_match = self._find_subcategory_match(proposal, location_hint, parent_hint=cat.name)
+            if sub_match:
+                scope_parent, target_sub = sub_match
+                if scope_parent.name.lower() == cat.name.lower() and item_name in (target_sub.items or []):
+                    target_sub.items = [item for item in target_sub.items if item != item_name]
+                    if target_sub.item_weights:
+                        target_sub.item_weights.pop(item_name, None)
+                    removed = True
+            else:
+                targets = self._resolve_category_targets(proposal, location_hint)
+                if targets and cat.name.lower() == targets[0].name.lower():
+                    removed = self._remove_item_from_category_tree(cat, item_name)
+        else:
+            removed = self._remove_item_from_category_tree(cat, item_name)
+
+        if not removed:
+            return False
+
+        self._append_effect_note(proposal, f"Removed '{item_name}' from {cat.name}")
+        return True
+
+    def _item_name_exists_in_category_tree(
+        self,
+        parent: GradebookCategory,
+        dest_name: str,
+        *,
+        except_item: Optional[str] = None,
+    ) -> bool:
+        dest_lower = str(dest_name or "").strip().lower()
+        except_lower = str(except_item or "").strip().lower()
+        if not dest_lower:
+            return False
+
+        for item in (parent.items or []):
+            item_lower = str(item).strip().lower()
+            if item_lower == except_lower:
+                continue
+            if item_lower == dest_lower:
+                return True
+
+        for sub in (parent.subcategories or []):
+            for item in (sub.items or []):
+                item_lower = str(item).strip().lower()
+                if item_lower == except_lower:
+                    continue
+                if item_lower == dest_lower:
+                    return True
+        return False
+
+    def _rename_item_in_category_tree(
+        self,
+        parent: GradebookCategory,
+        item_name: str,
+        dest_name: str,
+    ) -> bool:
+        if parent.items and item_name in parent.items:
+            parent.items = [dest_name if i == item_name else i for i in parent.items]
+            if item_name in (parent.item_weights or {}):
+                if parent.item_weights is None:
+                    parent.item_weights = {}
+                parent.item_weights[dest_name] = parent.item_weights.pop(item_name)
+            return True
+
+        for sub in (parent.subcategories or []):
+            if sub.items and item_name in sub.items:
+                sub.items = [dest_name if i == item_name else i for i in sub.items]
+                if item_name in (sub.item_weights or {}):
+                    if sub.item_weights is None:
+                        sub.item_weights = {}
+                    sub.item_weights[dest_name] = sub.item_weights.pop(item_name)
+                return True
+        return False
+
+    def _assign_item_to_subcategory(
+        self,
+        proposal: GradebookProposal,
+        item_query: str,
+        sub_hint: str,
+        parent_hint: Optional[str] = None,
+        content_mapping: Optional[dict] = None,
+    ) -> bool:
+        src_cat, item_name, from_not_graded = self._resolve_item_for_placement(proposal, item_query)
+        if not item_name:
+            return False
+
+        parent_name = str(parent_hint or (src_cat.name if src_cat else "") or "").strip()
+        sub_match = self._find_subcategory_match(proposal, sub_hint, parent_hint=parent_name)
+        if not sub_match:
+            return False
+
+        parent_cat, target_sub = sub_match
+        if from_not_graded:
+            self._remove_from_not_graded_items(proposal, item_name)
+            prior_weight = None
+        else:
+            if not src_cat:
+                return False
+            prior_weight = self._pop_item_from_category_tree(src_cat, item_name)
+        if target_sub.items is None:
+            target_sub.items = []
+        if item_name not in target_sub.items:
+            target_sub.items.append(item_name)
+        if prior_weight is not None:
+            if target_sub.item_weights is None:
+                target_sub.item_weights = {}
+            target_sub.item_weights[item_name] = prior_weight
+
+        if isinstance(content_mapping, dict):
+            for row in list(content_mapping.get("graded_activities") or []):
+                if str(row.get("activity_name") or "").strip().lower() != item_name.strip().lower():
+                    continue
+                row["suggested_category"] = parent_cat.name
+                row["confirmed_category"] = parent_cat.name
+                row.pop("not_graded", None)
+                _set_row_subcategory(row, target_sub.name)
+
+        self._append_effect_note(
+            proposal,
+            f"Moved '{item_name}' to subcategory '{target_sub.name}' in {parent_cat.name}",
+        )
+        return True
+
+    def _expand_item_queries(self, proposal: GradebookProposal, item_query: str) -> List[str]:
+        """Expand a move/remove item phrase into one or more item queries.
+
+        Supports separators like comma, "and", and "&" while preserving
+        single-item phrases when they already match an item exactly.
+        """
+        raw = str(item_query or "").strip().rstrip("., ")
+        if not raw:
+            return []
+
+        # Keep as single query when it already resolves exactly.
+        _, matched = self._find_item_in_proposal(proposal, raw)
+        if matched and matched.strip().lower() == raw.lower():
+            return [raw]
+
+        parts = [
+            part.strip().strip("'\"").rstrip("., ")
+            for part in re.split(r"\s*(?:,|\band\b|&)\s*", raw, flags=re.IGNORECASE)
+            if part and part.strip()
+        ]
+        if len(parts) <= 1:
+            return [raw]
+
+        # Return unique parts preserving order.
+        unique_parts: List[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            key = part.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_parts.append(part)
+        return unique_parts or [raw]
+
+    def _clear_item_subcategory_assignment(
+        self,
+        proposal: GradebookProposal,
+        item_query: str,
+        parent_hint: Optional[str] = None,
+        content_mapping: Optional[dict] = None,
+    ) -> bool:
+        src_cat, item_name = self._find_item_in_proposal(proposal, item_query)
+        if not src_cat or not item_name:
+            return False
+
+        prior_weight = self._pop_item_from_category_tree(src_cat, item_name)
+        if src_cat.items is None:
+            src_cat.items = []
+        if item_name not in src_cat.items:
+            src_cat.items.append(item_name)
+        if prior_weight is not None:
+            if src_cat.item_weights is None:
+                src_cat.item_weights = {}
+            src_cat.item_weights[item_name] = prior_weight
+
+        if isinstance(content_mapping, dict):
+            for row in list(content_mapping.get("graded_activities") or []):
+                if str(row.get("activity_name") or "").strip().lower() != item_name.strip().lower():
+                    continue
+                _set_row_subcategory(row, "")
+
+        self._append_effect_note(
+            proposal,
+            f"Moved '{item_name}' to parent category '{src_cat.name}'",
+        )
+        return True
+
+    def _apply_subcategory_item_assignments(
+        self,
+        proposal: GradebookProposal,
+        prompt: str,
+        content_mapping: Optional[dict] = None,
+    ) -> None:
+        """Assign grade items to subcategories from chat prompts."""
+        parent_hint = self._extract_scoped_parent_label(prompt)
+
+        clear_patterns = (
+            re.compile(
+                r"\b(?:clear|remove|reset)\s+(?:the\s+)?subcategory\s+(?:for|of|on)\s+(.+?)(?:\s+(?:in|under)\s+.+)?\s*(?:[.,]|$)",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\b(?:move|put|place)\s+(.+?)\s+(?:to|into)\s+(?:the\s+)?(?:parent\s+)?category(?:\s+(?:in|under)\s+.+)?\s*(?:[.,]|$)",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"\b(?:move|put|place)\s+(.+?)\s+(?:to|into)\s+none(?:\s+(?:in|under)\s+.+)?\s*(?:[.,]|$)",
+                re.IGNORECASE,
+            ),
+        )
+        for pattern in clear_patterns:
+            for match in pattern.finditer(prompt):
+                item_query = match.group(1).strip().rstrip("., ")
+                for query in self._expand_item_queries(proposal, item_query):
+                    self._clear_item_subcategory_assignment(
+                        proposal,
+                        query,
+                        parent_hint=parent_hint,
+                        content_mapping=content_mapping,
+                    )
+
+        scoped_move = re.compile(
+            r"\b(?:move|transfer|reassign|put|place|assign)\s+(.+?)"
+            r"\s+(?:from\s+[a-zA-Z][a-zA-Z ]{0,40}\s+)?(?:to|into|under)\s+"
+            r"([a-zA-Z][a-zA-Z \-]{1,40}?)(?:\s+subcategory)?"
+            r"\s+(?:in|under)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\s*(?:[.,]|$)",
+            re.IGNORECASE,
+        )
+        for match in scoped_move.finditer(prompt):
+            item_query = match.group(1).strip().rstrip("., ")
+            sub_hint = match.group(2).strip().rstrip("., ")
+            scoped_parent = match.group(3).strip().rstrip("., ")
+            if re.search(r"\b(?:parent|none)\s+category\b", sub_hint, re.IGNORECASE):
+                continue
+            for query in self._expand_item_queries(proposal, item_query):
+                self._assign_item_to_subcategory(
+                    proposal,
+                    query,
+                    sub_hint,
+                    parent_hint=scoped_parent,
+                    content_mapping=content_mapping,
+                )
+
+        direct_move = re.compile(
+            r"\b(?:move|transfer|reassign|put|place|assign)\s+(.+?)"
+            r"\s+(?:from\s+[a-zA-Z][a-zA-Z ]{0,40}\s+)?(?:to|into|under)\s+"
+            r"([a-zA-Z][a-zA-Z \-]{1,40}?)(?:\s+subcategory)?\s*(?:[.,]|$)",
+            re.IGNORECASE,
+        )
+        for match in direct_move.finditer(prompt):
+            if re.search(r"\s+(?:in|under)\s+", match.group(0), re.IGNORECASE):
+                continue
+            item_query = match.group(1).strip().rstrip("., ")
+            target_hint = match.group(2).strip().rstrip("., ")
+            if re.search(r"\b(?:parent|none)\s+category\b", target_hint, re.IGNORECASE):
+                continue
+            for query in self._expand_item_queries(proposal, item_query):
+                src_cat, _ = self._find_item_in_proposal(proposal, query)
+                sub_parent_hint = parent_hint or (src_cat.name if src_cat else "")
+                if self._find_subcategory_match(proposal, target_hint, parent_hint=sub_parent_hint):
+                    self._assign_item_to_subcategory(
+                        proposal,
+                        query,
+                        target_hint,
+                        parent_hint=sub_parent_hint,
+                        content_mapping=content_mapping,
+                    )
+                    continue
+                if self._resolve_category_targets(proposal, target_hint):
+                    continue
+                self._assign_item_to_subcategory(
+                    proposal,
+                    query,
+                    target_hint,
+                    parent_hint=parent_hint,
+                    content_mapping=content_mapping,
+                )
 
     def _apply_item_operations(self, proposal: GradebookProposal, prompt: str) -> None:
         """Handle move / weight-set / remove operations on grade items inside categories."""
+        self._apply_subcategory_item_assignments(proposal, prompt)
+
         # --- Move: "move <item> to <category>" / "move <item> from <A> to <B>" --------
         for m in re.finditer(
             r"\b(?:move|transfer|reassign|put|place)\s+"
@@ -1889,24 +3279,76 @@ class ProposalGenerator:
         ):
             item_query = m.group(1).strip().rstrip("., ")
             target_hint = m.group(2).strip().rstrip("., ")
-            src_cat, item_name = self._find_item_in_proposal(proposal, item_query)
-            if not item_name:
+            if re.search(r"\s+(?:in|under)\s+", prompt[m.start():m.end()], re.IGNORECASE):
                 continue
-            targets = self._resolve_category_targets(proposal, target_hint)
-            if not targets:
+            for query in self._expand_item_queries(proposal, item_query):
+                src_cat, item_name, from_not_graded = self._resolve_item_for_placement(proposal, query)
+                if not item_name:
+                    continue
+                if self._find_subcategory_match(proposal, target_hint, parent_hint=src_cat.name if src_cat else None):
+                    continue
+                targets = self._resolve_category_targets(proposal, target_hint)
+                if not targets:
+                    continue
+                target_cat = targets[0]
+                if src_cat and src_cat.name == target_cat.name:
+                    # Move from subcategory to parent level when target is the same parent category.
+                    already_parent = item_name in (target_cat.items or [])
+                    if already_parent:
+                        continue
+                    prior_weight = self._pop_item_from_category_tree(src_cat, item_name)
+                    if target_cat.items is None:
+                        target_cat.items = []
+                    if item_name not in target_cat.items:
+                        target_cat.items.append(item_name)
+                    if prior_weight is not None:
+                        if target_cat.item_weights is None:
+                            target_cat.item_weights = {}
+                        target_cat.item_weights[item_name] = prior_weight
+                    self._remove_from_not_graded_items(proposal, item_name)
+                    self._append_effect_note(
+                        proposal,
+                        f"Moved '{item_name}' to parent category '{target_cat.name}'",
+                    )
+                    continue
+                if from_not_graded:
+                    self._remove_from_not_graded_items(proposal, item_name)
+                    prior_weight = None
+                elif src_cat:
+                    prior_weight = self._pop_item_from_category_tree(src_cat, item_name)
+                    if prior_weight is not None:
+                        if target_cat.item_weights is None:
+                            target_cat.item_weights = {}
+                        target_cat.item_weights[item_name] = prior_weight
+                if target_cat.items is None:
+                    target_cat.items = []
+                if item_name not in target_cat.items:
+                    target_cat.items.append(item_name)
+                if from_not_graded:
+                    from_label = " from not graded"
+                else:
+                    from_label = f" from {src_cat.name}" if src_cat else ""
+                self._append_effect_note(proposal, f"Moved '{item_name}'{from_label} to {target_cat.name}")
+
+        # --- Item weight: "set weight of <item> in <category> to N" -------------------
+        for m in re.finditer(
+            r"\b(?:set|assign|give)\s+(?:the\s+)?weight\s+of\s+(?:(?:manual\s+)?grade\s+item\s+)?(.+?)\s+in\s+"
+            r"([a-zA-Z][a-zA-Z ]{1,40}?)\s+to\s+(\d+(?:\.\d+)?)\s*%?(?:\s|,|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            parent_hint = m.group(2).strip().rstrip("., ")
+            raw_val = float(m.group(3))
+            parent_targets = self._resolve_category_targets(proposal, parent_hint)
+            if not parent_targets:
                 continue
-            target_cat = targets[0]
-            if src_cat and src_cat.name == target_cat.name:
+            parent_cat = parent_targets[0]
+            cat, item_name = self._find_item_in_proposal(proposal, item_query)
+            if not cat or not item_name or cat.name.lower() != parent_cat.name.lower():
                 continue
-            if src_cat:
-                src_cat.items = [i for i in src_cat.items if i != item_name]
-                if item_name in (src_cat.item_weights or {}):
-                    target_cat.item_weights[item_name] = src_cat.item_weights.pop(item_name)
-            if target_cat.items is None:
-                target_cat.items = []
-            target_cat.items.append(item_name)
-            from_label = f" from {src_cat.name}" if src_cat else ""
-            self._append_effect_note(proposal, f"Moved '{item_name}'{from_label} to {target_cat.name}")
+            weight_val = raw_val if raw_val > 1.0 else round(raw_val * 100, 2)
+            self._set_item_weight_with_validation(proposal, cat, item_name, weight_val)
 
         # --- Item weight: "set weight of <item> to N" ---------------------------------
         for m in re.finditer(
@@ -1956,29 +3398,15 @@ class ProposalGenerator:
                 continue
             self._set_item_weight_with_validation(proposal, cat, item_name, raw_val)
 
-        # --- Remove item from category: "remove <item> from <category>" ---------------
-        for m in re.finditer(
-            r"\b(?:remove|unassign)\s+(.+?)\s+from\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\s*(?:[.,]|$)",
-            prompt,
-            re.IGNORECASE,
-        ):
-            item_query = m.group(1).strip().rstrip("., ")
-            cat_hint = m.group(2).strip().rstrip("., ")
-            # Only act when item_query is NOT a top-level category name
-            if self._resolve_category_targets(proposal, item_query):
-                continue
-            cat, item_name = self._find_item_in_proposal(proposal, item_query)
-            if not cat or not item_name:
-                continue
-            targets = self._resolve_category_targets(proposal, cat_hint)
-            if targets and cat.name.lower() != targets[0].name.lower():
-                continue
-            cat.items = [i for i in cat.items if i != item_name]
-            cat.item_weights.pop(item_name, None)
-            self._append_effect_note(proposal, f"Removed '{item_name}' from {cat.name}")
-
-    def _apply_item_remove_rename(self, proposal: GradebookProposal, prompt: str) -> None:
+    def _apply_item_remove_rename(
+        self,
+        proposal: GradebookProposal,
+        prompt: str,
+        renamed_subcategory_sources: Optional[set[str]] = None,
+        course_activities: Optional[List[CourseActivity]] = None,
+    ) -> None:
         """Handle explicit grade-item remove/rename commands before category removal logic."""
+        remove_kwargs = {"course_activities": course_activities}
         # Remove with explicit category context: "remove X from Final Exam"
         for m in re.finditer(
             r"\b(?:remove|delete|unassign)\s+(.+?)\s+from\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\s*(?:[.,]|$)",
@@ -1989,15 +3417,7 @@ class ProposalGenerator:
             cat_hint = m.group(2).strip().rstrip("., ")
             if not item_query:
                 continue
-            cat, item_name = self._find_item_in_proposal(proposal, item_query)
-            if not cat or not item_name:
-                continue
-            targets = self._resolve_category_targets(proposal, cat_hint)
-            if targets and cat.name.lower() != targets[0].name.lower():
-                continue
-            cat.items = [i for i in (cat.items or []) if i != item_name]
-            cat.item_weights.pop(item_name, None)
-            self._append_effect_note(proposal, f"Removed '{item_name}' from {cat.name}")
+            self._remove_grade_item(proposal, item_query, location_hint=cat_hint, **remove_kwargs)
 
         # Remove with prefix phrasing: "remove grade item X"
         for m in re.finditer(
@@ -2008,12 +3428,7 @@ class ProposalGenerator:
             item_query = m.group(1).strip().rstrip("., ")
             if not item_query:
                 continue
-            cat, item_name = self._find_item_in_proposal(proposal, item_query)
-            if not cat or not item_name:
-                continue
-            cat.items = [i for i in (cat.items or []) if i != item_name]
-            cat.item_weights.pop(item_name, None)
-            self._append_effect_note(proposal, f"Removed '{item_name}' from {cat.name}")
+            self._remove_grade_item(proposal, item_query, **remove_kwargs)
 
         # Remove without explicit category: "remove fina grade item" / "delete grade item fina"
         for m in re.finditer(
@@ -2024,12 +3439,28 @@ class ProposalGenerator:
             item_query = m.group(1).strip().rstrip("., ")
             if not item_query:
                 continue
+            self._remove_grade_item(proposal, item_query, **remove_kwargs)
+
+        # Bare remove by item name: "remove manual_item"
+        for m in re.finditer(
+            r"\b(?:remove|delete|unassign)\s+(?:the\s+)?(.+?)(?:[.,]|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_query = m.group(1).strip().rstrip("., ")
+            if not item_query or re.search(r"\bfrom\b", item_query, flags=re.IGNORECASE):
+                continue
+            if re.search(r"\b(?:grade\s+item|item)\b", item_query, flags=re.IGNORECASE):
+                continue
+            if any(
+                self._normalize_name(cat.name) == self._normalize_name(item_query)
+                for cat in proposal.categories
+            ):
+                continue
             cat, item_name = self._find_item_in_proposal(proposal, item_query)
             if not cat or not item_name:
                 continue
-            cat.items = [i for i in (cat.items or []) if i != item_name]
-            cat.item_weights.pop(item_name, None)
-            self._append_effect_note(proposal, f"Removed '{item_name}' from {cat.name}")
+            self._remove_grade_item(proposal, item_query, **remove_kwargs)
 
         # Rename item: "rename grade item fina to final" / "rename fina item to final"
         for m in re.finditer(
@@ -2042,52 +3473,111 @@ class ProposalGenerator:
             if not src_query or not dest_name:
                 continue
 
+            rename_phrase = m.group(0) or ""
+            explicit_item_rename = bool(
+                re.search(r"\b(?:grade\s+item|\bitem\b)\b", rename_phrase, flags=re.IGNORECASE)
+            )
+
             # Guard against category rename phrases only when the source text
             # matches an existing category name directly (not fuzzy aliases).
             src_norm = self._normalize_name(src_query)
             if any(self._normalize_name(cat.name) == src_norm for cat in proposal.categories):
                 continue
 
+            src_key = self._normalize_name(src_query)
+            renamed_sub_sources = renamed_subcategory_sources or set()
+
+            # Subcategory renames run first; avoid renaming grade items when the
+            # source label matches a subcategory (e.g. "Homework" vs "Homework 1").
+            if not explicit_item_rename and (
+                src_key in renamed_sub_sources
+                or any(
+                    self._subcategory_labels_match(sub.name, src_query)
+                    for category in proposal.categories
+                    for sub in (category.subcategories or [])
+                )
+            ):
+                continue
+
             cat, item_name = self._find_item_in_proposal(proposal, src_query)
             if not cat or not item_name:
                 continue
 
-            if any(str(existing).strip().lower() == dest_name.lower() for existing in (cat.items or [])):
+            if self._item_name_exists_in_category_tree(cat, dest_name, except_item=item_name):
                 continue
 
-            cat.items = [dest_name if i == item_name else i for i in (cat.items or [])]
-            if item_name in (cat.item_weights or {}):
-                cat.item_weights[dest_name] = cat.item_weights.pop(item_name)
+            if not self._rename_item_in_category_tree(cat, item_name, dest_name):
+                continue
+
             self._append_effect_note(proposal, f"Renamed '{item_name}' to '{dest_name}' in {cat.name}")
 
     def _apply_item_additions(self, proposal: GradebookProposal, prompt: str) -> None:
         """Handle direct creation of manual grade items from chat prompts."""
         for m in re.finditer(
-            r"\b(?:add|create|make|insert)\s+(?:a\s+)?(?:(?:manual\s+)?grade\s+item|manual\s+item|item)\s+"
-            r"(.+?)\s+(?:to|into|under|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\s*(?:[.,]|$)",
+            r"\b(?:add|create|make|insert)\s+(?:a\s+)?(?:(?:manual\s+)?grade\s+item|manual\s+item)\s+"
+            r"(.+?)\s+(?:to|into|under|for)\s+(?:(?:sub)?category\s+)?([a-zA-Z][a-zA-Z0-9 '\-]{1,40}?)(?:\s+(?:sub)?category)?\s*(?:[.,]|$)",
             prompt,
             re.IGNORECASE,
         ):
             item_name = m.group(1).strip().rstrip("., ")
-            cat_hint = m.group(2).strip().rstrip("., ")
+            target_hint = m.group(2).strip().rstrip("., ")
             if not item_name:
                 continue
 
-            if any(str(category.name).strip().lower() == item_name.lower() for category in proposal.categories):
+            sub_match = self._find_subcategory_match(proposal, target_hint)
+            if sub_match:
+                parent_cat, target_sub = sub_match
+                self._append_manual_grade_item_to_sub(proposal, item_name, parent_cat, target_sub)
                 continue
 
-            targets = self._resolve_category_targets(proposal, cat_hint)
+            targets = self._resolve_category_targets(proposal, target_hint)
             if not targets:
                 continue
+            self._append_manual_grade_item(proposal, item_name, targets[0])
 
-            target_cat = targets[0]
-            if any(str(existing).strip().lower() == item_name.lower() for existing in (target_cat.items or [])):
+        # Bare form: "add x to y" should create a manual grade item,
+        # unless the user explicitly asked for subcategory/category creation.
+        for m in re.finditer(
+            r"\b(?:add|create|make|insert)\s+([a-zA-Z][a-zA-Z0-9 '\-]{0,60}?)\s+"
+            r"(?:to|into|under|for)\s+(?:(?:sub)?category\s+)?([a-zA-Z][a-zA-Z0-9 '\-]{1,40}?)(?:\s+(?:sub)?category)?\s*(?:[.,]|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            item_name = m.group(1).strip().rstrip("., ")
+            target_hint = m.group(2).strip().rstrip("., ")
+            if not item_name:
+                continue
+            if re.search(r"\b(?:subcategor(?:y|ies)|category|grade\s+item|manual\s+item)\b", item_name, re.IGNORECASE):
+                continue
+            if re.search(r"\bwith\s+(?:weight\s+)?(?:of\s+)?\d+(?:\.\d+)?\s*%\b", m.group(0), re.IGNORECASE):
                 continue
 
-            if target_cat.items is None:
-                target_cat.items = []
-            target_cat.items.append(item_name)
-            self._append_effect_note(proposal, f"Added manual grade item '{item_name}' to {target_cat.name}")
+            sub_match = self._find_subcategory_match(proposal, target_hint)
+            if sub_match:
+                parent_cat, target_sub = sub_match
+                self._append_manual_grade_item_to_sub(proposal, item_name, parent_cat, target_sub)
+                continue
+
+            targets = self._resolve_category_targets(proposal, target_hint)
+            if not targets:
+                continue
+            self._append_manual_grade_item(proposal, item_name, targets[0])
+
+        for m in re.finditer(
+            r"\b(?:add|create|make|insert)\s+(?:a\s+)?(?:(?:manual\s+)?grade\s+item|manual\s+item)\s+"
+            r"([a-zA-Z][a-zA-Z0-9 '\-]{0,60}?)\s*(?:[.,]|$)",
+            prompt,
+            re.IGNORECASE,
+        ):
+            if re.search(r"\s+(?:to|into|under|for)\s+", m.group(0), re.IGNORECASE):
+                continue
+            item_name = m.group(1).strip().rstrip("., ")
+            if not item_name:
+                continue
+            target_cat = self._default_manual_item_parent(proposal)
+            if target_cat is None:
+                continue
+            self._append_manual_grade_item(proposal, item_name, target_cat)
 
     def _set_item_weight_with_validation(
         self,
@@ -2118,6 +3608,117 @@ class ProposalGenerator:
         category.item_weights[item_name] = value
         self._append_effect_note(proposal, f"Set item weight for '{item_name}' in {category.name} to {value:.1f}%")
 
+    def _extract_subcategory_weight_intents(
+        self,
+        prompt: str,
+    ) -> Tuple[str, List[Dict[str, object]]]:
+        """Pull scoped subcategory-weight clauses out before category-weight parsing."""
+        if not prompt:
+            return "", []
+
+        intents: List[Dict[str, object]] = []
+        cleaned = prompt
+
+        patterns: List[Tuple[re.Pattern, str]] = [
+            (
+                re.compile(
+                    r"\b(?:set|assign|update|change|make)\s+(?:the\s+)?weight\s+of\s+"
+                    r"(?:subcategory\s+)?(.+?)\s+in\s+([a-zA-Z][a-zA-Z '\-]{1,40}?)\s+"
+                    r"(?:to|as|=)\s+(\d+(?:\.\d+)?)\s*%?\b",
+                    flags=re.IGNORECASE,
+                ),
+                "scoped",
+            ),
+            (
+                re.compile(
+                    r"\b(?:set|assign|update|change|make)\s+(?:subcategory\s+)?(.+?)\s+subcategory\s+weight\s+"
+                    r"(?:in\s+([a-zA-Z][a-zA-Z '\-]{1,40}?)\s+)?(?:to|as|=)\s+(\d+(?:\.\d+)?)\s*%?\b",
+                    flags=re.IGNORECASE,
+                ),
+                "keyword",
+            ),
+            (
+                re.compile(
+                    r"\b(?:set|assign|update|change|make)\s+subcategory\s+(.+?)\s+"
+                    r"(?:in\s+([a-zA-Z][a-zA-Z '\-]{1,40}?)\s+)?(?:weight\s+)?(?:to|as|=)\s+(\d+(?:\.\d+)?)\s*%?\b",
+                    flags=re.IGNORECASE,
+                ),
+                "subkeyword",
+            ),
+        ]
+
+        for pattern, kind in patterns:
+            def _collect(match: re.Match, intent_kind: str = kind) -> str:
+                if intent_kind == "scoped":
+                    sub_name = match.group(1).strip().rstrip(".,;:!?")
+                    parent_hint = match.group(2).strip().rstrip(".,;:!?")
+                    weight = float(match.group(3))
+                else:
+                    sub_name = match.group(1).strip().rstrip(".,;:!?")
+                    parent_hint = (match.group(2) or "").strip().rstrip(".,;:!?")
+                    weight = float(match.group(3))
+                sub_name = re.sub(r"^subcategory\s+", "", sub_name, flags=re.IGNORECASE).strip()
+                if sub_name:
+                    intents.append(
+                        {
+                            "sub_name": sub_name,
+                            "parent_hint": parent_hint or None,
+                            "weight": weight,
+                        }
+                    )
+                return " "
+
+            cleaned = pattern.sub(_collect, cleaned)
+
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned, intents
+
+    def _apply_subcategory_weight_intents(
+        self,
+        proposal: GradebookProposal,
+        intents: List[Dict[str, object]],
+    ) -> None:
+        for intent in intents or []:
+            if not isinstance(intent, dict):
+                continue
+            sub_name = str(intent.get("sub_name") or "").strip()
+            parent_hint = intent.get("parent_hint")
+            parent_hint_str = str(parent_hint).strip() if parent_hint else None
+            try:
+                parsed_weight = float(intent.get("weight"))
+            except (TypeError, ValueError):
+                continue
+            if not sub_name:
+                continue
+
+            match = self._find_subcategory_match(
+                proposal,
+                sub_name,
+                parent_hint=parent_hint_str,
+            )
+            if match is None:
+                self._append_unique_note(
+                    proposal,
+                    f"Subcategory weight check: could not find subcategory '{sub_name}'"
+                    + (f" in {parent_hint_str}" if parent_hint_str else "")
+                    + ".",
+                )
+                continue
+
+            matched_parent, matched_sub = match
+            resolved_weight = self._parse_subcategory_weight_value(
+                str(parsed_weight),
+                float(matched_parent.weight),
+            )
+            if resolved_weight is None:
+                continue
+
+            matched_sub.weight = round(float(resolved_weight), 2)
+            self._append_effect_note(
+                proposal,
+                f"Set {matched_sub.name} split weight in {matched_parent.name} to {matched_sub.weight:.1f}%",
+            )
+
     def _apply_subcategory_weight_updates(self, proposal: GradebookProposal, prompt: str) -> None:
         patterns = (
             re.compile(
@@ -2145,6 +3746,7 @@ class ProposalGenerator:
                     raw_weight = match.group(2)
                 if not raw_name or not raw_weight:
                     continue
+                raw_name = re.sub(r"\s+subcategory\s*$", "", raw_name.strip(), flags=re.IGNORECASE).strip()
                 updates.append((raw_name.strip().rstrip(".,;:!?"), float(raw_weight)))
 
         if not updates:
@@ -2160,7 +3762,7 @@ class ProposalGenerator:
 
             for category in proposal.categories:
                 for sub in (category.subcategories or []):
-                    if self._normalize_name(sub.name) == normalized_target:
+                    if self._subcategory_labels_match(sub.name, raw_name):
                         matched_parent = category
                         matched_sub = sub
                         break
@@ -2302,6 +3904,17 @@ class ProposalGenerator:
         for raw_name, raw_weight in matches:
             if skip_split_pieces and raw_name.strip().lower() in split_piece_names:
                 continue
+            if re.search(r"\bin\b", raw_name, flags=re.IGNORECASE):
+                parts = re.split(r"\bin\b", raw_name, maxsplit=1, flags=re.IGNORECASE)
+                if len(parts) == 2:
+                    sub_part = parts[0].strip().rstrip(".,;:!?")
+                    parent_part = parts[1].strip().rstrip(".,;:!?")
+                    if sub_part and parent_part and self._find_subcategory_match(
+                        proposal,
+                        sub_part,
+                        parent_hint=parent_part,
+                    ):
+                        continue
             resolved = self._resolve_category_name(proposal, raw_name)
             if resolved is None and allow_new_categories:
                 candidate = self._clean_new_category_name(raw_name)
@@ -2329,6 +3942,70 @@ class ProposalGenerator:
         if len(name.split()) > 3:
             return None
         return name.title()
+
+    @staticmethod
+    def _clean_manual_item_name(raw_name: str) -> str:
+        name = re.sub(r"\s+", " ", (raw_name or "").strip()).rstrip("., ")
+        name = re.sub(r"^(?:grade\s+item|manual\s+item|item)\s+", "", name, flags=re.IGNORECASE)
+        return name.strip()
+
+    @staticmethod
+    def _normalize_item_query(item_query: str) -> str:
+        cleaned = ProposalGenerator._clean_manual_item_name(item_query)
+        return cleaned or (item_query or "").strip()
+
+    def _default_manual_item_parent(self, proposal: GradebookProposal) -> Optional[GradebookCategory]:
+        for category in proposal.categories:
+            if category.subcategories:
+                return category
+        return proposal.categories[0] if proposal.categories else None
+
+    def _append_manual_grade_item(
+        self,
+        proposal: GradebookProposal,
+        item_name: str,
+        target_cat: GradebookCategory,
+    ) -> bool:
+        cleaned_name = self._clean_manual_item_name(item_name)
+        if not cleaned_name:
+            return False
+        if any(str(category.name).strip().lower() == cleaned_name.lower() for category in proposal.categories):
+            return False
+        if any(str(existing).strip().lower() == cleaned_name.lower() for existing in (target_cat.items or [])):
+            return False
+        for sub in (target_cat.subcategories or []):
+            if any(str(existing).strip().lower() == cleaned_name.lower() for existing in (sub.items or [])):
+                return False
+        if target_cat.items is None:
+            target_cat.items = []
+        target_cat.items.append(cleaned_name)
+        self._append_effect_note(
+            proposal,
+            f"Added manual grade item '{cleaned_name}' to {target_cat.name}",
+        )
+        return True
+
+    def _append_manual_grade_item_to_sub(
+        self,
+        proposal: GradebookProposal,
+        item_name: str,
+        parent_cat: GradebookCategory,
+        target_sub: "GradebookSubcategory",
+    ) -> bool:
+        """Add a manual grade item directly into a subcategory."""
+        cleaned_name = self._clean_manual_item_name(item_name)
+        if not cleaned_name:
+            return False
+        if any(str(existing).strip().lower() == cleaned_name.lower() for existing in (target_sub.items or [])):
+            return False
+        if target_sub.items is None:
+            target_sub.items = []
+        target_sub.items.append(cleaned_name)
+        self._append_effect_note(
+            proposal,
+            f"Added manual grade item '{cleaned_name}' to {parent_cat.name} > {target_sub.name}",
+        )
+        return True
 
     @staticmethod
     def _should_rebuild_category_set(prompt: str, weights: Dict[str, float]) -> bool:
@@ -2401,13 +4078,26 @@ class ProposalGenerator:
                 continue
             if re.search(r"\b(?:it|them|its\s+weight|subcategor(?:y|ies))\b", raw, flags=re.IGNORECASE):
                 continue
+            if re.search(r"\bgrade\s+items?\b", raw, flags=re.IGNORECASE):
+                continue
 
-            resolved = self._resolve_category_name(proposal, raw)
-            if not resolved:
-                cleaned = self._clean_new_category_name(raw)
-                if not cleaned:
-                    continue
-                resolved = cleaned
+            # Scoped phrases like "add test to Final exam" should be handled as
+            # item/subcategory intent, not as top-level category creation.
+            trailing = prompt[match.end(): match.end() + 120]
+            scoped_target = re.match(
+                r"\s+(?:to|into|under|in)\s+([a-zA-Z][a-zA-Z ]{1,40})(?:\s+category)?\b",
+                trailing,
+                flags=re.IGNORECASE,
+            )
+            if scoped_target and self._resolve_existing_category_name(proposal, scoped_target.group(1).strip()):
+                continue
+
+            cleaned = self._clean_new_category_name(raw)
+            if not cleaned:
+                continue
+            if self._find_existing_name(proposal, cleaned):
+                continue
+            resolved = cleaned
 
             key = resolved.lower()
             if key in seen:
@@ -2793,6 +4483,421 @@ class ProposalGenerator:
         re.IGNORECASE,
     )
 
+    @staticmethod
+    def _collapse_subcategory_label(label: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", ProposalGenerator._normalize_name(label))
+
+    def _subcategory_labels_match(self, candidate: str, query: str) -> bool:
+        candidate_norm = self._normalize_name(candidate)
+        query_norm = self._normalize_name(query)
+        if not candidate_norm or not query_norm:
+            return False
+        if candidate_norm == query_norm:
+            return True
+
+        candidate_collapsed = self._collapse_subcategory_label(candidate)
+        query_collapsed = self._collapse_subcategory_label(query)
+        if candidate_collapsed and candidate_collapsed == query_collapsed:
+            return True
+
+        def _variants(name: str) -> set[str]:
+            variants = {name}
+            if name.endswith("ies") and len(name) > 3:
+                variants.add(name[:-3] + "y")
+            if name.endswith("s") and len(name) > 1:
+                variants.add(name[:-1])
+            else:
+                variants.add(name + "s")
+            return {v for v in variants if v}
+
+        if _variants(candidate_collapsed) & _variants(query_collapsed):
+            return True
+
+        close = difflib.get_close_matches(
+            query_collapsed,
+            [candidate_collapsed],
+            n=1,
+            cutoff=0.84,
+        )
+        return bool(close)
+
+    def _extract_scoped_parent_label(self, prompt: str) -> Optional[str]:
+        patterns = (
+            re.compile(
+                r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"\b(?:remove|drop|delete)\s+.+?\s+from\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\b",
+                flags=re.IGNORECASE,
+            ),
+            re.compile(
+                r"\badd\s+(?:subcategory\s+)?[a-zA-Z][a-zA-Z\- ]{1,40}?\s+(?:to|into|under|in)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?\b",
+                flags=re.IGNORECASE,
+            ),
+        )
+        for pattern in patterns:
+            match = pattern.search(prompt)
+            if not match:
+                continue
+            label = re.sub(r"\s+", " ", (match.group(1) or "").strip())
+            if label and self._normalize_name(label) not in self._SPLIT_PARENT_LABEL_STOPWORDS:
+                return label
+        return None
+
+    def _find_subcategory_match(
+        self,
+        proposal: GradebookProposal,
+        raw_name: str,
+        parent_hint: Optional[str] = None,
+    ) -> Optional[Tuple[GradebookCategory, GradebookSubcategory]]:
+        clean_name = re.sub(r"\s+", " ", (raw_name or "").strip())
+        if not clean_name:
+            return None
+
+        parents: List[GradebookCategory] = []
+        if parent_hint:
+            parent_name = self._resolve_existing_category_name(proposal, parent_hint)
+            if not parent_name:
+                return None
+            parents = [
+                cat for cat in proposal.categories
+                if cat.name.lower() == parent_name.lower()
+            ]
+        else:
+            parents = list(proposal.categories)
+
+        matches: List[Tuple[GradebookCategory, GradebookSubcategory]] = []
+        for parent in parents:
+            for sub in (parent.subcategories or []):
+                if self._subcategory_labels_match(sub.name, clean_name):
+                    matches.append((parent, sub))
+
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+
+        if parent_hint:
+            return None
+        return matches[0]
+
+    def _append_subcategory_not_found_effect(
+        self,
+        proposal: GradebookProposal,
+        raw_name: str,
+        action: str,
+        parent_hint: Optional[str] = None,
+    ) -> None:
+        clean_name = re.sub(r"\s+", " ", (raw_name or "").strip()) or "subcategory"
+        clean_action = re.sub(r"\s+", " ", (action or "modify").strip()) or "modify"
+        parent_suffix = ""
+        if parent_hint:
+            parent_name = self._resolve_existing_category_name(proposal, parent_hint)
+            if parent_name:
+                parent_suffix = f" under {parent_name}"
+        self._append_effect_note(
+            proposal,
+            f"Tried to {clean_action} subcategory '{clean_name}'{parent_suffix}, but it was not found. No changes made.",
+        )
+
+    def _remove_subcategory_from_parent(
+        self,
+        proposal: GradebookProposal,
+        parent: GradebookCategory,
+        sub_to_remove: GradebookSubcategory,
+        prompt: str,
+    ) -> None:
+        subs = list(parent.subcategories or [])
+        if sub_to_remove not in subs:
+            return
+
+        removed_weight = float(sub_to_remove.weight or 0.0)
+        if sub_to_remove.items:
+            if parent.items is None:
+                parent.items = []
+            for item_name in list(sub_to_remove.items):
+                if item_name not in parent.items:
+                    parent.items.append(item_name)
+                item_weight = (sub_to_remove.item_weights or {}).get(item_name)
+                if item_weight is not None:
+                    if parent.item_weights is None:
+                        parent.item_weights = {}
+                    parent.item_weights[item_name] = item_weight
+        remaining = [sub for sub in subs if sub is not sub_to_remove]
+        parent.subcategories = remaining
+
+        tail = prompt[prompt.lower().find(sub_to_remove.name.lower()):] if sub_to_remove.name else prompt
+        to_match = self._REDISTRIBUTE_TO_PATTERNS.search(tail)
+        if to_match and remaining:
+            raw_targets = re.sub(
+                r"\b(?:the|a|an|its|lowest|highest|subcategory|subcategories|weight|one|single)\b",
+                " ",
+                to_match.group(1) or "",
+                flags=re.IGNORECASE,
+            )
+            raw_targets = re.sub(r"\s+", " ", raw_targets).strip(" ,.")
+            target_name = raw_targets.split(",")[0].strip()
+            target_match = self._find_subcategory_match(proposal, target_name, parent_hint=parent.name)
+            if target_match and target_match[0] is parent:
+                target_match[1].weight = round(float(target_match[1].weight or 0.0) + removed_weight, 2)
+                self._append_effect_note(
+                    proposal,
+                    f"Removed subcategory '{sub_to_remove.name}' from {parent.name} and assigned "
+                    f"{removed_weight:.1f}% to {target_match[1].name}",
+                )
+                return
+
+        if remaining and removed_weight > 0 and (
+            self._REDISTRIBUTE_EVENLY_PATTERNS.search(tail)
+            or re.search(r"\bevenly\b|\bequally\b", prompt, flags=re.IGNORECASE)
+        ):
+            share = removed_weight / len(remaining)
+            for sub in remaining:
+                sub.weight = round(float(sub.weight or 0.0) + share, 2)
+            self._append_effect_note(
+                proposal,
+                f"Removed subcategory '{sub_to_remove.name}' from {parent.name} and distributed "
+                f"{removed_weight:.1f}% evenly",
+            )
+            return
+
+        if remaining and removed_weight > 0:
+            share = removed_weight / len(remaining)
+            for sub in remaining:
+                sub.weight = round(float(sub.weight or 0.0) + share, 2)
+
+        if not remaining:
+            parent.subcategories = []
+            self._append_effect_note(
+                proposal,
+                f"Removed subcategory '{sub_to_remove.name}' from {parent.name}",
+            )
+            return
+
+        self._append_effect_note(
+            proposal,
+            f"Removed subcategory '{sub_to_remove.name}' from {parent.name} and redistributed "
+            f"{removed_weight:.1f}% across remaining subcategories",
+        )
+
+    def _apply_subcategory_removals(self, proposal: GradebookProposal, prompt: str) -> set[str]:
+        def _clean_phrase(value: str) -> str:
+            cleaned = re.sub(
+                r"\b(?:the|a|an|its|lowest|highest|subcategory|subcategories|weight|one|single)\b",
+                " ",
+                value,
+                flags=re.IGNORECASE,
+            )
+            return re.sub(r"\s+", " ", cleaned).strip(" ,.")
+
+        patterns = (
+            re.compile(
+                r"\b(?:remove|delete|drop)\s+(?:the\s+)?(?:subcategory\s+)?([a-z][a-z\s\-]{0,40}?)"
+                r"(?:\s+subcategory)?(?:\s+from\s+([a-zA-Z][a-zA-Z ]{1,40}?))?(?:\s+category)?"
+                r"(?:\s+and\s|\s+evenly|\s+equally|\s+proportionally|[,:;.!?]|$)",
+                re.IGNORECASE,
+            ),
+        )
+        parent_hint = self._extract_scoped_parent_label(prompt)
+        handled: set[str] = set()
+
+        for pattern in patterns:
+            for match in pattern.finditer(prompt):
+                raw_name = _clean_phrase(match.group(1) or "")
+                if not raw_name:
+                    continue
+                if re.search(r"\b(?:grade\s+item|item)\b", raw_name, flags=re.IGNORECASE):
+                    continue
+
+                explicit_parent = (match.group(2) or "").strip() or parent_hint
+                handle_key = f"{self._normalize_name(raw_name)}::{self._normalize_name(explicit_parent or '')}"
+                if handle_key in handled:
+                    continue
+
+                match_result = self._find_subcategory_match(proposal, raw_name, explicit_parent)
+                if match_result:
+                    handled.add(handle_key)
+                    parent, sub = match_result
+                    self._remove_subcategory_from_parent(proposal, parent, sub, prompt)
+                    continue
+
+                # Defer to top-level category removal (including fuzzy quiz -> Quizzes).
+                if self._resolve_category_name(proposal, raw_name):
+                    continue
+
+                has_subcategories = any((cat.subcategories or []) for cat in proposal.categories)
+                if has_subcategories or explicit_parent:
+                    self._append_subcategory_not_found_effect(
+                        proposal,
+                        raw_name,
+                        "remove",
+                        parent_hint=explicit_parent,
+                    )
+                    handled.add(handle_key)
+
+        return handled
+
+    def _apply_subcategory_renames(self, proposal: GradebookProposal, prompt: str) -> set[str]:
+        parent_hint = self._extract_scoped_parent_label(prompt)
+        handled: set[str] = set()
+        renamed_sources: set[str] = set()
+
+        scoped_pattern = re.compile(
+            r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,\s*"
+            r"rename\s+(?:subcategory\s+)?(.+?)\s+(?:subcategory\s+)?to\s+(.+?)(?:[.,]|$)",
+            flags=re.IGNORECASE,
+        )
+        simple_pattern = re.compile(
+            r"\brename\s+(?:subcategory\s+)?(.+?)\s+(?:subcategory\s+)?to\s+(.+?)(?:[.,]|$)",
+            flags=re.IGNORECASE,
+        )
+
+        def _apply_rename(src_name: str, dest_name: str, parent_hint_for_match: Optional[str]) -> None:
+            handle_key = (
+                f"{self._normalize_name(src_name)}::{self._normalize_name(dest_name)}::"
+                f"{self._normalize_name(parent_hint_for_match or '')}"
+            )
+            if handle_key in handled:
+                return
+            handled.add(handle_key)
+
+            if not src_name or not dest_name:
+                return
+            if re.search(r"\b(?:grade\s+item|item)\b", src_name, flags=re.IGNORECASE):
+                return
+
+            match_result = self._find_subcategory_match(proposal, src_name, parent_hint_for_match)
+            if not match_result:
+                resolved_top = self._resolve_existing_category_name(proposal, src_name)
+                if (
+                    resolved_top
+                    and self._normalize_name(resolved_top) == self._normalize_name(src_name)
+                ):
+                    return
+                self._append_subcategory_not_found_effect(
+                    proposal,
+                    src_name,
+                    "rename",
+                    parent_hint=parent_hint_for_match,
+                )
+                return
+
+            parent, sub = match_result
+            dest_clean = re.sub(r"\s+", " ", dest_name).strip()
+            if not dest_clean:
+                return
+            if any(
+                self._subcategory_labels_match(existing.name, dest_clean)
+                for existing in (parent.subcategories or [])
+                if existing is not sub
+            ):
+                return
+
+            old_name = sub.name
+            sub.name = dest_clean.title() if dest_clean.islower() else dest_clean
+            renamed_sources.add(self._normalize_name(old_name))
+            renamed_sources.add(self._normalize_name(src_name))
+            self._append_effect_note(
+                proposal,
+                f"Renamed subcategory '{old_name}' to '{sub.name}' in {parent.name}",
+            )
+
+        for match in scoped_pattern.finditer(prompt):
+            scoped_parent = (match.group(1) or "").strip()
+            src_name = (match.group(2) or "").strip().rstrip("., ")
+            dest_name = (match.group(3) or "").strip().rstrip("., ")
+            _apply_rename(src_name, dest_name, scoped_parent or parent_hint)
+
+        for match in simple_pattern.finditer(prompt):
+            src_name = (match.group(1) or "").strip().rstrip("., ")
+            dest_name = (match.group(2) or "").strip().rstrip("., ")
+            _apply_rename(src_name, dest_name, parent_hint)
+
+        return renamed_sources
+
+    def _apply_subcategory_additions(self, proposal: GradebookProposal, prompt: str) -> None:
+        parent_hint = self._extract_scoped_parent_label(prompt)
+        handled: set[str] = set()
+
+        scoped_pattern = re.compile(
+            r"\b(?:in|for)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s*\(\s*\d+(?:\.\d+)?\s*%\s*\))?\s*,\s*"
+            r"add\s+(?:subcategory\s+)?([a-zA-Z][a-zA-Z\- ]{1,40}?)(?:\s+subcategory)?"
+            r"(?:\s+(?:with\s+)?(?:weight\s+)?(?:of\s+)?(\d+(?:\.\d+)?)\s*%?)?(?:[.,]|$)",
+            flags=re.IGNORECASE,
+        )
+        trailing_parent_pattern = re.compile(
+            r"\badd\s+(?:subcategory\s+)?([a-zA-Z][a-zA-Z\- ]{1,40}?)(?:\s+subcategory)?"
+            r"(?:\s+(?:with\s+)?(?:weight\s+)?(?:of\s+)?(\d+(?:\.\d+)?)\s*%?)?"
+            r"\s+(?:to|into|under|in)\s+([a-zA-Z][a-zA-Z ]{1,40}?)(?:\s+category)?(?:[.,]|$)",
+            flags=re.IGNORECASE,
+        )
+
+        def _apply_add(parent_label: str, sub_name: str, raw_weight: Optional[str]) -> None:
+            parent_label = parent_label or parent_hint or ""
+            sub_name = re.sub(r"\s+", " ", sub_name).strip(" ,.")
+            if not sub_name or not parent_label:
+                return
+
+            # "add grade item X to Y" belongs to manual-item flow, not subcategory CRUD.
+            if re.search(r"\b(?:grade\s+item|manual\s+item)\b", sub_name, re.IGNORECASE):
+                return
+
+            # Prevent ambiguous "add X to Y" from creating subcategories unless
+            # the user explicitly says subcategory/subcategories or provides a weight.
+            has_explicit_subcategory_intent = bool(
+                re.search(r"\bsubcategor(?:y|ies)\b", prompt, re.IGNORECASE)
+            )
+            if (raw_weight is None or str(raw_weight).strip() == "") and not has_explicit_subcategory_intent:
+                return
+
+            handle_key = f"{self._normalize_name(sub_name)}::{self._normalize_name(parent_label)}"
+            if handle_key in handled:
+                return
+            handled.add(handle_key)
+
+            parent_name = self._resolve_existing_category_name(proposal, parent_label)
+            if not parent_name:
+                return
+
+            parent = next((cat for cat in proposal.categories if cat.name.lower() == parent_name.lower()), None)
+            if parent is None:
+                return
+
+            if any(self._subcategory_labels_match(existing.name, sub_name) for existing in (parent.subcategories or [])):
+                return
+
+            weight_value: Optional[float] = None
+            if raw_weight is not None and str(raw_weight).strip() != "":
+                parsed = self._parse_subcategory_weight_value(str(raw_weight), float(parent.weight))
+                if parsed is not None:
+                    weight_value = float(parsed)
+
+            if weight_value is None:
+                weight_value = 0.0
+
+            parent.subcategories = list(parent.subcategories or [])
+            display_name = sub_name.title() if sub_name.islower() else sub_name
+            parent.subcategories.append(GradebookSubcategory(name=display_name, weight=weight_value))
+            self._append_effect_note(
+                proposal,
+                f"Added subcategory '{display_name}' ({weight_value:.1f}%) to {parent.name}",
+            )
+
+        for match in scoped_pattern.finditer(prompt):
+            _apply_add(
+                (match.group(1) or "").strip(),
+                (match.group(2) or "").strip(),
+                match.group(3),
+            )
+
+        for match in trailing_parent_pattern.finditer(prompt):
+            _apply_add(
+                (match.group(3) or "").strip(),
+                (match.group(1) or "").strip(),
+                match.group(2),
+            )
+
     def _apply_removals(self, proposal: GradebookProposal, prompt: str) -> None:
         """Handle category removal with three distinct weight modes.
 
@@ -2801,6 +4906,8 @@ class ProposalGenerator:
         2. ``remove X evenly``              – redistribute freed weight to remaining categories
         3. ``remove X and give/assign to Y``– transfer freed weight to specific category Y
         """
+        subcategory_handled = self._apply_subcategory_removals(proposal, prompt)
+
         def _clean_phrase(value: str) -> str:
             cleaned = re.sub(
                 r"\b(?:the|a|an|its|lowest|highest|category|categories|weight|one|single)\b",
@@ -2827,6 +4934,10 @@ class ProposalGenerator:
             if re.search(r"\bfrom\b", raw_category, flags=re.IGNORECASE):
                 continue
             if re.search(r"\b(?:grade\s+item|item)\b", raw_category, flags=re.IGNORECASE):
+                continue
+
+            raw_key = self._normalize_name(raw_category)
+            if any(key.startswith(f"{raw_key}::") for key in subcategory_handled):
                 continue
 
             resolved = self._resolve_category_name(proposal, raw_category)
@@ -3035,6 +5146,11 @@ class ProposalGenerator:
     )
 
     def _post_update_checks(self, proposal: GradebookProposal, prompt: str) -> None:
+        proposal.notes = [
+            n for n in (proposal.notes or [])
+            if not str(n).lower().startswith("weight check:")
+        ]
+
         total = sum(cat.weight for cat in proposal.categories)
 
         normalize_requested = bool(self._NORMALIZE_PATTERNS.search(prompt))

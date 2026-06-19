@@ -86,6 +86,10 @@ class ContextRetriever:
         r")\b",
         re.IGNORECASE,
     )
+    _EMBED_SCOPE_PREFIX_RE = re.compile(
+        r"^answer\s+using\s+only\s+the\s+training\s+materials\b.*?\bq:\s*",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     def __init__(
             self,
@@ -267,6 +271,24 @@ class ContextRetriever:
 
         return focused_prompt
 
+    @classmethod
+    def extract_embed_user_question(cls, prompt: str) -> str:
+        """Return the student's question from a Moodle embed-enriched prompt."""
+        stripped_prompt = (prompt or "").strip()
+        if not stripped_prompt:
+            return stripped_prompt
+
+        scoped_match = cls._EMBED_SCOPE_PREFIX_RE.search(stripped_prompt)
+        if scoped_match:
+            return stripped_prompt[scoped_match.end():].strip()
+
+        if "q: " in stripped_prompt:
+            focused_part = stripped_prompt.rsplit("q: ", 1)[-1].strip()
+            if focused_part:
+                return focused_part
+
+        return stripped_prompt
+
     @staticmethod
     def _strip_leading_article(prompt: str) -> str:
         return re.sub(r"^(the|a|an)\s+", "", (prompt or "").strip(), flags=re.IGNORECASE)
@@ -283,18 +305,34 @@ class ContextRetriever:
         return list(dict.fromkeys(keywords))
 
     @classmethod
+    def _normalized_file_name_tokens(cls, file_name: str) -> str:
+        return re.sub(r"[_\-.]+", " ", (file_name or "").lower())
+
+    @classmethod
     def prioritize_nodes_for_prompt(cls, prompt: str, nodes: List[TextNodeWithScore]) -> List[TextNodeWithScore]:
-        focused_prompt = cls._extract_focused_question_prompt(prompt) or prompt
+        user_question = cls.extract_embed_user_question(prompt)
+        focused_prompt = cls._extract_focused_question_prompt(user_question) or user_question
         keywords = cls._prompt_keywords(focused_prompt)
         if not keywords:
             return nodes
 
-        def relevance_key(item: tuple[int, TextNodeWithScore]) -> tuple[int, int, float, int]:
+        def relevance_key(item: tuple[int, TextNodeWithScore]) -> tuple[int, int, int, float, int]:
             index, node = item
             text = (node.node.text or "").lower()
+            metadata = node.node.metadata or {}
+            file_name = cls._normalized_file_name_tokens(
+                str(metadata.get(cls.FILE_NAME_METADATA_KEY, ""))
+            )
             matched_keywords = sum(1 for keyword in keywords if keyword in text)
+            file_name_matches = sum(1 for keyword in keywords if keyword in file_name)
             total_matches = sum(text.count(keyword) for keyword in keywords)
-            return (-matched_keywords, -total_matches, -float(node.score or 0.0), index)
+            return (
+                -file_name_matches,
+                -matched_keywords,
+                -total_matches,
+                -float(node.score or 0.0),
+                index,
+            )
 
         return [node for _, node in sorted(enumerate(nodes), key=relevance_key)]
 
@@ -815,11 +853,32 @@ class ContextRetriever:
 
     @classmethod
     def build_retrieval_prompts(cls, prompt: str) -> List[str]:
-        prompts = [prompt.strip()]
         stripped_prompt = prompt.strip()
+        prompts = [stripped_prompt]
+        user_question = cls.extract_embed_user_question(stripped_prompt)
+
+        if user_question and user_question != stripped_prompt:
+            prompts.append(user_question)
+
+        # Course assistant bots often receive 'enriched' prompts that contain
+        # instructions or context before the actual question (prefixed with 'q: ').
+        # Extract the focused part to ensure vector retrieval stays relevant.
+        if "q: " in stripped_prompt:
+            parts = stripped_prompt.split("q: ")
+            if len(parts) > 1:
+                focused_part = parts[-1].strip()
+                if focused_part:
+                    prompts.append(focused_part)
+                    # Also try to extract question variant from the focused part
+                    question_variant = cls._extract_focused_question_prompt(focused_part)
+                    if question_variant:
+                        prompts.append(question_variant)
+                        article_free = cls._strip_leading_article(question_variant)
+                        if article_free and article_free.lower() != question_variant.lower():
+                            prompts.append(article_free)
 
         if cls._is_summary_style_request(prompt):
-            summary_prompt = cls._PROMPT_PREFIX_RE.sub("", stripped_prompt).strip(" .")
+            summary_prompt = cls._PROMPT_PREFIX_RE.sub("", user_question or stripped_prompt).strip(" .")
             segments = [
                 segment.strip(" .")
                 for segment in cls._PROMPT_SPLIT_RE.split(summary_prompt)
@@ -831,7 +890,7 @@ class ContextRetriever:
                     continue
                 prompts.append(segment)
         else:
-            focused_prompt = cls._extract_focused_question_prompt(stripped_prompt)
+            focused_prompt = cls._extract_focused_question_prompt(user_question or stripped_prompt)
             if focused_prompt:
                 prompts.append(focused_prompt)
                 article_free_prompt = cls._strip_leading_article(focused_prompt)
@@ -1014,6 +1073,7 @@ def build_context_prompt(context: TextContext, prompt: str = "", best_guess: boo
     :return: The context prompt
 
     """
+    user_question = ContextRetriever.extract_embed_user_question(prompt)
 
     extra_text: str = (
         "If nothing from this information is relevant, use your knowledge to guess."
@@ -1040,7 +1100,7 @@ def build_context_prompt(context: TextContext, prompt: str = "", best_guess: boo
         {extra_text}
 
         [QUESTION]
-        {prompt}
+        {user_question}
 
         [INFORMATION]
         {context.text}

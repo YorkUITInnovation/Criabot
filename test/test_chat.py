@@ -244,15 +244,44 @@ async def test_send_explicit_summary_prompt_uses_summary_fast_path(chat, bot_moc
 
 
 @pytest.mark.asyncio
-async def test_related_prompts_dns_failure_disables_further_attempts(chat, bot_mock, bot_parameters):
-    bot_parameters.llm_generate_related_prompts = True
-    bot_mock.criadex.agents.azure.related_prompts = AsyncMock(
-        side_effect=Exception("Network error after 3 attempts: [Errno -2] Name or service not known")
+async def test_send_pointer_node_forces_llm_call(chat, bot_mock):
+    # If the retrieved node says "Please refer to Section 1.1", 
+    # we should NOT use a direct reply. Instead, we call the LLM
+    # so it can try to find the actual content or give a better answer.
+    nodes = [
+        make_text_node("Please refer to Section 1.1 of the syllabus for learning outcomes."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
     )
 
-    first = await chat.send(prompt="hello one", metadata_filter=None, extra_bots=[])
-    second = await chat.send(prompt="hello two", metadata_filter=None, extra_bots=[])
+    await chat.send(
+        prompt="What are the learning outcomes?",
+        metadata_filter=None,
+        extra_bots=[],
+    )
 
-    assert first.content.content == "assistant reply"
-    assert second.content.content == "assistant reply"
-    assert bot_mock.criadex.agents.azure.related_prompts.await_count == 1
+    # LLM should be called because direct reply is suppressed for pointers
+    bot_mock.criadex.agents.azure.chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_send_non_pointer_single_node_uses_direct_reply(chat, bot_mock):
+    nodes = [
+        make_text_node("The learning outcome is to master the art of Art."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
+    )
+
+    reply = await chat.send(
+        prompt="What is the learning outcome?",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert reply.content.content == "The learning outcome is to master the art of Art."
+    # LLM should NOT be called
+    bot_mock.criadex.agents.azure.chat.assert_not_called()

@@ -1,5 +1,6 @@
 import logging
 import traceback
+import re
 from typing import List, Optional, Dict, Tuple
 
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
@@ -441,6 +442,13 @@ class Chat:
 
         top_fact_text = fact_texts[0]
         if len(top_fact_text) > 300:
+            return False
+
+        # If the top fact looks like a pointer to another section rather than 
+        # the answer itself, avoid a direct reply so the LLM can try to 
+        # synthesize a better response from all retrieved context.
+        pointer_pattern = r"\b(please\s+)?refer\s+to\b|\bsee\s+(section|chapter|appendix|page|module)\b"
+        if re.search(pointer_pattern, top_fact_text, re.IGNORECASE):
             return False
 
         if len(context.nodes) == 1:

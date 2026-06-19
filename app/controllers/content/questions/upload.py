@@ -2,6 +2,7 @@ import uuid
 from typing import Type
 
 from CriadexSDK.ragflow_schemas import ContentUploadConfig
+from CriadexSDK.ragflow_sdk import CriadexAPIError
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from pydantic import Field
@@ -9,7 +10,7 @@ from starlette.requests import Request
 
 from app.controllers.content.documents.upload import UploadDocumentResponse
 from app.controllers.schemas import NOT_FOUND_CODE, \
-    SUCCESS_CODE, APIResponseModel, QuestionConfig, exception_response, \
+    SUCCESS_CODE, DUPLICATE_CODE, APIResponseModel, QuestionConfig, exception_response, \
     catch_exceptions
 from app.core.route import CriaRoute
 from criabot.bot.schemas import GroupContentResponse
@@ -28,6 +29,13 @@ class QuestionUploadConfig(ContentUploadConfig):
 @cbv(view)
 class UploadQuestionRoute(CriaRoute):
     ResponseModel = UploadDocumentResponse
+
+    @staticmethod
+    def _is_duplicate_content_error(exc: CriadexAPIError) -> bool:
+        if exc.status_code != 409:
+            return False
+        raw_message = str(getattr(exc, "message", "")) or str(exc)
+        return "DUPLICATE" in raw_message or "already exists" in raw_message.lower()
 
     @view.post(
         path="/bots/{bot_name}/questions/upload",
@@ -52,22 +60,33 @@ class UploadQuestionRoute(CriaRoute):
             bot_name: str,
             file: QuestionUploadConfig
     ) -> ResponseModel:
-    # Try to retrieve the bot
-        from criabot.bot.bot import Bot
-        bot: Bot = await request.app.criabot.get(name=bot_name)
+        try:
+            # Try to retrieve the bot
+            from criabot.bot.bot import Bot
+            bot: Bot = await request.app.criabot.get(name=bot_name)
 
-        response: GroupContentResponse = await bot.add_group_content(
-            file=file,
-            index_type="QUESTION"
-        )
+            response: GroupContentResponse = await bot.add_group_content(
+                file=file,
+                index_type="QUESTION"
+            )
 
-        return ResponseModel(
-            code=SUCCESS_CODE,
-            status=200,
-            message="Successfully added to the index. Save the 'document_name' field to be able to update it!",
-            document_name=response.get("document_name"),
-            token_usage=response.get("token_usage")
-        )
+            return ResponseModel(
+                code=SUCCESS_CODE,
+                status=200,
+                message="Successfully added to the index. Save the 'document_name' field to be able to update it!",
+                document_name=response.get("document_name"),
+                token_usage=response.get("token_usage")
+            )
+        except CriadexAPIError as ex:
+            if self._is_duplicate_content_error(ex):
+                return ResponseModel(
+                    code=DUPLICATE_CODE,
+                    status=409,
+                    message="A question with this name already exists in the index. Please use a different name or update the existing question.",
+                    document_name=None,
+                    token_usage=None
+                )
+            raise
 
 
 __all__ = ["view"]

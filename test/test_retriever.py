@@ -270,6 +270,52 @@ def test_build_retrieval_prompts_for_direct_question_adds_focused_variant():
     ]
 
 
+def test_build_retrieval_prompts_extracts_question_from_enriched_prompt():
+    enriched_prompt = (
+        "Answer using only the training materials indexed for this course. "
+        "The current course is 'Art of Art'. q: What are the learning outcomes?"
+    )
+    prompts = ContextRetriever.build_retrieval_prompts(enriched_prompt)
+
+    # It should include the full prompt (for safety), the extracted question, 
+    # and the focused variants of that question.
+    assert "What are the learning outcomes?" in prompts
+    assert "the learning outcomes" in prompts
+    assert "learning outcomes" in prompts
+    # But it shouldn't just be the full string
+    assert len(prompts) > 1
+
+
+def test_extract_embed_user_question_from_moodle_embed_prompt():
+    enriched_prompt = (
+        'Answer using only the training materials indexed for this Moodle course assistant. '
+        'The current course is "The art of Art" (The art of Art), Moodle course id 7. '
+        'When the user says "this course", "the course", or asks about course learning outcomes, '
+        'they mean this course. I am a student and my name is Test User.. Current grade: 0. '
+        "Today's date is 6/10/26. "
+        'q: For the course "The art of Art": can you tell me about this course Learning Outcomes?'
+    )
+    assert ContextRetriever.extract_embed_user_question(enriched_prompt) == (
+        'For the course "The art of Art": can you tell me about this course Learning Outcomes?'
+    )
+
+
+def test_prioritize_nodes_boosts_filename_keyword_matches_for_embed_prompt():
+    nodes = [
+        create_text_node("General feedback notes about critique techniques.", metadata={"file_name": "page_71_notes.html"}),
+        create_text_node(
+            "The robotics lab is located in Building 7, Room B12.",
+            metadata={"file_name": "page_12_Robotics_Lab_Location.html"},
+        ),
+    ]
+    prompt = (
+        'Answer using only the training materials indexed for this Moodle course assistant. '
+        'The current course is "Physics 101". q: Where is the robotics lab located?'
+    )
+    ranked = ContextRetriever.prioritize_nodes_for_prompt(prompt, nodes)
+    assert ranked[0].node.metadata["file_name"] == "page_12_Robotics_Lab_Location.html"
+
+
 @pytest.mark.asyncio
 async def test_retrieve_limits_direct_question_context_to_adaptive_budget(retriever):
     nodes = [

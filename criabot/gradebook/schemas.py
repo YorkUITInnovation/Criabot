@@ -51,6 +51,11 @@ GRADE_DISPLAY_TYPE_NAMES = {
 class GradebookSubcategory(BaseModel):
     name: str
     weight: float
+    items: List[str] = Field(default_factory=list)
+    item_weights: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-item weight overrides inside this subcategory.",
+    )
     aggregation_method: Optional[int] = Field(
         default=None,
         description="Optional Moodle aggregation method override for this subcategory.",
@@ -171,6 +176,10 @@ class BaselineSnapshotV1(BaseModel):
 
 class GradebookProposal(BaseModel):
     categories: List[GradebookCategory] = Field(default_factory=list)
+    not_graded_items: List[str] = Field(
+        default_factory=list,
+        description="Moodle activities explicitly marked not graded via chat; excluded from category tree",
+    )
     notes: List[str] = Field(default_factory=list)
     aggregation_method: int = Field(default=13, description="Moodle aggregation method: 0=Mean, 10=Weighted mean, 11=Simple weighted mean, 12=Mean with extra credits, 13=Natural (default)")
 

@@ -18,6 +18,7 @@ class ContentMappingItem(BaseModel):
     itemtype: Optional[str] = None
     item_source: Optional[str] = None
     category: str
+    subcategory: Optional[str] = None
 
 
 class GradebookFinalizeRequest(BaseModel):

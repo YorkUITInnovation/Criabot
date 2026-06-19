@@ -1629,6 +1629,7 @@ class Criabot:
             "reply": reply_message,
             "proposal": session.proposal.model_dump() if session.proposal else None,
             "proposal_changed": self._normalize_bool_flag((session.extraction or {}).get("proposal_changed", False)),
+            "content_mapping": session.content_mapping,
             "chat_history": persisted_history,
         }
 
@@ -1857,6 +1858,7 @@ class Criabot:
             "session_id": session.session_id,
             "phase": session.phase,
             "proposal": session.proposal.model_dump() if session.proposal else None,
+            "content_mapping": session.content_mapping,
         }
 
     async def gradebook_finalize(

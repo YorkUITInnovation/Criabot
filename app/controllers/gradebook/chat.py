@@ -20,6 +20,8 @@ class GradebookChatResponse(APIResponse):
     phase: Optional[str] = None
     reply: Optional[str] = None
     proposal: Optional[dict] = None
+    proposal_changed: Optional[bool] = None
+    content_mapping: Optional[dict] = None
     chat_history: Optional[list] = None
 
 
@@ -33,7 +35,7 @@ class GradebookChatRoute(CriaRoute):
         summary="Advance gradebook workflow by prompt",
         description="Consumes professor feedback and advances the gradebook workflow state machine.",
     )
-    @general_limiter.limit("30/minute")
+    @general_limiter.limit("300/minute")
     @catch_exceptions(ResponseModel)
     @exception_response(
         KeyError,
@@ -53,6 +55,8 @@ class GradebookChatRoute(CriaRoute):
             phase=result.get("phase"),
             reply=result.get("reply"),
             proposal=result.get("proposal"),
+            proposal_changed=result.get("proposal_changed"),
+            content_mapping=result.get("content_mapping"),
             chat_history=result.get("chat_history"),
         )
 

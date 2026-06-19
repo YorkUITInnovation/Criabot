@@ -20,6 +20,7 @@ class GradebookSyncResponse(APIResponse):
     session_id: Optional[str] = None
     phase: Optional[str] = None
     proposal: Optional[dict] = None
+    content_mapping: Optional[dict] = None
 
 
 @cbv(view)
@@ -60,6 +61,7 @@ class GradebookSyncRoute(CriaRoute):
             session_id=result.get("session_id"),
             phase=result.get("phase"),
             proposal=result.get("proposal"),
+            content_mapping=result.get("content_mapping"),
         )
 
 

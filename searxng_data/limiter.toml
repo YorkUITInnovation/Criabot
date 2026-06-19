@@ -10,7 +10,13 @@ ipv6_prefix = 48
 # extracted from the X-Forwarded-For and X-Real-IP headers. This should be
 # used if SearXNG is behind a reverse proxy or load balancer.
 
-trusted_proxies = []
+# Docker bridge + loopback: lets SearXNG read X-Forwarded-For / X-Real-IP from Criabot.
+trusted_proxies = [
+  '127.0.0.0/8',
+  '::1',
+  '172.16.0.0/12',
+  '10.0.0.0/8',
+]
 
 [botdetection.ip_limit]
 

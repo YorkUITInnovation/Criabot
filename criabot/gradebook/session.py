@@ -15,7 +15,15 @@ from .proposal import (
     ProposalGenerator,
     validate_proposal_weights,
     sync_proposal_items_from_mapping,
+    sync_proposal_not_graded_from_confirmed_mapping,
     sync_mapping_from_proposal_manual_items,
+    snapshot_subcategories,
+    infer_subcategory_renames,
+    infer_subcategory_removals,
+    should_invalidate_content_mapping,
+    sync_content_mapping_with_proposal_subcategory_changes,
+    sync_confirmed_mapping_into_content_mapping,
+    apply_mapping_subcategory_operations,
 )
 from .naming_utils import derive_course_activities_from_resources
 from .schemas import CourseActivity, GradebookSessionRecord, MoodleResource
@@ -128,6 +136,14 @@ class GradebookSessionEngine:
                 changed = True
 
         if confirmed_mapping and session.proposal is not None:
+            if sync_proposal_not_graded_from_confirmed_mapping(
+                session.proposal,
+                confirmed_mapping,
+                session.course_activities,
+            ):
+                self._ensure_history_initialized(session)
+                self._push_proposal_history(session)
+                changed = True
             if sync_proposal_items_from_mapping(
                 session.proposal,
                 confirmed_mapping,
@@ -144,6 +160,19 @@ class GradebookSessionEngine:
                 session.course_activities,
             ):
                 changed = True
+
+        if confirmed_mapping and session.content_mapping is not None:
+            if sync_confirmed_mapping_into_content_mapping(
+                session.content_mapping,
+                confirmed_mapping,
+                session.proposal,
+            ):
+                changed = True
+            validation_errors = self._content_mapper.validate_mapping(
+                (session.content_mapping or {}).get("graded_activities") or [],
+                session.proposal,
+            )
+            session.content_mapping["validation_errors"] = validation_errors
 
         if changed:
             await self._save_session(session)
@@ -647,6 +676,8 @@ class GradebookSessionEngine:
             self._push_proposal_history(session)
 
         proposal_changed = False
+        proposal_before_obj = session.proposal
+        subcategories_before = snapshot_subcategories(session.proposal)
         force_mutation_on_first_post_finalize_edit = bool(
             previous_phase in {"ACCEPTED", "COMPLETED"}
             and session.phase == "REFINEMENT"
@@ -654,6 +685,7 @@ class GradebookSessionEngine:
         )
         should_mutate_proposal = bool(
             session.proposal is not None
+            and not self._conversation._is_read_only_gradebook_prompt(prompt)
             and (
                 force_mutation_on_first_post_finalize_edit
                 or
@@ -675,9 +707,45 @@ class GradebookSessionEngine:
         session.extraction["proposal_changed"] = proposal_changed
 
         if proposal_changed:
-            # Force re-accept/rebuild mapping after edits to avoid stale finalize validation.
-            session.content_mapping = None
-            session.extraction.pop("llm_mapper_chat_id", None)
+            subcategories_after = snapshot_subcategories(session.proposal)
+            subcategory_renames = infer_subcategory_renames(subcategories_before, subcategories_after)
+            subcategory_removals = infer_subcategory_removals(
+                subcategories_before,
+                subcategories_after,
+                subcategory_renames,
+            )
+            subcategories_changed = subcategories_before != subcategories_after
+            if session.content_mapping is not None and subcategories_changed:
+                sync_content_mapping_with_proposal_subcategory_changes(
+                    session.content_mapping,
+                    session.proposal,
+                    subcategory_renames,
+                    subcategory_removals,
+                )
+                validation_errors = self._content_mapper.validate_mapping(
+                    (session.content_mapping or {}).get("graded_activities") or [],
+                    session.proposal,
+                )
+                session.content_mapping["validation_errors"] = validation_errors
+
+            if should_invalidate_content_mapping(proposal_before_obj, session.proposal):
+                # Force re-accept/rebuild mapping after structural edits to avoid stale finalize validation.
+                session.content_mapping = None
+                session.extraction.pop("llm_mapper_chat_id", None)
+
+        if session.content_mapping is not None and session.proposal is not None:
+            if proposal_changed and apply_mapping_subcategory_operations(
+                session.content_mapping,
+                session.proposal,
+                prompt,
+                session.course_activities,
+            ):
+                validation_errors = self._content_mapper.validate_mapping(
+                    (session.content_mapping or {}).get("graded_activities") or [],
+                    session.proposal,
+                )
+                session.content_mapping["validation_errors"] = validation_errors
+                await self._save_session(session)
 
         # Always update syllabus_sources to reflect current visible resources and session uploads
         uploaded_docs = list(session.uploaded_document_ids or [])
@@ -789,10 +857,18 @@ class GradebookSessionEngine:
         # Mapping validation: stale/non-existent categories should block accept.
         for issue in list((content_mapping or {}).get("validation_errors") or []):
             activity_name = str(issue.get("activity_name") or "Unknown activity")
-            missing_category = str(issue.get("missing_category") or "Unknown category")
-            errors.append(
-                f"Activity '{activity_name}' points to missing category '{missing_category}'."
-            )
+            if issue.get("missing_category"):
+                missing_category = str(issue.get("missing_category") or "Unknown category")
+                errors.append(
+                    f"Activity '{activity_name}' points to missing category '{missing_category}'."
+                )
+            if issue.get("missing_subcategory"):
+                missing_subcategory = str(issue.get("missing_subcategory") or "Unknown subcategory")
+                parent_category = str(issue.get("parent_category") or "parent category")
+                warnings.append(
+                    f"Activity '{activity_name}' points to missing subcategory '{missing_subcategory}' "
+                    f"under '{parent_category}'."
+                )
 
         # Empty categories are warnings (non-blocking) so instructors can intentionally keep them.
         assigned_categories = set()
@@ -1068,6 +1144,14 @@ class GradebookSessionEngine:
 
             existing["suggested_category"] = confirmed.get("category")
             existing["confirmed_category"] = confirmed.get("category")
+            confirmed_subcategory = str(
+                confirmed.get("subcategory")
+                or confirmed.get("confirmed_subcategory")
+                or ""
+            ).strip()
+            existing["suggested_subcategory"] = confirmed_subcategory
+            existing["confirmed_subcategory"] = confirmed_subcategory
+            existing["subcategory"] = confirmed_subcategory
             existing["finalized"] = True
             matched_count += 1
 
