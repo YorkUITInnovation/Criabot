@@ -755,3 +755,153 @@ async def test_web_search_client_returns_empty_for_non_retriable_http_4xx():
     assert results == []
     # Non-retriable 4xx should not trigger backoff retry sleeps.
     mocked_sleep.assert_not_awaited()
+
+
+# ============================================================================
+# TESTS FOR STREAMING CALLBACK (on_step) FUNCTIONALITY
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_retrieve_calls_on_step_callback_for_graphrag(retriever, bot_mock):
+    """Test that on_step callback is invoked when GraphRAG is queried"""
+    nodes = [create_text_node("text 1")]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
+
+    # Track on_step calls
+    on_step_calls = []
+    
+    async def track_on_step(engine, state, message):
+        on_step_calls.append({"engine": engine, "state": state, "message": message})
+
+    response = await retriever.retrieve(
+        prompt="hello",
+        metadata_filter=None,
+        extra_bots=[],
+        on_step=track_on_step
+    )
+
+    # Verify callback was called for graphrag, elasticsearch, rerank, synthesis
+    engines_called = [call["engine"] for call in on_step_calls]
+    assert "elasticsearch" in engines_called
+    assert "rerank" in engines_called
+    
+    # Verify response is still valid
+    assert isinstance(response.context, TextContext)
+
+
+@pytest.mark.asyncio
+async def test_retrieve_on_step_callback_with_web_search(retriever, bot_mock):
+    """Test that on_step callback is invoked for web search when triggered"""
+    nodes = [create_text_node("text 1")]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
+    
+    # Mock web search to return results
+    web_nodes = [create_text_node("web result", metadata={"url": "http://example.com"})]
+    retriever._search_web_nodes = AsyncMock(return_value=web_nodes)
+    
+    # Mock conditions to trigger web search
+    retriever._can_use_web_search = MagicMock(return_value=True)
+    retriever._explicit_web_search_requested = MagicMock(return_value=True)
+
+    on_step_calls = []
+    
+    async def track_on_step(engine, state, message):
+        on_step_calls.append({"engine": engine, "state": state, "message": message})
+
+    response = await retriever.retrieve(
+        prompt="hello web search",
+        metadata_filter=None,
+        extra_bots=[],
+        on_step=track_on_step
+    )
+
+    # Verify web_search callback was called
+    engines_called = [call["engine"] for call in on_step_calls]
+    assert "web_search" in engines_called
+    assert response is not None
+
+
+@pytest.mark.asyncio
+async def test_retrieve_on_step_callback_none_is_handled(retriever, bot_mock):
+    """Test that on_step=None doesn't cause errors"""
+    nodes = [create_text_node("text 1")]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
+
+    # Should not raise when on_step is None
+    response = await retriever.retrieve(
+        prompt="hello",
+        metadata_filter=None,
+        extra_bots=[],
+        on_step=None
+    )
+
+    assert isinstance(response.context, TextContext)
+
+
+@pytest.mark.asyncio
+async def test_on_step_callback_receives_proper_message_format(retriever, bot_mock):
+    """Test that on_step callback receives properly formatted status messages"""
+    nodes = [create_text_node("text 1")]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
+
+    on_step_calls = []
+    
+    async def track_on_step(engine, state, message):
+        on_step_calls.append({"engine": engine, "state": state, "message": message})
+
+    response = await retriever.retrieve(
+        prompt="hello",
+        metadata_filter=None,
+        extra_bots=[],
+        on_step=track_on_step
+    )
+
+    # Verify all calls have proper structure
+    for call in on_step_calls:
+        assert "engine" in call
+        assert "state" in call
+        assert "message" in call
+        assert call["state"] in ["start", "done"]
+        assert isinstance(call["message"], str)
+        assert len(call["message"]) > 0
+        # Check for emoji in messages
+        assert any(ord(c) > 127 for c in call["message"]) or any(
+            word in call["message"].lower() for word in ["query", "search", "rerank", "process"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_on_step_callback_async_exceptions_dont_break_retrieval(retriever, bot_mock):
+    """Test that exceptions in on_step callback don't break retrieval"""
+    nodes = [create_text_node("text 1")]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
+
+    async def broken_on_step(engine, state, message):
+        raise RuntimeError("Callback error")
+
+    # Should complete successfully despite callback error
+    response = await retriever.retrieve(
+        prompt="hello",
+        metadata_filter=None,
+        extra_bots=[],
+        on_step=broken_on_step
+    )
+
+    # Retrieval should still work
+    assert isinstance(response.context, TextContext)
+

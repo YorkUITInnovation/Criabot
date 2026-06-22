@@ -4,7 +4,7 @@ import itertools
 import os
 import re
 import textwrap
-from typing import List, Optional, Dict, Awaitable, Union, Type
+from typing import List, Optional, Dict, Awaitable, Union, Type, Callable
 
 from CriadexSDK.ragflow_sdk import RAGFlowSDK, CriadexNetworkError, CriadexAPIError
 from CriadexSDK.ragflow_schemas import TextNodeWithScore, Filter, GroupSearchResponse, CompletionUsage, Asset
@@ -403,7 +403,8 @@ class ContextRetriever:
             self,
             prompt,
             metadata_filter,
-            extra_bots
+            extra_bots,
+            on_step: Optional[Callable[[str, str, str], Awaitable[None]]] = None
     ):
         def to_group_response(search_result: object) -> tuple[GroupSearchResponse, object]:
             graph_meta = None
@@ -456,8 +457,12 @@ class ContextRetriever:
 
             search_result = None
             graph_meta = None
+            graphrag_attempted = False
             if self._graph_enabled:
                 try:
+                    if on_step:
+                        await on_step("graphrag", "start", "🕸️ Querying course concept graph (GraphRAG)...")
+                    graphrag_attempted = True
                     manage_api = getattr(self._criadex, "manage", None)
                     graph_search = getattr(manage_api, "graph_search", None) if manage_api is not None else None
                     if callable(graph_search):
@@ -478,16 +483,34 @@ class ContextRetriever:
                         elif not self._result_has_nodes(search_result):
                             # If graph search yields an empty response, fall back to standard retrieval.
                             search_result = None
+                        if on_step:
+                            if search_result and self._result_has_nodes(search_result):
+                                await on_step("graphrag", "done", "✓ GraphRAG retrieved nodes")
+                            else:
+                                await on_step("graphrag", "done", "✓ GraphRAG query complete")
                 except Exception:
+                    if on_step:
+                        await on_step("graphrag", "done", "✓ GraphRAG query complete (with errors)")
                     search_result = None
 
             if search_result is None:
-                search_result = await self._criadex.content.search(
-                    group_name=group_name,
-                    search_config=search_config
-                )
-                if inspect.isawaitable(search_result):
-                    search_result = await search_result
+                if on_step and not graphrag_attempted:
+                    await on_step("elasticsearch", "start", "🔍 Searching course knowledge base (Elasticsearch)...")
+                elif on_step:
+                    await on_step("elasticsearch", "start", "🔍 Searching course knowledge base (Elasticsearch)...")
+                try:
+                    search_result = await self._criadex.content.search(
+                        group_name=group_name,
+                        search_config=search_config
+                    )
+                    if inspect.isawaitable(search_result):
+                        search_result = await search_result
+                    if on_step:
+                        await on_step("elasticsearch", "done", "✓ Elasticsearch search complete")
+                except Exception:
+                    if on_step:
+                        await on_step("elasticsearch", "done", "✓ Elasticsearch search complete (with errors)")
+                    raise
             response_obj, graph_meta_from_result = to_group_response(search_result)
             if graph_meta_from_result:
                 graph_meta = graph_meta_from_result
@@ -731,11 +754,24 @@ class ContextRetriever:
             self,
             prompt,
             metadata_filter,
-            extra_bots
+            extra_bots,
+            on_step: Optional[Callable[[str, str, str], Awaitable[None]]] = None
     ):
         retriever_response = ContextRetrieverResponse(
             group_responses={}
         )
+        
+        # Create a safe wrapper for on_step callback to handle errors gracefully
+        safe_on_step = None
+        if on_step:
+            async def safe_on_step_wrapper(engine: str, state: str, message: str):
+                try:
+                    await on_step(engine, state, message)
+                except Exception:
+                    # Silently ignore callback errors to not break retrieval
+                    pass
+            safe_on_step = safe_on_step_wrapper
+        
         search_prompts = self.build_retrieval_prompts(prompt)
         summary_style_request = self._is_summary_style_request(prompt)
         response_sets = []
@@ -744,7 +780,8 @@ class ContextRetriever:
                 await self.search_groups(
                     prompt=search_prompt,
                     metadata_filter=metadata_filter,
-                    extra_bots=extra_bots
+                    extra_bots=extra_bots,
+                    on_step=safe_on_step
                 )
             )
 
@@ -790,8 +827,12 @@ class ContextRetriever:
         if should_run_web_fallback or should_run_web_parallel:
             if should_run_web_parallel or not self._web_search_fallback_only:
                 try:
+                    if on_step:
+                        await on_step("web_search", "start", "🌐 Dispatching secure web query (SearXNG)...")
                     web_nodes = await self._search_web_nodes(prompt)
                     if web_nodes:
+                        if on_step:
+                            await on_step("web_search", "done", f"✓ SearXNG retrieved {len(web_nodes)} external resources")
                         self._attach_web_group_response(retriever_response, web_nodes)
                         nodes = self.normalize_ranked_nodes([*nodes, *web_nodes])
                         if nodes:
@@ -801,12 +842,20 @@ class ContextRetriever:
                                 related_prompts=[],
                             )
                             return retriever_response
+                    elif on_step:
+                        await on_step("web_search", "done", "✓ Web search complete: no new results")
                 except Exception:
+                    if on_step:
+                        await on_step("web_search", "done", "✓ Web search complete (with errors)")
                     pass
             else:
                 try:
+                    if on_step:
+                        await on_step("web_search", "start", "🌐 Dispatching secure web query (SearXNG)...")
                     web_nodes = await self._search_web_nodes(prompt)
                     if web_nodes:
+                        if on_step:
+                            await on_step("web_search", "done", f"✓ SearXNG retrieved {len(web_nodes)} external resources")
                         self._attach_web_group_response(retriever_response, web_nodes)
                         retriever_response.context = TextContext(
                             text=build_text_context(nodes=web_nodes),
@@ -814,7 +863,11 @@ class ContextRetriever:
                             related_prompts=[],
                         )
                         return retriever_response
+                    elif on_step:
+                        await on_step("web_search", "done", "✓ Web search complete: no results")
                 except Exception:
+                    if on_step:
+                        await on_step("web_search", "done", "✓ Web search complete (with errors)")
                     pass
 
         # If there are no nodes after fallback attempt, return no-context.
@@ -833,9 +886,15 @@ class ContextRetriever:
             return retriever_response
         ranked_nodes: List[TextNodeWithScore] = []
         try:
+            if safe_on_step:
+                await safe_on_step("rerank", "start", "⚡ Reranking sources...")
             rerank_result = await self.hybrid_rerank(prompt=prompt, nodes=nodes)
             ranked_nodes = rerank_result.get("ranked_nodes") or []
+            if safe_on_step:
+                await safe_on_step("rerank", "done", f"✓ Rerank complete: top {len(ranked_nodes)} sources selected")
         except Exception:
+            if safe_on_step:
+                await safe_on_step("rerank", "done", "✓ Rerank complete (with errors)")
             ranked_nodes = []
 
         ranked_nodes = self.normalize_ranked_nodes(
