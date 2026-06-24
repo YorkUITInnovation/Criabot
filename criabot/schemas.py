@@ -34,6 +34,7 @@ class BotCreateConfig(BotParametersBaseConfig):
     embedding_model_id: int
     rerank_model_id: int
     use_knowledge_graph: bool = True
+    requires_documents: bool = True
     parent_bot_names: List[str] = Field(default_factory=list)
     parent_priorities: Optional[Dict[str, int]] = Field(default=None)
 

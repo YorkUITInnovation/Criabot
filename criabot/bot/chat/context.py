@@ -710,13 +710,20 @@ class ContextRetriever:
             metadata_filter,
             extra_groups
     ):
+        search_filter = metadata_filter
+        if metadata_filter is not None:
+            if hasattr(metadata_filter, "model_dump"):
+                search_filter = metadata_filter.model_dump(mode="json", exclude_none=True)
+            elif not isinstance(metadata_filter, dict):
+                search_filter = None
+
         return {
             "query": prompt,
             "top_k": self._bot_params.top_k,
             "min_k": self._bot_params.min_k,
             "top_n": self._bot_params.top_n,
             "min_n": self._bot_params.min_n,
-            "search_filter": metadata_filter,
+            "search_filter": search_filter,
             "extra_groups": extra_groups,
         }
 

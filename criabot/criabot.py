@@ -1051,6 +1051,9 @@ class Criabot:
                     "embedding_model_id": bot_config.embedding_model_id,
                     "rerank_model_id": bot_config.rerank_model_id,
                     "use_knowledge_graph": bot_config.use_knowledge_graph,
+                    "requires_documents": (
+                        bot_config.requires_documents if index_type == "DOCUMENT" else True
+                    ),
                 }
             )
             try:
