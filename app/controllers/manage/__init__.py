@@ -16,6 +16,8 @@ router = CriaRouter(
 
 about.view.dependencies.extend(NON_MASTER_DEPS)
 update.view.dependencies.extend(NON_MASTER_DEPS)
+children.view.dependencies.extend(NON_MASTER_DEPS)
+parents.view.dependencies.extend(NON_MASTER_DEPS)
 
 create.view.dependencies.extend(MASTER_DEPS)
 delete.view.dependencies.extend(MASTER_DEPS)

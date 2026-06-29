@@ -3,7 +3,7 @@ from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
 from app.controllers.schemas import NOT_FOUND_CODE, \
-    SUCCESS_CODE, exception_response, catch_exceptions
+    SUCCESS_CODE, CONTENT_WRITE_RATE_LIMIT, exception_response, catch_exceptions, bot_management_limiter
 from app.controllers.content.documents.delete import BotContentDeleteResponse
 from app.core.route import CriaRoute
 
@@ -23,6 +23,7 @@ class DeleteQuestionRoute(CriaRoute):
         summary="Delete a question on the bot",
         description="Delete a question on the bot",
     )
+    @bot_management_limiter.limit(CONTENT_WRITE_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

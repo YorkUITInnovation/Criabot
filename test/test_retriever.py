@@ -194,6 +194,41 @@ async def test_search_groups_with_parent_bots(retriever, bot_mock):
     )
 
 
+def test_build_search_group_config_preserves_dict_metadata_filter(retriever):
+    metadata_filter = {"must": [{"key": "course_id", "value": "101"}]}
+
+    config = retriever.build_search_group_config(
+        prompt="hello",
+        metadata_filter=metadata_filter,
+        extra_groups=[],
+    )
+
+    assert config["search_filter"] == metadata_filter
+
+
+def test_build_search_group_config_serializes_pydantic_filter(retriever):
+    metadata_filter = MagicMock()
+    metadata_filter.model_dump.return_value = {"must": [{"key": "course_id"}]}
+
+    config = retriever.build_search_group_config(
+        prompt="hello",
+        metadata_filter=metadata_filter,
+        extra_groups=[],
+    )
+
+    metadata_filter.model_dump.assert_called_once_with(mode="json", exclude_none=True)
+    assert config["search_filter"] == {"must": [{"key": "course_id"}]}
+
+
+def test_build_search_group_config_rejects_malformed_metadata_filter(retriever):
+    with pytest.raises(ValueError, match="metadata_filter must be"):
+        retriever.build_search_group_config(
+            prompt="hello",
+            metadata_filter="not-a-filter",
+            extra_groups=[],
+        )
+
+
 @pytest.mark.asyncio
 async def test_question_index_uses_single_pass_by_default(retriever):
     retriever._criadex.content.search.side_effect = make_group_search_side_effect(
@@ -905,3 +940,157 @@ async def test_on_step_callback_async_exceptions_dont_break_retrieval(retriever,
     # Retrieval should still work
     assert isinstance(response.context, TextContext)
 
+
+@pytest.mark.asyncio
+async def test_on_step_callback_emits_start_before_done_per_engine(retriever, bot_mock):
+    """Each engine should emit start before done to support progressive loader updates."""
+    nodes = [create_text_node("text 1")]
+    retriever._criadex.content.search.side_effect = make_group_search_side_effect(
+        {"child-document-index": nodes}
+    )
+    retriever.hybrid_rerank = AsyncMock(return_value={"ranked_nodes": nodes, "search_units": 1})
+
+    on_step_calls = []
+
+    async def track_on_step(engine, state, message):
+        on_step_calls.append({"engine": engine, "state": state, "message": message})
+
+    response = await retriever.retrieve(
+        prompt="hello",
+        metadata_filter=None,
+        extra_bots=[],
+        on_step=track_on_step
+    )
+
+    assert isinstance(response.context, TextContext)
+    assert len(on_step_calls) > 0
+
+    engine_states = {}
+    for call in on_step_calls:
+        engine_states.setdefault(call["engine"], []).append(call["state"])
+
+    for engine, states in engine_states.items():
+        if "start" in states and "done" in states:
+            assert states.index("start") < states.index("done"), (
+                f"Expected '{engine}' start before done, got order: {states}"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Web-search result caching
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_search_web_nodes_cache_miss_populates_cache(retriever, bot_mock, monkeypatch):
+    """On a cache miss we hit the live client and write the result back."""
+    web_cache = MagicMock()
+    web_cache.get = AsyncMock(return_value=None)
+    web_cache.set = AsyncMock()
+    bot_mock.cache_api.web_searches = web_cache
+
+    search_mock = AsyncMock(return_value=[
+        {"title": "Doc", "url": "http://example.com", "content": "snippet"}
+    ])
+    fake_client = MagicMock()
+    fake_client.search = search_mock
+    monkeypatch.setattr(
+        "criabot.bot.chat.context.WebSearchClient", MagicMock(return_value=fake_client)
+    )
+
+    nodes = await retriever._search_web_nodes("latest python news")
+
+    assert len(nodes) == 1
+    web_cache.get.assert_awaited_once()
+    web_cache.set.assert_awaited_once()
+    search_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_web_nodes_cache_hit_skips_client(retriever, bot_mock, monkeypatch):
+    """On a cache hit we rebuild nodes from cache and never call the client."""
+    cached_node = create_text_node("web result", metadata={"url": "http://example.com"})
+    payload = [cached_node.model_dump(mode="json")]
+
+    web_cache = MagicMock()
+    web_cache.get = AsyncMock(return_value=payload)
+    web_cache.set = AsyncMock()
+    bot_mock.cache_api.web_searches = web_cache
+
+    client_factory = MagicMock()
+    monkeypatch.setattr("criabot.bot.chat.context.WebSearchClient", client_factory)
+
+    nodes = await retriever._search_web_nodes("latest python news")
+
+    assert len(nodes) == 1
+    web_cache.get.assert_awaited_once()
+    web_cache.set.assert_not_awaited()
+    client_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_search_web_nodes_cache_errors_are_non_fatal(retriever, bot_mock, monkeypatch):
+    """A broken cache must degrade gracefully to a live search."""
+    web_cache = MagicMock()
+    web_cache.get = AsyncMock(side_effect=RuntimeError("redis down"))
+    web_cache.set = AsyncMock(side_effect=RuntimeError("redis down"))
+    bot_mock.cache_api.web_searches = web_cache
+
+    search_mock = AsyncMock(return_value=[
+        {"title": "Doc", "url": "http://example.com", "content": "snippet"}
+    ])
+    fake_client = MagicMock()
+    fake_client.search = search_mock
+    monkeypatch.setattr(
+        "criabot.bot.chat.context.WebSearchClient", MagicMock(return_value=fake_client)
+    )
+
+    nodes = await retriever._search_web_nodes("latest python news")
+
+    assert len(nodes) == 1
+    search_mock.assert_awaited_once()
+
+
+# --------------------------------------------------------------------------- #
+# Rerank result caching
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_hybrid_rerank_cache_miss_populates_cache(retriever, bot_mock):
+    rerank_cache = MagicMock()
+    rerank_cache.get = AsyncMock(return_value=None)
+    rerank_cache.set = AsyncMock()
+    bot_mock.cache_api.reranks = rerank_cache
+
+    nodes = [create_text_node("alpha"), create_text_node("beta")]
+    ranked = [create_text_node("beta", score=0.95), create_text_node("alpha", score=0.5)]
+    retriever._criadex.agents.cohere.rerank = AsyncMock(
+        return_value={"reranked_documents": [n.model_dump(mode="json") for n in ranked]}
+    )
+
+    result = await retriever.hybrid_rerank(prompt="hello", nodes=nodes)
+
+    assert len(result["ranked_nodes"]) == 2
+    rerank_cache.get.assert_awaited_once()
+    rerank_cache.set.assert_awaited_once()
+    retriever._criadex.agents.cohere.rerank.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_rerank_cache_hit_skips_cohere(retriever, bot_mock):
+    ranked = [create_text_node("beta", score=0.95)]
+    payload = [n.model_dump(mode="json") for n in ranked]
+
+    rerank_cache = MagicMock()
+    rerank_cache.get = AsyncMock(return_value=payload)
+    rerank_cache.set = AsyncMock()
+    bot_mock.cache_api.reranks = rerank_cache
+    retriever._criadex.agents.cohere.rerank = AsyncMock()
+
+    result = await retriever.hybrid_rerank(
+        prompt="hello",
+        nodes=[create_text_node("alpha"), create_text_node("beta")],
+    )
+
+    assert len(result["ranked_nodes"]) == 1
+    rerank_cache.set.assert_not_awaited()
+    retriever._criadex.agents.cohere.rerank.assert_not_awaited()

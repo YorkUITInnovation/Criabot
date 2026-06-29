@@ -4,7 +4,7 @@ from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
 from app.controllers.schemas import NOT_FOUND_CODE, \
-    SUCCESS_CODE, exception_response, catch_exceptions
+    SUCCESS_CODE, CONTENT_READ_RATE_LIMIT, exception_response, catch_exceptions, bot_management_limiter
 from app.controllers.content.documents.list import BotContentListResponse
 from app.core.route import CriaRoute
 
@@ -23,6 +23,7 @@ class ListQuestionsRoute(CriaRoute):
         summary="List questions stored in the bot",
         description="List questions stored in the bot"
     )
+    @bot_management_limiter.limit(CONTENT_READ_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

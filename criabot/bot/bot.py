@@ -78,10 +78,12 @@ class Bot:
             chat_model=chat_model
         )
 
-        # Ensure the dialog exists in Ragflow (attempt to create if not exists)
+        # Ensure the dialog exists in Ragflow (attempt to create if not exists).
+        # Do not hardcode a model: when RAGFLOW_CHAT_LLM_ID is unset, Criadex resolves
+        # the tenant's configured default chat model.
         try:
             ragflow_tenant_id = os.getenv("RAGFLOW_TENANT_ID")
-            ragflow_model_id = os.getenv("RAGFLOW_CHAT_LLM_ID", "gpt-3.5-turbo")
+            ragflow_model_id = os.getenv("RAGFLOW_CHAT_LLM_ID") or None
 
             if criadex is not None:
                 await criadex.agents.azure.ensure_dialog(

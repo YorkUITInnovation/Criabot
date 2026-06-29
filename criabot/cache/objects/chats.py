@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from typing import List, Optional, Any
 
 from redis import asyncio as aioredis
@@ -9,30 +8,11 @@ from pydantic import BaseModel
 
 from criabot.bot.chat.buffer import ChatBuffer
 from criabot.cache.core import CacheObject
+from criabot.cache.ttl import parse_time_to_seconds
 
 
-def _parse_time_to_seconds(time_str: str) -> int:
-    if not time_str:
-        return 3600
-    match = re.match(r'^(\d+)([hdwmy])$', time_str.lower())
-    if not match:
-        return 3600
-    value, unit = match.groups()
-    value = int(value)
-    if unit == 'h':
-        return value * 60 * 60
-    elif unit == 'd':
-        return value * 24 * 60 * 60
-    elif unit == 'w':
-        return value * 7 * 24 * 60 * 60
-    elif unit == 'm':
-        return value * 30 * 24 * 60 * 60
-    elif unit == 'y':
-        return value * 365 * 24 * 60 * 60
-    return 3600
-
-
-CHAT_EXPIRE_TIME: int = _parse_time_to_seconds(os.environ.get("CHAT_EXPIRE_TIME", "1h"))
+CHAT_EXPIRE_TIME: int = parse_time_to_seconds(os.environ.get("CHAT_EXPIRE_TIME", "1h"))
+CACHE_TOUCH_ON_READ: bool = os.environ.get("CACHE_TOUCH_ON_READ", "true").lower() == "true"
 
 
 class ChatModel(BaseModel):
@@ -67,26 +47,39 @@ class ChatModel(BaseModel):
 
 
 class Chats(CacheObject):
+    key_prefix = "chat:"
+
     async def set(self, chat_id: str, chat_model: ChatModel, **kwargs) -> None:
         async with self.redis() as redis:
             await redis.set(
-                chat_id, chat_model.model_dump_json(), ex=kwargs.get('ex', CHAT_EXPIRE_TIME)
+                self._key(chat_id), chat_model.model_dump_json(), ex=kwargs.get('ex', CHAT_EXPIRE_TIME)
             )
 
     async def get(self, chat_id: str, **kwargs) -> Optional[ChatModel]:
         async with self.redis() as redis:
             redis: aioredis.Redis
-            result: Optional[bytes] = await redis.get(chat_id)
+            key = self._key(chat_id)
+            ex = kwargs.get("ex", CHAT_EXPIRE_TIME)
 
-            if result is not None:
-                data: dict = json.loads(result.decode("utf-8"))
-                return ChatModel(**data)
+            if kwargs.get("touch", CACHE_TOUCH_ON_READ):
+                # GETEX atomically reads and resets TTL in one round-trip.
+                result: Optional[bytes] = await redis.getex(key, ex=ex)
+            else:
+                result: Optional[bytes] = await redis.get(key)
 
-            return None
+            if result is None:
+                return None
+
+            data: dict = json.loads(result.decode("utf-8"))
+            return ChatModel(**data)
 
     async def delete(self, chat_id: str, **kwargs) -> None:
         async with self.redis() as redis:
-            await redis.delete(chat_id)
+            await redis.delete(self._key(chat_id))
 
     async def exists(self, chat_id: str, **kwargs) -> bool:
-        return bool(await self.get(chat_id=chat_id))
+        # Use a native EXISTS so we don't fetch + deserialize the full history
+        # just to check presence.
+        async with self.redis() as redis:
+            redis: aioredis.Redis
+            return bool(await redis.exists(self._key(chat_id)))

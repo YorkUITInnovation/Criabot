@@ -4,7 +4,7 @@ from starlette.requests import Request
 
 from app.controllers.content.documents.upload import UploadDocumentResponse, DocumentUploadConfig
 from app.controllers.schemas import NOT_FOUND_CODE, \
-    SUCCESS_CODE, exception_response, catch_exceptions
+    SUCCESS_CODE, CONTENT_WRITE_RATE_LIMIT, exception_response, catch_exceptions, bot_management_limiter
 from app.core.route import CriaRoute
 
 from criabot.bot.schemas import GroupContentResponse
@@ -27,6 +27,7 @@ class UpdateDocumentRoute(CriaRoute):
         summary="Update a document on the bot",
         description="Update a document on the bot",
     )
+    @bot_management_limiter.limit(CONTENT_WRITE_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

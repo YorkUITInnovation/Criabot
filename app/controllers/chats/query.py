@@ -7,7 +7,7 @@ from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
 from app.controllers.schemas import SUCCESS_CODE, NOT_FOUND_CODE, ChatSendConfig, exception_response, catch_exceptions, \
-    APIResponse
+    APIResponse, CHAT_RATE_LIMIT, chat_limiter
 from app.core.route import CriaRoute
 
 from criabot.bot.schemas import ChatNotFoundError
@@ -30,6 +30,7 @@ class QueryChatRoute(CriaRoute):
         summary="Query a bot",
         description="Query a bot",
     )
+    @chat_limiter.limit(CHAT_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

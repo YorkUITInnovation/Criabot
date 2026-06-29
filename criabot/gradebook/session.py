@@ -27,7 +27,7 @@ from .proposal import (
 )
 from .naming_utils import derive_course_activities_from_resources
 from .schemas import CourseActivity, GradebookSessionRecord, MoodleResource
-from criabot.cache.objects.gradebooks import _parse_time_to_seconds
+from criabot.cache.ttl import parse_time_to_seconds
 
 if TYPE_CHECKING:
     from criabot.database.gradebook.gradebook_db import GradebookDatabaseAPI
@@ -59,7 +59,7 @@ class GradebookSessionEngine:
         self._proposal_generator = ProposalGenerator()
         self._content_mapper = ContentMapper(criadex=criadex, llm_model_id=mapping_llm_model_id)
         self._conversation = ConversationManager()
-        self._session_expire_seconds = _parse_time_to_seconds(
+        self._session_expire_seconds = parse_time_to_seconds(
             os.environ.get("GRADEBOOK_SESSION_EXPIRE_TIME", "4h")
         )
         # Keep in-memory cache for active sessions

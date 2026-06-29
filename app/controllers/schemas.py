@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import time
 import traceback
@@ -25,6 +26,19 @@ ERROR_CODE: str = "ERROR"
 DUPLICATE_CODE: str = "DUPLICATE"
 NOT_FOUND_CODE: str = "NOT_FOUND"
 CRIADEX_ERROR: str = "CRIADEX_ERROR"
+
+def _rate_limit_from_env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+CHAT_RATE_LIMIT: str = _rate_limit_from_env("CRIABOT_CHAT_RATE_LIMIT", "60/minute")
+CHAT_START_RATE_LIMIT: str = _rate_limit_from_env("CRIABOT_CHAT_START_RATE_LIMIT", "30/minute")
+CHAT_READ_RATE_LIMIT: str = _rate_limit_from_env("CRIABOT_CHAT_READ_RATE_LIMIT", "120/minute")
+CONTENT_READ_RATE_LIMIT: str = _rate_limit_from_env("CRIABOT_CONTENT_READ_RATE_LIMIT", "120/minute")
+CONTENT_WRITE_RATE_LIMIT: str = _rate_limit_from_env("CRIABOT_CONTENT_WRITE_RATE_LIMIT", "20/minute")
+BOT_MANAGEMENT_CREATE_RATE_LIMIT: str = _rate_limit_from_env("CRIABOT_BOT_CREATE_RATE_LIMIT", "10/minute")
+BOT_MANAGEMENT_READ_RATE_LIMIT: str = _rate_limit_from_env("CRIABOT_BOT_READ_RATE_LIMIT", "60/minute")
+BOT_MANAGEMENT_WRITE_RATE_LIMIT: str = _rate_limit_from_env("CRIABOT_BOT_WRITE_RATE_LIMIT", "20/minute")
 
 # Rate limiters - key by bot name for bot-specific endpoints, IP for general endpoints
 bot_management_limiter: Limiter = Limiter(key_func=lambda request: request.path_params.get('bot_name', get_remote_address(request)))

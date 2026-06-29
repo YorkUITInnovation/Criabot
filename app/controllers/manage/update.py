@@ -3,7 +3,7 @@ from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
 from app.controllers.schemas import SUCCESS_CODE, \
-    NOT_FOUND_CODE, exception_response, catch_exceptions, APIResponse
+    NOT_FOUND_CODE, BOT_MANAGEMENT_WRITE_RATE_LIMIT, exception_response, catch_exceptions, APIResponse, bot_management_limiter
 from app.core.route import CriaRoute
 from criabot.database.bots.tables.bot_params import BotParametersBaseConfig
 from criabot.schemas import BotNotFoundError, BotUpdateConfig, CircularDependencyError, ParentNotFoundError
@@ -25,6 +25,7 @@ class ManageUpdateRoute(CriaRoute):
         summary="Configure Bot Hyperparameters",
         description="Configure the hyperparameters for a Cria Bot",
     )
+    @bot_management_limiter.limit(BOT_MANAGEMENT_WRITE_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

@@ -4,7 +4,8 @@ from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
-from app.controllers.schemas import SUCCESS_CODE, NOT_FOUND_CODE, exception_response, catch_exceptions, APIResponse
+from app.controllers.schemas import SUCCESS_CODE, NOT_FOUND_CODE, BOT_MANAGEMENT_READ_RATE_LIMIT, exception_response, \
+    catch_exceptions, APIResponse, bot_management_limiter
 from app.core.route import CriaRoute
 from criabot.schemas import BotNotFoundError
 
@@ -26,6 +27,7 @@ class ManageParentsRoute(CriaRoute):
         summary="List parent bots for a child",
         description="Return the direct parents for a given child bot.",
     )
+    @bot_management_limiter.limit(BOT_MANAGEMENT_READ_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

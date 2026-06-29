@@ -8,7 +8,8 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from app.controllers.schemas import NOT_FOUND_CODE, \
-    SUCCESS_CODE, DUPLICATE_CODE, exception_response, catch_exceptions, APIResponse
+    SUCCESS_CODE, DUPLICATE_CODE, CONTENT_WRITE_RATE_LIMIT, exception_response, catch_exceptions, APIResponse, \
+    bot_management_limiter
 from app.core.route import CriaRoute
 from criabot.bot.schemas import GroupContentResponse
 from criabot.schemas import BotNotFoundError
@@ -47,6 +48,7 @@ class UploadDocumentRoute(CriaRoute):
         summary="Upload a document to the bot",
         description="Upload a document to the bot",
     )
+    @bot_management_limiter.limit(CONTENT_WRITE_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

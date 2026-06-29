@@ -197,7 +197,7 @@ class CriabotAPI(FastAPI):
 
         criabot_api.logger.info("Shutting down Criabot...")
         await criabot_instance.stop_faq_sync_scheduler()
-        # Optionally, add shutdown logic for criabot_instance here
+        await criabot_instance.shutdown()
 
 
 # Instance of the app, started by Uvicorn.

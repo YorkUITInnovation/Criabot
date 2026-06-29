@@ -146,11 +146,18 @@ class Criabot:
         await MigrationRunner(self._mysql_engine).run_pending()
 
         # Redis DB Startup
+        # Bound the pool and add socket/health timeouts so a slow or dropped
+        # Redis connection can't hang requests or leak connections.
         self._redis_pool: ConnectionPool = aioredis.ConnectionPool(
             host=self._redis_credentials.host,
             port=self._redis_credentials.port,
             username=self._redis_credentials.username,
-            password=self._redis_credentials.password
+            password=self._redis_credentials.password,
+            max_connections=int(os.environ.get("REDIS_MAX_CONNECTIONS", "50")),
+            socket_timeout=float(os.environ.get("REDIS_SOCKET_TIMEOUT_SECONDS", "5")),
+            socket_connect_timeout=float(os.environ.get("REDIS_CONNECT_TIMEOUT_SECONDS", "5")),
+            health_check_interval=int(os.environ.get("REDIS_HEALTH_CHECK_INTERVAL_SECONDS", "30")),
+            retry_on_timeout=True,
         )
 
         # SQL DB API Startup
@@ -1043,18 +1050,19 @@ class Criabot:
         async def create_group(index_type):
             from .bot.bot import Bot
             group_name = bot_name + Bot.INDEX_SUFFIX[index_type]
+            group_config = {
+                "type": index_type,
+                "llm_model_id": bot_config.llm_model_id,
+                "embedding_model_id": bot_config.embedding_model_id,
+                "rerank_model_id": bot_config.rerank_model_id,
+                "use_knowledge_graph": bot_config.use_knowledge_graph,
+            }
+            if index_type == "DOCUMENT":
+                group_config["requires_documents"] = bot_config.requires_documents
+
             new_group = await self._create_new_bot_group(
                 group_name=group_name,
-                group_config={
-                    "type": index_type,
-                    "llm_model_id": bot_config.llm_model_id,
-                    "embedding_model_id": bot_config.embedding_model_id,
-                    "rerank_model_id": bot_config.rerank_model_id,
-                    "use_knowledge_graph": bot_config.use_knowledge_graph,
-                    "requires_documents": (
-                        bot_config.requires_documents if index_type == "DOCUMENT" else True
-                    ),
-                }
+                group_config=group_config
             )
             try:
                 await self._create_new_bot_auth_group(
@@ -1514,6 +1522,23 @@ class Criabot:
         except asyncio.CancelledError:
             pass
         self._faq_sync_task = None
+
+    async def shutdown(self) -> None:
+        """Release external resources (Redis pool, MySQL engine) on app shutdown."""
+
+        redis_pool = getattr(self, "_redis_pool", None)
+        if redis_pool is not None:
+            try:
+                await redis_pool.disconnect(inuse_connections=True)
+            except Exception:
+                logging.warning("Failed to disconnect Redis pool cleanly", exc_info=True)
+
+        mysql_engine = getattr(self, "_mysql_engine", None)
+        if mysql_engine is not None:
+            try:
+                await mysql_engine.dispose()
+            except Exception:
+                logging.warning("Failed to dispose MySQL engine cleanly", exc_info=True)
 
     async def _faq_sync_scheduler_loop(self) -> None:
         interval_seconds = max(int(self._faq_sync_config.get("interval_seconds", 21600)), 60)

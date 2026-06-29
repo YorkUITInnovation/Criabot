@@ -5,7 +5,8 @@ from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
-from app.controllers.schemas import DUPLICATE_CODE, SUCCESS_CODE, exception_response, catch_exceptions, APIResponse, bot_management_limiter
+from app.controllers.schemas import BOT_MANAGEMENT_CREATE_RATE_LIMIT, DUPLICATE_CODE, SUCCESS_CODE, exception_response, \
+    catch_exceptions, APIResponse, bot_management_limiter
 from app.core.route import CriaRoute
 from criabot.schemas import BotCreateConfig, BotExistsError, ParentNotFoundError, CircularDependencyError, InvalidModelsError
 
@@ -26,7 +27,7 @@ class ManageCreateRoute(CriaRoute):
         summary="Create a Cria Bot",
         description="Create a Cria Bot.",
     )
-    @bot_management_limiter.limit("10/minute")
+    @bot_management_limiter.limit(BOT_MANAGEMENT_CREATE_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

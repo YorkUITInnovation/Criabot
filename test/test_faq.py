@@ -210,6 +210,33 @@ async def test_faq_fallback_caches_repeated_queries():
 
 
 @pytest.mark.asyncio
+async def test_faq_fallback_redis_cache_hit_skips_search():
+    sdk = MagicMock()
+    sdk.manage = MagicMock()
+    sdk.content = MagicMock()
+    sdk.manage.graph_search = AsyncMock()
+
+    faq_cache = MagicMock()
+    faq_cache.get = AsyncMock(
+        return_value={
+            "group_name": "faq-group",
+            "response": GroupSearchResponse(nodes=[], assets=[], search_units=0, metadata={}),
+            "sources": [],
+            "graph_metadata": None,
+        }
+    )
+    faq_cache.set = AsyncMock()
+
+    fallback = FAQFallback(criadex=sdk, faq_cache=faq_cache)
+    fallback._cache.clear()
+
+    await fallback.search(prompt="redis cached")
+
+    faq_cache.get.assert_awaited_once()
+    sdk.manage.graph_search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_faq_fallback_caches_missing_group_from_graph_search():
     class GroupNotFoundError(Exception):
         def __init__(self):

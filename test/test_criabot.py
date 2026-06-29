@@ -60,6 +60,32 @@ async def test_create_bot(criabot_instance):
         payload = call.kwargs["group_config"]
         assert payload["use_knowledge_graph"] is True
 
+
+@pytest.mark.asyncio
+async def test_create_bot_only_sends_requires_documents_for_document_group(criabot_instance):
+    criabot_instance._mysql_api.bots.exists = AsyncMock(return_value=False)
+    criabot_instance._criadex.auth.create = AsyncMock(return_value={"api_key": "new_key"})
+    criabot_instance._criadex.manage.create = AsyncMock(return_value=MagicMock())
+    criabot_instance._criadex.group_auth.create = AsyncMock()
+    criabot_instance._mysql_api.bots.insert = AsyncMock(return_value=1)
+    criabot_instance._mysql_api.bot_params.insert = AsyncMock(return_value=None)
+
+    config = BotCreateConfig(
+        llm_model_id=1,
+        embedding_model_id=1,
+        rerank_model_id=1,
+        requires_documents=False,
+    )
+
+    await criabot_instance.create(name="chat_only_bot", config=config)
+
+    created_groups = {
+        call.kwargs["group_config"]["type"]: call.kwargs["group_config"]
+        for call in criabot_instance._criadex.manage.create.await_args_list
+    }
+    assert created_groups["DOCUMENT"]["requires_documents"] is False
+    assert "requires_documents" not in created_groups["QUESTION"]
+
 @pytest.mark.asyncio
 async def test_create_bot_with_parents(criabot_instance):
     criabot_instance._mysql_api.bots.exists = AsyncMock(return_value=False)

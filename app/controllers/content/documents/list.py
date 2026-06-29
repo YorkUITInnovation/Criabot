@@ -6,7 +6,7 @@ from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
 from app.controllers.schemas import NOT_FOUND_CODE, \
-    SUCCESS_CODE, exception_response, catch_exceptions, APIResponse
+    SUCCESS_CODE, CONTENT_READ_RATE_LIMIT, exception_response, catch_exceptions, APIResponse, bot_management_limiter
 from app.core.route import CriaRoute
 
 from criabot.schemas import BotNotFoundError
@@ -28,6 +28,7 @@ class ListDocumentsRoute(CriaRoute):
         summary="List documents stored in the bot",
         description="List documents stored in the bot"
     )
+    @bot_management_limiter.limit(CONTENT_READ_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

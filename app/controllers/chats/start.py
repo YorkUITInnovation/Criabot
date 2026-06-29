@@ -4,7 +4,7 @@ from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
-from app.controllers.schemas import SUCCESS_CODE, catch_exceptions, APIResponse
+from app.controllers.schemas import SUCCESS_CODE, CHAT_START_RATE_LIMIT, catch_exceptions, APIResponse, general_limiter
 from app.core.route import CriaRoute
 
 view = APIRouter()
@@ -24,6 +24,7 @@ class StartChatRoute(CriaRoute):
         summary="Start a chat with a bot",
         description="Start a chat with a bot",
     )
+    @general_limiter.limit(CHAT_START_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

@@ -64,12 +64,25 @@ logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
 
 
 @router.get(HealthCheckFilter.HEALTH_ENDPOINT, include_in_schema=False)
-async def health_check() -> Response:
+async def health_check(request: Request) -> Response:
     """
-    Check if the server is online (for docker health check)
-    :return: Just a simple 200
+    Liveness probe: confirms the API is up and Redis is reachable.
 
+    Docker health checks call this endpoint; a 503 signals the container
+    should be restarted when Redis is unavailable.
     """
+
+    criabot = getattr(request.app, "criabot", None)
+    redis_api = getattr(criabot, "redis_api", None) if criabot is not None else None
+    if redis_api is None:
+        return Response(status_code=503, content="Criabot not initialized")
+
+    try:
+        async with redis_api.chats.redis() as redis:
+            await redis.ping()
+    except Exception:
+        logging.getLogger(__name__).warning("Health check Redis ping failed", exc_info=True)
+        return Response(status_code=503, content="Redis unavailable")
 
     return Response(status_code=200, content="Pong!")
 

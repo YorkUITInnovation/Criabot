@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import itertools
+import logging
 import os
 import re
 import textwrap
@@ -112,6 +113,8 @@ class ContextRetriever:
         self._web_search_url = os.getenv("WEB_SEARCH_URL", "http://searxng:8080")
         self._web_search_timeout_seconds = float(os.getenv("WEB_SEARCH_TIMEOUT_SECONDS", "8"))
         self._web_search_max_results = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+        self._web_search_cache_enabled = os.getenv("WEB_SEARCH_CACHE_ENABLED", "true").lower() == "true"
+        self._rerank_cache_enabled = os.getenv("RERANK_CACHE_ENABLED", "true").lower() == "true"
         self._web_search_fallback_only = os.getenv("WEB_SEARCH_FALLBACK_ONLY", "true").lower() == "true"
         self._web_search_fallback_threshold = float(
             os.getenv("WEB_SEARCH_FALLBACK_SCORE_THRESHOLD", str(self._faq_fallback_threshold))
@@ -341,14 +344,62 @@ class ContextRetriever:
         bot_setting = bool(getattr(self._bot_params, "web_search_enabled", False))
         return self._web_search_global_enabled and global_setting and bot_setting
 
+    def _web_search_cache(self):
+        """Best-effort access to the shared web-search cache object."""
+        if not self._web_search_cache_enabled:
+            return None
+        cache_api = getattr(self._bot, "cache_api", None)
+        return getattr(cache_api, "web_searches", None) if cache_api is not None else None
+
+    async def _get_cached_web_nodes(self, cache, cache_key: str) -> Optional[List[TextNodeWithScore]]:
+        try:
+            payload = await cache.get(cache_key)
+        except Exception:
+            logging.getLogger(__name__).debug("Web-search cache read failed", exc_info=True)
+            return None
+
+        if not payload:
+            return None
+
+        try:
+            return [TextNodeWithScore(**node) for node in payload]
+        except Exception:
+            logging.getLogger(__name__).debug("Failed to rebuild cached web nodes", exc_info=True)
+            return None
+
+    async def _store_cached_web_nodes(self, cache, cache_key: str, nodes: List[TextNodeWithScore]) -> None:
+        if not nodes:
+            return
+        try:
+            payload = [node.model_dump(mode="json") for node in nodes]
+            await cache.set(cache_key, payload)
+        except Exception:
+            logging.getLogger(__name__).debug("Web-search cache write failed", exc_info=True)
+
     async def _search_web_nodes(self, prompt: str) -> List[TextNodeWithScore]:
+        language = infer_search_language(prompt)
+        cache = self._web_search_cache()
+        cache_key = None
+
+        if cache is not None:
+            from criabot.cache.objects.web_searches import WebSearches
+            cache_key = WebSearches.build_key(prompt, language, self._web_search_max_results)
+            cached_nodes = await self._get_cached_web_nodes(cache, cache_key)
+            if cached_nodes is not None:
+                return cached_nodes
+
         client = WebSearchClient(
             base_url=self._web_search_url,
             timeout_seconds=self._web_search_timeout_seconds,
             max_results=self._web_search_max_results,
         )
-        results = await client.search(prompt, language=infer_search_language(prompt))
-        return build_web_search_nodes(results)
+        results = await client.search(prompt, language=language)
+        nodes = build_web_search_nodes(results)
+
+        if cache is not None and cache_key is not None:
+            await self._store_cached_web_nodes(cache, cache_key, nodes)
+
+        return nodes
 
     @staticmethod
     def _attach_web_group_response(
@@ -680,11 +731,37 @@ class ContextRetriever:
             for r in results
         }
 
+    def _rerank_cache(self):
+        if not self._rerank_cache_enabled:
+            return None
+        cache_api = getattr(self._bot, "cache_api", None)
+        return getattr(cache_api, "reranks", None) if cache_api is not None else None
+
     async def hybrid_rerank(
             self,
             prompt,
             nodes,
     ):
+        cache = self._rerank_cache()
+        cache_key = None
+        if cache is not None and nodes:
+            from criabot.cache.objects.reranks import Reranks
+            cache_key = Reranks.build_key(
+                prompt=prompt,
+                rerank_model_id=self._rerank_model_id,
+                top_n=self._bot_params.top_n,
+                min_n=self._bot_params.min_n,
+                nodes=nodes,
+            )
+            try:
+                cached_payload = await cache.get(cache_key)
+            except Exception:
+                logging.getLogger(__name__).debug("Rerank cache read failed", exc_info=True)
+                cached_payload = None
+            if cached_payload is not None:
+                reranked_docs = [TextNodeWithScore(**doc) for doc in cached_payload]
+                return {"ranked_nodes": reranked_docs, "search_units": 0}
+
         response = await self._criadex.agents.cohere.rerank(
             model_id=self._rerank_model_id,
             agent_config={
@@ -698,6 +775,13 @@ class ContextRetriever:
         reranked_docs = response.get("reranked_documents", [])
         if reranked_docs and isinstance(reranked_docs[0], dict):
             reranked_docs = [TextNodeWithScore(**doc) for doc in reranked_docs]
+
+        if cache is not None and cache_key is not None and reranked_docs:
+            try:
+                payload = [doc.model_dump(mode="json") for doc in reranked_docs]
+                await cache.set(cache_key, payload)
+            except Exception:
+                logging.getLogger(__name__).debug("Rerank cache write failed", exc_info=True)
 
         return {
             "ranked_nodes": reranked_docs,
@@ -715,7 +799,9 @@ class ContextRetriever:
             if hasattr(metadata_filter, "model_dump"):
                 search_filter = metadata_filter.model_dump(mode="json", exclude_none=True)
             elif not isinstance(metadata_filter, dict):
-                search_filter = None
+                raise ValueError(
+                    "metadata_filter must be a dict, a Pydantic model, or None"
+                )
 
         return {
             "query": prompt,
@@ -807,7 +893,10 @@ class ContextRetriever:
         # If there are no nodes, or confidence is too low, try FAQ fallback first.
         if faq_enabled and (len(nodes) < 1 or max_node_score < faq_threshold):
             try:
-                fallback = FAQFallback(criadex=self._criadex)
+                fallback = FAQFallback(
+                    criadex=self._criadex,
+                    faq_cache=getattr(getattr(self._bot, "cache_api", None), "faq_searches", None),
+                )
                 fallback_result = await fallback.search(prompt=prompt, top_k=max(3, self._bot_params.top_n))
                 fallback_response = fallback_result.get("response")
                 if isinstance(fallback_response, GroupSearchResponse) and fallback_response.nodes:

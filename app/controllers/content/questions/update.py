@@ -5,7 +5,7 @@ from starlette.requests import Request
 from app.controllers.content.documents.update import UpdateDocumentResponse
 from app.controllers.content.questions.upload import QuestionUploadConfig
 from app.controllers.schemas import NOT_FOUND_CODE, \
-    SUCCESS_CODE, exception_response, catch_exceptions
+    SUCCESS_CODE, CONTENT_WRITE_RATE_LIMIT, exception_response, catch_exceptions, bot_management_limiter
 from app.core.route import CriaRoute
 
 from criabot.bot.schemas import GroupContentResponse
@@ -24,6 +24,7 @@ class UpdateQuestionRoute(CriaRoute):
         summary="Update a question on the bot",
         description="Update a question on the bot",
     )
+    @bot_management_limiter.limit(CONTENT_WRITE_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

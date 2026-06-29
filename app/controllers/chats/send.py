@@ -1,4 +1,5 @@
 from typing import Optional, Any, List
+import asyncio
 import json
 import time
 from datetime import datetime
@@ -10,7 +11,7 @@ from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
 from app.controllers.schemas import SUCCESS_CODE, NOT_FOUND_CODE, ChatSendConfig, exception_response, catch_exceptions, \
-    APIResponse, chat_limiter
+    APIResponse, CHAT_RATE_LIMIT, chat_limiter
 from app.core.route import CriaRoute
 
 from criabot.bot.schemas import ChatNotFoundError
@@ -34,7 +35,7 @@ class SendChatRoute(CriaRoute):
         description="Send a chat to a bot",
         # dependencies=CHATS_BOT_DEPS
     )
-    @chat_limiter.limit("60/minute")
+    @chat_limiter.limit(CHAT_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )
@@ -134,7 +135,7 @@ class StreamChatRoute(CriaRoute):
         summary="Stream a chat response with reasoning steps",
         description="Send a chat to a bot and receive a streaming response with reasoning steps and citations",
     )
-    @chat_limiter.limit("60/minute")
+    @chat_limiter.limit(CHAT_RATE_LIMIT)
     async def execute(
         self,
         request: Request,
@@ -178,12 +179,13 @@ class StreamChatRoute(CriaRoute):
 
             # Generate streaming response
             async def event_generator():
-                import asyncio
-                
                 start_time = time.time()
-                status_events = []
+                response = None
+                retrieval_error = None
+                status_queue: asyncio.Queue = asyncio.Queue()
+                status_done = object()
 
-                # Create on_step callback to accumulate status events
+                # Create on_step callback to emit status events immediately.
                 async def on_step(engine: str, state: str, message: str):
                     event = {
                         "type": "status",
@@ -192,19 +194,38 @@ class StreamChatRoute(CriaRoute):
                         "state": state,
                         "message": message
                     }
-                    status_events.append(event)
+                    await status_queue.put(event)
 
-                # Get the context with streaming status updates
-                response = await chat._retriever.retrieve(
-                    prompt=chat_config.prompt,
-                    metadata_filter=chat_config.metadata_filter,
-                    extra_bots=effective_extra_bots,
-                    on_step=on_step
-                )
+                async def retrieve_context():
+                    nonlocal response, retrieval_error
+                    try:
+                        response = await chat._retriever.retrieve(
+                            prompt=chat_config.prompt,
+                            metadata_filter=chat_config.metadata_filter,
+                            extra_bots=effective_extra_bots,
+                            on_step=on_step
+                        )
+                    except Exception as exc:
+                        retrieval_error = exc
+                    finally:
+                        await status_queue.put(status_done)
 
-                # Yield all status events
-                for event in status_events:
-                    yield f"data: {json.dumps(event)}\n\n"
+                retrieval_task = asyncio.create_task(retrieve_context())
+
+                try:
+                    while True:
+                        event = await status_queue.get()
+                        if event is status_done:
+                            break
+                        yield f"data: {json.dumps(event)}\n\n"
+                except (asyncio.CancelledError, GeneratorExit):
+                    if not retrieval_task.done():
+                        retrieval_task.cancel()
+                    raise
+
+                await retrieval_task
+                if retrieval_error:
+                    raise retrieval_error
 
                 # Add user message to buffer
                 from CriadexSDK.ragflow_schemas import ChatMessage
@@ -378,7 +399,7 @@ class StreamChatRoute(CriaRoute):
 
         # Extract web search citations if available
         for group_name, group_response in (response.group_responses or {}).items():
-            if group_name == "web_search" and hasattr(group_response, "nodes"):
+            if group_name.lower() == "web_search" and hasattr(group_response, "nodes"):
                 for idx, node in enumerate(group_response.nodes):
                     if hasattr(node, "url") and node.url:
                         source_id = f"web_{idx}"

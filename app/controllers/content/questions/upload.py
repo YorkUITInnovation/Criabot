@@ -11,7 +11,7 @@ from starlette.requests import Request
 from app.controllers.content.documents.upload import UploadDocumentResponse
 from app.controllers.schemas import NOT_FOUND_CODE, \
     SUCCESS_CODE, DUPLICATE_CODE, APIResponseModel, QuestionConfig, exception_response, \
-    catch_exceptions
+    CONTENT_WRITE_RATE_LIMIT, catch_exceptions, bot_management_limiter
 from app.core.route import CriaRoute
 from criabot.bot.schemas import GroupContentResponse
 from criabot.schemas import BotNotFoundError
@@ -43,6 +43,7 @@ class UploadQuestionRoute(CriaRoute):
         summary="Upload a question to the bot",
         description="Upload a question to the bot",
     )
+    @bot_management_limiter.limit(CONTENT_WRITE_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

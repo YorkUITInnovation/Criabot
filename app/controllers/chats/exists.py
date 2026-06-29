@@ -4,7 +4,7 @@ from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
 
-from app.controllers.schemas import SUCCESS_CODE, catch_exceptions, APIResponse
+from app.controllers.schemas import SUCCESS_CODE, CHAT_READ_RATE_LIMIT, catch_exceptions, APIResponse, chat_limiter
 from app.core.route import CriaRoute
 
 view = APIRouter()
@@ -24,6 +24,7 @@ class ExistsChatRoute(CriaRoute):
         summary="Check if the chat with a given Id exists",
         description="Check if the chat with a given Id exists",
     )
+    @chat_limiter.limit(CHAT_READ_RATE_LIMIT)
     @catch_exceptions(
         ResponseModel
     )

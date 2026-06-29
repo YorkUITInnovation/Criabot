@@ -12,6 +12,12 @@ T = TypeVar('T', bound=BaseModel)
 class CacheObject:
     """Generic Redis object model supporting operations"""
 
+    #: Optional namespace prepended to every key (e.g. ``"chat:"``). Keeping
+    #: each cache object in its own namespace prevents key collisions between
+    #: chats, gradebook sessions, web-search results, and any other tenants
+    #: (e.g. SearXNG) that may share the same Redis instance.
+    key_prefix: str = ""
+
     def __init__(self, pool: ConnectionPool):
         """
         Instantiate the table
@@ -22,19 +28,23 @@ class CacheObject:
 
         self._pool: ConnectionPool = pool
 
+    def _key(self, key: str) -> str:
+        """Apply the cache object's namespace to a raw key."""
+        return f"{self.key_prefix}{key}"
+
     @asynccontextmanager
     async def redis(self) -> Redis:
         """
-        Context manager for retrieving the cursor from the pool
-        :return: Cursor instance
+        Context manager for retrieving a client bound to the shared pool.
+
+        Exiting the ``async with`` releases the connection back to the pool;
+        no explicit ``close()`` is needed (and the old explicit call used the
+        deprecated API).
 
         """
 
         async with aioredis.Redis(connection_pool=self._pool) as redis:
-            try:
-                yield redis
-            finally:
-                await redis.close()
+            yield redis
 
     @abstractmethod
     async def set(self, key: str, val: T, **kwargs) -> None:

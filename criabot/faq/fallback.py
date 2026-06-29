@@ -1,24 +1,33 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from CriadexSDK.ragflow_schemas import GroupSearchResponse
 
+if TYPE_CHECKING:
+    from criabot.cache.objects.faq_searches import FaqSearches
+
+logger = logging.getLogger(__name__)
+
 
 class FAQFallback:
+    # Process-local L1 cache (fast path); Redis L2 is optional via faq_cache.
     _cache: Dict[str, tuple[int, Dict[str, Any]]] = {}
 
-    def __init__(self, criadex) -> None:
+    def __init__(self, criadex, faq_cache: Optional["FaqSearches"] = None) -> None:
         self._criadex = criadex
+        self._faq_cache = faq_cache
         self._faq_group = os.environ.get("FAQ_GROUP_NAME", "eclass-faq-bot-document-index")
-        self._graph_auto_build = os.environ.get("GRAPH_RAG_CHAT_AUTO_BUILD", "true").lower() == "true"
+        self._graph_auto_build = os.getenv("GRAPH_RAG_CHAT_AUTO_BUILD", "true").lower() == "true"
         self._cache_ttl_seconds = int(os.environ.get("FAQ_FALLBACK_CACHE_SECONDS", "300"))
         self._missing_group_cache_ttl_seconds = int(
             os.environ.get("FAQ_FALLBACK_MISSING_GROUP_CACHE_SECONDS", "1800")
         )
+        self._redis_cache_enabled = os.getenv("FAQ_REDIS_CACHE_ENABLED", "true").lower() == "true"
 
     @staticmethod
     def _is_group_missing_error(exc: Exception) -> bool:
@@ -42,11 +51,56 @@ class FAQFallback:
             }
         }
 
-    async def search(self, prompt: str, top_k: int = 5) -> Dict[str, Any]:
-        cache_key = f"{self._faq_group}:{top_k}:{prompt.strip().lower()}"
-        cached = self._cache.get(cache_key)
+    def _memory_cache_key(self, prompt: str, top_k: int) -> str:
+        return f"{self._faq_group}:{top_k}:{prompt.strip().lower()}"
+
+    def _redis_cache_key(self, prompt: str, top_k: int) -> Optional[str]:
+        if self._faq_cache is None or not self._redis_cache_enabled:
+            return None
+        from criabot.cache.objects.faq_searches import FaqSearches
+        return FaqSearches.build_key(faq_group=self._faq_group, prompt=prompt, top_k=top_k)
+
+    async def _get_cached(self, prompt: str, top_k: int) -> Optional[Dict[str, Any]]:
+        memory_key = self._memory_cache_key(prompt, top_k)
+        cached = self._cache.get(memory_key)
         if cached and cached[0] > int(time.time()):
             return cached[1]
+
+        redis_key = self._redis_cache_key(prompt, top_k)
+        if redis_key is None:
+            return None
+        try:
+            payload = await self._faq_cache.get(redis_key)
+        except Exception:
+            logger.debug("FAQ Redis cache read failed", exc_info=True)
+            return None
+        if payload is not None:
+            self._cache[memory_key] = (int(time.time()) + self._cache_ttl_seconds, payload)
+        return payload
+
+    async def _store_cached(
+        self,
+        prompt: str,
+        top_k: int,
+        payload: Dict[str, Any],
+        *,
+        ttl_seconds: int,
+    ) -> None:
+        memory_key = self._memory_cache_key(prompt, top_k)
+        self._cache[memory_key] = (int(time.time()) + ttl_seconds, payload)
+
+        redis_key = self._redis_cache_key(prompt, top_k)
+        if redis_key is None:
+            return
+        try:
+            await self._faq_cache.set(redis_key, payload, ex=ttl_seconds)
+        except Exception:
+            logger.debug("FAQ Redis cache write failed", exc_info=True)
+
+    async def search(self, prompt: str, top_k: int = 5) -> Dict[str, Any]:
+        cached_payload = await self._get_cached(prompt, top_k)
+        if cached_payload is not None:
+            return cached_payload
 
         search_config = {"query": prompt, "top_k": top_k}
 
@@ -74,9 +128,11 @@ class FAQFallback:
                         "sources": [],
                         "graph_metadata": None,
                     }
-                    self._cache[cache_key] = (
-                        int(time.time()) + self._missing_group_cache_ttl_seconds,
+                    await self._store_cached(
+                        prompt,
+                        top_k,
                         empty_payload,
+                        ttl_seconds=self._missing_group_cache_ttl_seconds,
                     )
                     return empty_payload
                 result = None
@@ -97,9 +153,11 @@ class FAQFallback:
                         "sources": [],
                         "graph_metadata": None,
                     }
-                    self._cache[cache_key] = (
-                        int(time.time()) + self._missing_group_cache_ttl_seconds,
+                    await self._store_cached(
+                        prompt,
+                        top_k,
                         empty_payload,
+                        ttl_seconds=self._missing_group_cache_ttl_seconds,
                     )
                     return empty_payload
                 raise
@@ -144,5 +202,10 @@ class FAQFallback:
             "sources": deduped,
             "graph_metadata": graph_meta,
         }
-        self._cache[cache_key] = (int(time.time()) + self._cache_ttl_seconds, response_payload)
+        await self._store_cached(
+            prompt,
+            top_k,
+            response_payload,
+            ttl_seconds=self._cache_ttl_seconds,
+        )
         return response_payload
