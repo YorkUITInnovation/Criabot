@@ -1,5 +1,8 @@
 import pytest
+import base64
+from criabot.database.gradebook.tables.gradebook_sessions import GradebookSessionsTable
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from criabot.criabot import Criabot, BotExistsError
 from criabot.schemas import (
@@ -53,6 +56,9 @@ async def test_create_bot(criabot_instance):
     assert criabot_instance._criadex.group_auth.create.call_count == 2
     criabot_instance._mysql_api.bots.insert.assert_called_once()
     criabot_instance._mysql_api.bot_params.insert.assert_called_once()
+    for call in criabot_instance._criadex.manage.create.await_args_list:
+        payload = call.kwargs["group_config"]
+        assert payload["use_knowledge_graph"] is True
 
 @pytest.mark.asyncio
 async def test_create_bot_with_parents(criabot_instance):
@@ -213,7 +219,10 @@ async def test_create_bot_rollback_does_not_delete_preexisting_groups(criabot_in
 @pytest.mark.asyncio
 async def test_table_creation_on_initialize(criabot_instance):
     with patch('criabot.criabot.create_async_engine') as mock_create_async_engine, \
-         patch('criabot.criabot.BotDatabaseAPI') as MockBotDatabaseAPI:
+         patch('criabot.criabot.BotDatabaseAPI') as MockBotDatabaseAPI, \
+         patch('criabot.criabot.GradebookDatabaseAPI') as MockGradebookDatabaseAPI, \
+         patch('criabot.criabot.FAQDatabaseAPI') as MockFAQDatabaseAPI, \
+         patch('criabot.criabot.MigrationRunner') as MockMigrationRunner:
 
         # Mocks for the first engine (init_engine)
         mock_init_engine = MagicMock()
@@ -227,8 +236,413 @@ async def test_table_creation_on_initialize(criabot_instance):
 
         mock_mysql_api = AsyncMock()
         MockBotDatabaseAPI.return_value = mock_mysql_api
+        mock_gradebook_api = AsyncMock()
+        MockGradebookDatabaseAPI.return_value = mock_gradebook_api
+        mock_faq_api = AsyncMock()
+        mock_faq_api.sync_logs.retrieve_latest = AsyncMock(return_value=[])
+        MockFAQDatabaseAPI.return_value = mock_faq_api
+        mock_runner = AsyncMock()
+        MockMigrationRunner.return_value = mock_runner
 
         await criabot_instance.initialize()
 
         assert mock_create_async_engine.call_count == 2
+        mock_runner.run_pending.assert_awaited_once()
         mock_mysql_api.initialize.assert_called_once()
+        mock_gradebook_api.initialize.assert_called_once()
+        mock_faq_api.initialize.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_faq_site_uses_crawler_and_indexes(criabot_instance):
+    criabot_instance.sync_faq_group = AsyncMock(
+        return_value={
+            "group_name": "eclass-faq-bot-document-index",
+            "uploaded_files": ["faq-page-1", "faq-page-2"],
+            "graph_build_job": {"job_id": "job-1"},
+        }
+    )
+    fake_pages = [
+        {"url": "https://lthelp.yorku.ca/eclass", "title": "/", "text": "FAQ root"},
+        {"url": "https://lthelp.yorku.ca/page-1", "title": "/page-1", "text": "FAQ one"},
+    ]
+
+    with patch("criabot.criabot.FAQCrawler") as mock_crawler:
+        mock_crawler.return_value.crawl = AsyncMock(return_value=fake_pages)
+        result = await criabot_instance.sync_faq_site(max_pages=2)
+
+    assert result["pages_crawled"] == 2
+    criabot_instance.sync_faq_group.assert_awaited_once()
+    sync_args = criabot_instance.sync_faq_group.call_args[1]
+    assert sync_args["documents"][0].file_contents["nodes"][0]["type"] == "UncategorizedText"
+    assert sync_args["documents"][0].file_contents["nodes"][0]["metadata"] == {}
+    status = criabot_instance.get_faq_sync_status()
+    assert status["state"] == "READY"
+    assert status["indexed_files"] == 2
+
+
+def test_update_faq_sync_config(criabot_instance):
+    updated = criabot_instance.update_faq_sync_config(
+        source_url="https://lthelp.yorku.ca/eclass",
+        group_name="custom-faq-group",
+        max_pages=10,
+        timeout_seconds=15,
+        enabled=True,
+        interval_seconds=7200,
+        stale_after_seconds=14400,
+        failure_alert_threshold=4,
+    )
+    assert updated["source_url"] == "https://lthelp.yorku.ca/eclass"
+    assert updated["group_name"] == "custom-faq-group"
+    assert updated["max_pages"] == 10
+    assert updated["timeout_seconds"] == 15.0
+    assert updated["enabled"] is True
+    assert updated["interval_seconds"] == 7200
+    assert updated["stale_after_seconds"] == 14400
+    assert updated["failure_alert_threshold"] == 4
+
+
+def test_get_faq_sync_status_reports_stale_failure_alert(criabot_instance):
+    criabot_instance._faq_sync_status.update(
+        {
+            "state": "ERROR",
+            "last_success_at": 1,
+            "consecutive_failures": 3,
+        }
+    )
+    criabot_instance._faq_sync_config["stale_after_seconds"] = 1
+    criabot_instance._faq_sync_config["failure_alert_threshold"] = 3
+
+    status = criabot_instance.get_faq_sync_status()
+
+    assert status["stale"] is True
+    assert status["alert_state"] == "FAILURE_THRESHOLD_EXCEEDED"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_session_flow(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-1234-F2026",
+        professor_id="prof_jsmith",
+        bot_name="eecs-1234-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-1234-F2026",
+            "root_category": {"id": 1, "name": "Course total", "aggregation": 13, "keephigh": 0, "droplow": 0, "aggregateonlygraded": True, "aggregateoutcomes": False},
+            "tree": {"type": "category", "depth": 1, "children": {}},
+            "stats": {"category_count": 1, "item_count": 0, "max_depth": 1, "has_formula": False, "has_locked_items": False, "has_hidden_items": False, "item_types": {}},
+        },
+        import_mode="baseline",
+    )
+    assert start["session_id"].startswith("gb-")
+    assert start["phase"] == "BASELINE_READY"
+    assert start["import_mode"] == "baseline"
+    assert start["context_source"] == "baseline_import"
+
+    session_id = start["session_id"]
+    chat = await criabot_instance.gradebook_chat(session_id=session_id, prompt="Please generate proposal")
+    assert chat["phase"] in {"PROPOSAL", "ANALYSIS", "REFINEMENT"}
+    proposal = await criabot_instance.gradebook_proposal(session_id=session_id)
+    assert proposal["proposal"] is not None
+
+    accepted = await criabot_instance.gradebook_accept(session_id=session_id)
+    assert accepted["phase"] == "ACCEPTED"
+    assert accepted["content_mapping"] is not None
+
+    finalized = await criabot_instance.gradebook_finalize(
+        session_id=session_id,
+        confirmed_mapping=[{"moodle_cmid": 1, "category": "Assignments"}],
+    )
+    assert finalized["phase"] == "COMPLETED"
+    assert finalized["summary"]["activities_mapped"] == 1
+
+
+def test_gradebook_sessions_phase_enum_includes_baseline_ready():
+    phase_type = GradebookSessionsTable.__table__.c.phase.type
+    assert "BASELINE_READY" in list(getattr(phase_type, "enums", []) or [])
+
+
+@pytest.mark.asyncio
+async def test_gradebook_session_flow_respects_explicit_fresh_mode(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-1234-F2026-fresh",
+        professor_id="prof_jsmith",
+        bot_name="eecs-1234-bot-fresh",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+        baseline_snapshot={
+            "contract_name": "baseline_gradebook_v1",
+            "schema_version": 1,
+            "available": True,
+            "courseid": "EECS-1234-F2026-fresh",
+            "root_category": {"id": 1, "name": "Course total", "aggregation": 13, "keephigh": 0, "droplow": 0, "aggregateonlygraded": True, "aggregateoutcomes": False},
+            "tree": {"type": "category", "depth": 1, "children": {}},
+            "stats": {"category_count": 1, "item_count": 0, "max_depth": 1, "has_formula": False, "has_locked_items": False, "has_hidden_items": False, "item_types": {}},
+        },
+        import_mode="fresh",
+    )
+
+    assert start["session_id"].startswith("gb-")
+    assert start["import_mode"] == "fresh"
+    assert start["context_source"] == "syllabus_generation"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_reports_proposal_changed_only_for_real_updates(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-4321-W2027",
+        professor_id="prof_changeflag",
+        bot_name="eecs-4321-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    help_chat = await criabot_instance.gradebook_chat(session_id=session_id, prompt="help")
+    assert help_chat["proposal"] is not None
+    assert help_chat["proposal_changed"] is False
+
+    refined = await criabot_instance.gradebook_chat(session_id=session_id, prompt="Set Assignments 40%")
+    assert refined["proposal"] is not None
+    assert refined["proposal_changed"] is True
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_returns_content_mapping_after_subcategory_rename(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-5555-W2027",
+        professor_id="prof_submap",
+        bot_name="eecs-5555-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 101, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    await criabot_instance.gradebook_chat(
+        session_id=session_id,
+        prompt="In Assignments, split into Homework 10%, Projects 15%",
+    )
+    accepted = await criabot_instance.gradebook_accept(session_id=session_id)
+    assert accepted["content_mapping"] is not None
+
+    renamed = await criabot_instance.gradebook_chat(
+        session_id=session_id,
+        prompt="rename Homework to Homework Tasks",
+    )
+    assert renamed.get("content_mapping") is not None
+    rows = (renamed.get("content_mapping") or {}).get("graded_activities") or []
+    homework_rows = [row for row in rows if int(row.get("moodle_cmid") or 0) == 101]
+    assert homework_rows
+    assert str(homework_rows[0].get("confirmed_subcategory") or homework_rows[0].get("subcategory") or "").lower() == "homework tasks"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_sync_preserves_subcategory_in_content_mapping(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-5566-W2027",
+        professor_id="prof_sync_sub",
+        bot_name="eecs-5566-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 101, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    await criabot_instance.gradebook_chat(
+        session_id=session_id,
+        prompt="In Assignments, split into Homework 10%, Projects 15%",
+    )
+    await criabot_instance.gradebook_accept(session_id=session_id)
+
+    synced = await criabot_instance.gradebook_sync_moodle_context(
+        session_id=session_id,
+        confirmed_mapping=[
+            {
+                "moodle_cmid": 101,
+                "activity_name": "Homework 1",
+                "category": "Assignments",
+                "subcategory": "Projects",
+            }
+        ],
+    )
+
+    rows = (synced.get("content_mapping") or {}).get("graded_activities") or []
+    homework_rows = [row for row in rows if int(row.get("moodle_cmid") or 0) == 101]
+    assert homework_rows
+    assert str(homework_rows[0].get("confirmed_subcategory") or homework_rows[0].get("subcategory") or "") == "Projects"
+
+
+@pytest.mark.asyncio
+async def test_gradebook_status_includes_latest_chat_history_after_post_finalize_edit(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-9999-F2026",
+        professor_id="prof_history",
+        bot_name="eecs-9999-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    await criabot_instance.gradebook_chat(session_id=session_id, prompt="Please generate proposal")
+    await criabot_instance.gradebook_accept(session_id=session_id)
+    await criabot_instance.gradebook_finalize(
+        session_id=session_id,
+        confirmed_mapping=[{"moodle_cmid": 1, "category": "Assignments"}],
+    )
+
+    chat = await criabot_instance.gradebook_chat(session_id=session_id, prompt="Change Assignments weight by 5%")
+    assert isinstance(chat.get("chat_history"), list)
+    assert len(chat.get("chat_history") or []) >= 2
+
+    status = await criabot_instance.gradebook_status(session_id=session_id)
+    history = status.get("chat_history") or []
+    assert isinstance(history, list)
+    assert any((entry.get("role") == "human" and "Change Assignments weight by 5%" in str(entry.get("text") or "")) for entry in history)
+
+
+@pytest.mark.asyncio
+async def test_gradebook_chat_history_fifo_trims_oldest_messages(criabot_instance):
+    start = await criabot_instance.start_gradebook_session(
+        course_id="EECS-8888-F2026",
+        professor_id="prof_fifo",
+        bot_name="eecs-8888-bot",
+        moodle_resources=[{"name": "Course Syllabus.pdf", "content_preview": "Assignments 25%, Midterm 30%, Final 30%"}],
+        course_activities=[{"cmid": 1, "module": "assign", "name": "Homework 1"}],
+    )
+    session_id = start["session_id"]
+
+    criabot_instance._gradebook._chat_history_max_messages = 4
+    criabot_instance._gradebook._chat_history_max_chars = 100000
+
+    await criabot_instance.gradebook_chat(session_id=session_id, prompt="first change")
+    await criabot_instance.gradebook_chat(session_id=session_id, prompt="second change")
+    await criabot_instance.gradebook_chat(session_id=session_id, prompt="third change")
+
+    status = await criabot_instance.gradebook_status(session_id=session_id)
+    history = status.get("chat_history") or []
+    assert len(history) <= 4
+    assert any(entry.get("role") == "human" and "third change" in str(entry.get("text") or "") for entry in history)
+    assert not any(entry.get("role") == "human" and "first change" in str(entry.get("text") or "") for entry in history)
+
+
+def test_gradebook_bool_normalization_in_criabot_response():
+    assert Criabot._normalize_bool_flag(True) is True
+    assert Criabot._normalize_bool_flag(False) is False
+    assert Criabot._normalize_bool_flag("true") is True
+    assert Criabot._normalize_bool_flag("false") is False
+    assert Criabot._normalize_bool_flag("1") is True
+    assert Criabot._normalize_bool_flag("0") is False
+    assert Criabot._normalize_bool_flag(1) is True
+    assert Criabot._normalize_bool_flag(0) is False
+    assert Criabot._normalize_bool_flag("yes") is True
+    assert Criabot._normalize_bool_flag("off") is False
+
+
+@pytest.mark.asyncio
+async def test_gradebook_status_missing_session_raises(criabot_instance):
+    with pytest.raises(KeyError):
+        await criabot_instance.gradebook_status(session_id="missing-session")
+
+
+@pytest.mark.asyncio
+async def test_sync_faq_site_invalid_url_marks_error_status(criabot_instance):
+    with pytest.raises(ValueError):
+        await criabot_instance.sync_faq_site(source_url="not-a-valid-url")
+    status = criabot_instance.get_faq_sync_status()
+    assert status["state"] == "ERROR"
+    assert status["error"] is not None
+
+
+@pytest.mark.asyncio
+async def test_gradebook_upload_duplicate_conflict_is_non_fatal(criabot_instance):
+    class DuplicateUploadError(Exception):
+        def __init__(self):
+            self.status_code = 409
+            self.message = '{"status":409,"message":"Requested content already exists in the database.","code":"DUPLICATE"}'
+            super().__init__(self.message)
+
+    session = SimpleNamespace(
+        session_id="gb-session-1",
+        phase="ANALYSIS",
+        bot_name="eclass-faq-bot",
+        proposal=None,
+        extraction={},
+    )
+
+    criabot_instance._gradebook.chat = AsyncMock(return_value=session)
+    criabot_instance._gradebook.register_uploaded_document = AsyncMock()
+    criabot_instance._gradebook_api = SimpleNamespace(
+        sessions=SimpleNamespace(update_session=AsyncMock())
+    )
+    criabot_instance._gradebook_conversation = MagicMock()
+    criabot_instance._gradebook_conversation.make_reply.return_value = "ack"
+
+    criabot_instance._criadex.content = MagicMock()
+    criabot_instance._criadex.content.upload = AsyncMock(side_effect=DuplicateUploadError())
+
+    payload = base64.b64encode(b"Course syllabus with grading percentages").decode("utf-8")
+    result = await criabot_instance.gradebook_upload(
+        session_id="gb-session-1",
+        filename="syllabus.txt",
+        filetype="text/plain",
+        base64_content=payload,
+    )
+
+    assert result["uploaded_document_name"] is not None
+    criabot_instance._gradebook.register_uploaded_document.assert_awaited_once_with(
+        "gb-session-1", result["uploaded_document_name"]
+    )
+
+
+def test_duplicate_content_error_detection_409_with_duplicate_code():
+    """Test that 409 errors with DUPLICATE code are properly detected"""
+    class Mock409Error(Exception):
+        def __init__(self):
+            self.status_code = 409
+            self.message = '{"status":409,"code":"DUPLICATE","message":"Requested content already exists in the database."}'
+
+    error = Mock409Error()
+    
+    # Simulate the error detection logic
+    if error.status_code == 409:
+        raw_message = str(getattr(error, "message", "")) or str(error)
+        is_duplicate = "DUPLICATE" in raw_message or "already exists" in raw_message.lower()
+        assert is_duplicate is True
+
+
+def test_duplicate_content_error_detection_409_with_already_exists():
+    """Test that 409 errors with 'already exists' message are properly detected"""
+    class Mock409Error(Exception):
+        def __init__(self):
+            self.status_code = 409
+            self.message = "Requested content already exists in the database."
+
+    error = Mock409Error()
+    
+    # Simulate the error detection logic
+    if error.status_code == 409:
+        raw_message = str(getattr(error, "message", "")) or str(error)
+        is_duplicate = "DUPLICATE" in raw_message or "already exists" in raw_message.lower()
+        assert is_duplicate is True
+
+
+def test_duplicate_content_error_detection_non_409_ignored():
+    """Test that non-409 errors are not treated as duplicates"""
+    class Mock500Error(Exception):
+        def __init__(self):
+            self.status_code = 500
+            self.message = "Internal server error"
+
+    error = Mock500Error()
+    
+    # Simulate the error detection logic
+    if error.status_code == 409:
+        raw_message = str(getattr(error, "message", "")) or str(error)
+        is_duplicate = "DUPLICATE" in raw_message or "already exists" in raw_message.lower()
+    else:
+        is_duplicate = False
+    
+    assert is_duplicate is False

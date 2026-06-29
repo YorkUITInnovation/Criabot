@@ -279,14 +279,66 @@ class TestMergeConfigurations:
             llm_generate_related_prompts=True, no_context_message="Msg2",
             no_context_use_message=False, no_context_llm_guess=False, system_message="Sys2"
         )
-        
+
         priorities = {1: 2, 2: 1}
-        
+
         result = merge_configurations([config1, config2], priorities=priorities)
-        
+
         assert result.max_input_tokens == 1000
         assert result.temperature == 0.5
         assert result.system_message == "Sys1"
+
+    def test_merge_preserves_web_and_faq_flags(self):
+        config1 = BotParametersModel(
+            id=1,
+            bot_id=1,
+            max_input_tokens=2000,
+            max_reply_tokens=1024,
+            temperature=0.7,
+            top_p=0.0,
+            top_k=5,
+            min_k=0.5,
+            top_n=3,
+            min_n=0.7,
+            llm_generate_related_prompts=True,
+            no_context_message="Message 1",
+            no_context_use_message=False,
+            no_context_llm_guess=False,
+            system_message="System 1",
+            web_search_global_enabled=False,
+            web_search_enabled=False,
+            faq_fallback_enabled=False,
+            faq_fallback_threshold=0.3,
+        )
+
+        config2 = BotParametersModel(
+            id=2,
+            bot_id=2,
+            max_input_tokens=3000,
+            max_reply_tokens=2048,
+            temperature=0.9,
+            top_p=0.1,
+            top_k=10,
+            min_k=0.6,
+            top_n=5,
+            min_n=0.8,
+            llm_generate_related_prompts=False,
+            no_context_message="Message 2",
+            no_context_use_message=True,
+            no_context_llm_guess=True,
+            system_message="System 2",
+            web_search_global_enabled=True,
+            web_search_enabled=True,
+            faq_fallback_enabled=True,
+            faq_fallback_threshold=0.9,
+        )
+
+        result = merge_configurations([config1, config2])
+
+        assert result.web_search_global_enabled is True
+        assert result.web_search_enabled is True
+        assert result.faq_fallback_enabled is True
+        assert result.faq_fallback_threshold == 0.9
 
     def test_merge_none_values_not_override(self):
         config1 = BotParametersModel(

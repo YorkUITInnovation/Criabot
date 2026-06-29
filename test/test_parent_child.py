@@ -342,7 +342,9 @@ class TestCriabotParentChild:
             id=1, bot_id=1, max_input_tokens=2000, max_reply_tokens=1024, temperature=0.9,
             top_p=0.0, top_k=10, min_k=0.5, top_n=3, min_n=0.7,
             llm_generate_related_prompts=True, no_context_message="Test",
-            no_context_use_message=False, no_context_llm_guess=False, system_message="Child system"
+            no_context_use_message=False, no_context_llm_guess=False, system_message="Child system",
+            web_search_global_enabled=True, web_search_enabled=True,
+            faq_fallback_enabled=True, faq_fallback_threshold=0.9,
         ))
         criabot_instance._mysql_api.bot_parents.get_parent_ids = AsyncMock(return_value=[2])
         criabot_instance._mysql_api.bot_parents.get_by_child = AsyncMock(return_value=[
@@ -358,7 +360,9 @@ class TestCriabotParentChild:
                 id=2, bot_id=2, max_input_tokens=3000, max_reply_tokens=2048, temperature=0.8,
                 top_p=0.1, top_k=15, min_k=0.6, top_n=5, min_n=0.8,
                 llm_generate_related_prompts=False, no_context_message="Parent",
-                no_context_use_message=True, no_context_llm_guess=True, system_message="Parent system"
+                no_context_use_message=True, no_context_llm_guess=True, system_message="Parent system",
+                web_search_global_enabled=False, web_search_enabled=False,
+                faq_fallback_enabled=False, faq_fallback_threshold=0.2,
             )
         ])
         criabot_instance._mysql_api.bot_parents.get_child_ids = AsyncMock(return_value=[])
@@ -368,3 +372,7 @@ class TestCriabotParentChild:
         assert result.parent_bot_names == ["parent_bot"]
         assert result.children == []
         assert result.effective_config is not None
+        assert result.effective_config.web_search_enabled is True
+        assert result.effective_config.web_search_global_enabled is True
+        assert result.effective_config.faq_fallback_enabled is True
+        assert result.effective_config.faq_fallback_threshold == 0.9

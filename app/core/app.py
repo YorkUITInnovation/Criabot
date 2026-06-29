@@ -186,6 +186,7 @@ class CriabotAPI(FastAPI):
         )
         await criabot_instance.initialize()
         criabot_api.criabot = criabot_instance # Assign to app instance
+        await criabot_instance.start_faq_sync_scheduler()
 
         # Postflight checks
         if not await criabot_api.postflight_checks():
@@ -195,6 +196,7 @@ class CriabotAPI(FastAPI):
         yield
 
         criabot_api.logger.info("Shutting down Criabot...")
+        await criabot_instance.stop_faq_sync_scheduler()
         # Optionally, add shutdown logic for criabot_instance here
 
 

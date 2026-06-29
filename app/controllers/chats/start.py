@@ -33,7 +33,10 @@ class StartChatRoute(CriaRoute):
     ) -> ResponseModel:
         # Try to start a chat
         from criabot.bot.bot import Bot
-        chat_id: str = await Bot.start_chat(cache_api=request.app.criabot.redis_api)
+        chat_id: str = await Bot.start_chat(
+            cache_api=request.app.criabot.redis_api,
+            criadex=request.app.criabot.criadex
+        )
 
         # Success!
         return self.ResponseModel(

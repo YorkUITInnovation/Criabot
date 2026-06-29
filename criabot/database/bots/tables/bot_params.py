@@ -1,6 +1,6 @@
 from typing import Optional, List
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import Integer, Numeric, Boolean, Text, ForeignKey, insert, delete, select, update, \
     CursorResult, ChunkedIteratorResult
 from sqlalchemy.orm import Mapped, mapped_column
@@ -31,6 +31,10 @@ class BotParametersTable(BaseTable):
     no_context_use_message: Mapped[bool] = mapped_column(Boolean, nullable=False)
     no_context_llm_guess: Mapped[bool] = mapped_column(Boolean, nullable=False)
     system_message: Mapped[str] = mapped_column(Text, nullable=True)
+    web_search_global_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    web_search_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    faq_fallback_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    faq_fallback_threshold: Mapped[float] = mapped_column(Numeric(3, 2), nullable=False, default=0.5)
 
 
 class BotParametersBaseConfig(BaseModel):
@@ -56,6 +60,10 @@ class BotParametersBaseConfig(BaseModel):
     no_context_use_message: bool = False
     no_context_llm_guess: bool = False
     system_message: Optional[str] = ""  # System message to embed (default empty string)
+    web_search_global_enabled: bool = True
+    web_search_enabled: bool = False
+    faq_fallback_enabled: bool = True
+    faq_fallback_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class BotParametersConfig(BotParametersBaseConfig):

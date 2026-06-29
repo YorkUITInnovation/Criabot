@@ -2,6 +2,7 @@ from redis.asyncio import ConnectionPool
 
 from criabot.cache.core import BaseCacheAPI
 from criabot.cache.objects.chats import Chats
+from criabot.cache.objects.gradebooks import Gradebooks
 
 
 class BotCacheAPI(BaseCacheAPI):
@@ -20,3 +21,4 @@ class BotCacheAPI(BaseCacheAPI):
         super().__init__(pool)
 
         self.chats: Chats = Chats(pool)
+        self.gradebooks: Gradebooks = Gradebooks(pool)

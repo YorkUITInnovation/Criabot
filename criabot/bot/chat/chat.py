@@ -1,5 +1,6 @@
 import logging
 import traceback
+import re
 from typing import List, Optional, Dict, Tuple
 
 from CriadexSDK.ragflow_sdk import RAGFlowSDK
@@ -28,6 +29,10 @@ class Chat:
     Lightweight, transient chat instance
     """
 
+    INDEXING_IN_PROGRESS_MESSAGE = (
+        "Your document is still indexing. Please try again in a few moments."
+    )
+
     def __init__(
         self,
         bot: Bot,
@@ -50,6 +55,7 @@ class Chat:
         self._llm_model_id = llm_model_id
         self._rerank_model_id = rerank_model_id
         self.chat_reply_metadata = {}
+        self._related_prompts_enabled = True
 
         # Build the context retriever
         self._retriever = ContextRetriever(
@@ -96,6 +102,12 @@ class Chat:
             metadata_filter=metadata_filter,
             extra_bots=extra_bots
         )
+        if response.indexing_in_progress:
+            self.chat_reply_metadata["indexing_in_progress"] = True
+            self.chat_reply_metadata["indexing_groups"] = response.indexing_groups
+        if response.faq_fallback_used:
+            self.chat_reply_metadata["faq_fallback_used"] = True
+            self.chat_reply_metadata["faq_sources"] = response.faq_sources
 
         # Add the user's prompt to the buffer
         self._buffer.add_message(
@@ -109,9 +121,9 @@ class Chat:
 
         # Generate the response history
         if isinstance(response.context, TextContext):
-            if self._should_use_direct_text_reply(response.context):
+            if self._should_use_direct_text_reply(response.context, prompt):
                 reply_history, reply_tokens = self._direct_text_context_reply(response.context)
-            elif self._should_use_direct_text_summary_reply(response.context):
+            elif self._should_use_direct_text_summary_reply(response.context, prompt):
                 reply_history, reply_tokens = self._direct_text_summary_reply(response.context)
             else:
                 reply_history, reply_tokens, message_text = await self._text_context_reply(
@@ -121,7 +133,9 @@ class Chat:
         elif isinstance(response.context, QuestionContext):
             reply_history, reply_tokens = self._question_context_reply(response.context)
         elif response.context is None:
-            reply_history, reply_tokens = await self._no_context_reply()
+            reply_history, reply_tokens = await self._no_context_reply(
+                indexing_in_progress=response.indexing_in_progress
+            )
         else:
             raise ValueError("Unexpected context return case!")
 
@@ -140,7 +154,7 @@ class Chat:
         response_message: ChatMessage = reply_history[-1]
 
         related_prompts = response.context.related_prompts if response.context else []
-        if self._bot_parameters.llm_generate_related_prompts and not related_prompts:
+        if self._bot_parameters.llm_generate_related_prompts and self._related_prompts_enabled and not related_prompts:
             try:
                 related_prompts_response = await self._criadex.agents.azure.related_prompts(
                     model_id=self._llm_model_id,
@@ -158,9 +172,18 @@ class Chat:
                         token_usage.extend([CompletionUsage(**u) for u in usage_from_related_prompts])
                     else:
                         token_usage.extend(usage_from_related_prompts)
-            except:
-                # Don't want this to actually cause issues if the agent fails because the LLM sucks
-                logging.error("Failed to generate related prompts! " + traceback.format_exc())
+            except Exception as exc:
+                # Related prompts are optional. If network/DNS is flaky, avoid repeated retries/log spam for this chat.
+                message = str(exc)
+                if "Name or service not known" in message or "Network error after" in message:
+                    self._related_prompts_enabled = False
+                    logging.warning(
+                        "Related prompts disabled for chat_id=%s due to transient network/DNS error: %s",
+                        self._chat_id,
+                        message,
+                    )
+                else:
+                    logging.error("Failed to generate related prompts! " + traceback.format_exc())
 
         # Return reply
         return ChatReply(
@@ -176,6 +199,8 @@ class Chat:
             token_usage=token_usage,
             search_units=response.search_units,
             verified_response=response.context.context_type == "QUESTION" if response.context else False,
+            faq_fallback_used=response.faq_fallback_used,
+            faq_sources=response.faq_sources,
             total_usage={
                 "completion_tokens": sum(usage.completion_tokens for usage in token_usage),
                 "prompt_tokens": sum(usage.prompt_tokens for usage in token_usage),
@@ -361,7 +386,21 @@ class Chat:
         )
         return self._buffer.history, None
 
-    async def _no_context_reply(self):
+    def _indexing_in_progress_message(self):
+        self._buffer.add_message(
+            message=ChatMessage(
+                role="assistant",
+                blocks=[{"type": "text", "text": self.INDEXING_IN_PROGRESS_MESSAGE}],
+                additional_kwargs={},
+                metadata=self.chat_reply_metadata,
+            )
+        )
+        return self._buffer.history, None
+
+    async def _no_context_reply(self, indexing_in_progress: bool = False):
+        if indexing_in_progress:
+            return self._indexing_in_progress_message()
+
         if self._bot_parameters.no_context_llm_guess:
             history, usage = await self._no_context_llm_guess()
             
@@ -396,15 +435,28 @@ class Chat:
         )
         return self._buffer.history, None
 
-    def _should_use_direct_text_reply(self, context: TextContext) -> bool:
-        if len(context.nodes) != 1:
+    def _should_use_direct_text_reply(self, context: TextContext, prompt: str) -> bool:
+        fact_texts = self._extract_fact_texts(context)
+        if not fact_texts:
             return False
 
-        node_text = (context.nodes[0].node.text or "").strip()
-        if not node_text:
+        top_fact_text = fact_texts[0]
+        if len(top_fact_text) > 300:
             return False
 
-        return len(node_text) <= 300
+        # If the top fact looks like a pointer to another section rather than 
+        # the answer itself, avoid a direct reply so the LLM can try to 
+        # synthesize a better response from all retrieved context.
+        pointer_pattern = r"\b(please\s+)?refer\s+to\b|\bsee\s+(section|chapter|appendix|page|module)\b"
+        if re.search(pointer_pattern, top_fact_text, re.IGNORECASE):
+            return False
+
+        if len(context.nodes) == 1:
+            return True
+
+        # Simple factoid prompts are more reliable when answered from the top
+        # retrieved fact instead of letting the LLM rewrite or replace it.
+        return ContextRetriever._extract_focused_question_prompt(prompt) is not None and len(context.nodes) <= 3
 
     def _direct_text_context_reply(self, context: TextContext):
         node = context.nodes[0]
@@ -424,7 +476,12 @@ class Chat:
         )
         return self._buffer.history, None
 
-    def _should_use_direct_text_summary_reply(self, context: TextContext) -> bool:
+    def _should_use_direct_text_summary_reply(self, context: TextContext, prompt: str) -> bool:
+        normalized_prompt = (prompt or "").strip()
+        summary_requested = bool(ContextRetriever._PROMPT_PREFIX_RE.search(normalized_prompt))
+        if not summary_requested:
+            return False
+
         fact_texts = self._extract_fact_texts(context)
         if len(fact_texts) < 2 or len(fact_texts) > 5:
             return False

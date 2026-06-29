@@ -169,12 +169,21 @@ class ChatBuffer:
         # Update stored history EXCLUDING the ephemeral
         self._history = history.copy()
 
-        # The ephemeral is always the SECOND-LAST message (just before user prompt)
+        # The ephemeral is always inserted BEFORE the last user message to ensure
+        # conversation history sent to LLM ends with a user message (required by Ragflow)
         if system_ephemeral is not None:
-            history.insert(
-                -1 if len(history) > 1 else 1,
-                system_ephemeral
-            )
+            # Find the last user message position in history
+            last_user_msg_idx = -1
+            for i in range(len(history) - 1, -1, -1):
+                if history[i].role == "user":
+                    last_user_msg_idx = i
+                    break
+            
+            # Insert ephemeral before the last user message (or at position 1 if no user message)
+            if last_user_msg_idx >= 0:
+                history.insert(last_user_msg_idx, system_ephemeral)
+            else:
+                history.insert(1 if system_message else 0, system_ephemeral)
 
         return history
 
@@ -185,6 +194,10 @@ class ChatBuffer:
             max_tokens: int,
             print_debug: bool = False
     ) -> ChatMessage:
+        # Preserve a non-empty user turn for downstream Ragflow validation.
+        # If budget collapses to zero, truncating to empty can make the payload invalid.
+        if max_tokens <= 0:
+            return message
 
         while cls.create_chat_token_metadata(message) > max_tokens:
             excess_tokens: int = abs(max_tokens - cls.get_token_metadata(message))
@@ -202,7 +215,9 @@ class ChatBuffer:
                     "| Current Prompt: ", f"{message.blocks[0].text}"
                 )
 
-            message.blocks[0].text = message.blocks[0].text[:-remove_n_chars]
+            next_text = message.blocks[0].text[:-remove_n_chars]
+            # Avoid collapsing content to empty; keep at least one character.
+            message.blocks[0].text = next_text if next_text else message.blocks[0].text[:1]
 
         # Update at the end
         message.metadata[cls.TOKEN_COUNT_META_NAME] = cls.get_token_metadata(message)

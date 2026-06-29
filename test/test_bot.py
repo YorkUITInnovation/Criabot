@@ -20,6 +20,19 @@ async def test_start_chat(bot_cache_api):
     assert isinstance(chat_id, str)
     bot_cache_api.chats.set.assert_called_once()
 
+
+@pytest.mark.asyncio
+async def test_start_chat_uses_sdk_for_ensure(bot_cache_api):
+    criadex = MagicMock()
+    criadex.agents = MagicMock()
+    criadex.agents.azure = MagicMock()
+    criadex.agents.azure.ensure_dialog = AsyncMock(return_value={"status": 200})
+
+    chat_id = await Bot.start_chat(bot_cache_api, criadex=criadex)
+
+    assert isinstance(chat_id, str)
+    criadex.agents.azure.ensure_dialog.assert_called_once()
+
 def test_group_name(bot):
     assert bot.group_name("QUESTION") == "test_bot-question-index"
     assert bot.group_name("DOCUMENT") == "test_bot-document-index"
@@ -49,3 +62,4 @@ async def test_set_chat_model(bot):
     chat_model = MagicMock()
     await bot.set_chat_model(chat_id="test_chat", chat_model=chat_model)
     bot.cache_api.chats.set.assert_called_once_with(chat_id="test_chat", chat_model=chat_model)
+

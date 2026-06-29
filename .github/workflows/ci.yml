@@ -6,6 +6,7 @@ on:
       - main
       - ragflow-integration
       - feature/child_bot
+      - graphrag
 
 jobs:
   test:
@@ -68,6 +69,8 @@ jobs:
         echo "REDIS_USERNAME=" >> .env
         echo "REDIS_PASSWORD=" >> .env
         echo "CRIADEX_STACKTRACE=True" >> .env
+        echo "GRAPH_RAG_CHAT_ENABLED=true" >> .env
+        echo "GRAPH_RAG_CHAT_AUTO_BUILD=true" >> .env
 
     - name: Run tests
       run: |

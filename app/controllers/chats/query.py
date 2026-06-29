@@ -1,5 +1,6 @@
 from typing import Optional, Any, List
 
+from CriadexSDK.ragflow_sdk import CriadexNetworkError
 from CriadexSDK.ragflow_schemas import CompletionUsage
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
@@ -101,11 +102,23 @@ class QueryChatRoute(CriaRoute):
                 message="One or more bots could not be found in the query."
             )
 
-        reply: ChatReply = await chat.send(
-            prompt=chat_config.prompt,
-            metadata_filter=chat_config.metadata_filter,
-            extra_bots=effective_extra_bots
-        )
+        try:
+            reply: ChatReply = await chat.send(
+                prompt=chat_config.prompt,
+                metadata_filter=chat_config.metadata_filter,
+                extra_bots=effective_extra_bots
+            )
+        except CriadexNetworkError:
+            # Return a graceful response when backend retrieval is temporarily unreachable.
+            # This prevents user-facing 500 errors in Moodle while infra recovers.
+            return self.ResponseModel(
+                code=SUCCESS_CODE,
+                status=200,
+                message="Temporary service connectivity issue. Please retry in a moment.",
+                reply={
+                    "message": "I am temporarily unable to reach the knowledge service. Please try again in a few seconds."
+                }
+            )
 
         return self.ResponseModel(
             code=SUCCESS_CODE,

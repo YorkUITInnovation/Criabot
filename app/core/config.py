@@ -7,6 +7,14 @@ from app.core.objects import AppMode, check_env_path
 
 from criabot.schemas import CriadexCredentials, RedisCredentials, MySQLCredentials
 
+
+def parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
 ENV_PATH: str = os.environ.get('ENV_PATH', "./.env")
 
 # Load .env configuration
@@ -55,6 +63,27 @@ REDIS_CREDENTIALS: RedisCredentials = RedisCredentials(
 
 # By default, only enable in test mode, as stacktraces can leak sensitive info
 CRIADEX_STACKTRACE: bool = os.environ.get("CRIADEX_STACKTRACE", APP_MODE == AppMode.TESTING)
+
+# FAQ Sync Config
+FAQ_SOURCE_URL: str = os.environ.get("FAQ_SOURCE_URL", "https://lthelp.yorku.ca/eclass")
+FAQ_GROUP_NAME: str = os.environ.get("FAQ_GROUP_NAME", "eclass-faq-bot-document-index")
+FAQ_SYNC_MAX_PAGES: int = int(os.environ.get("FAQ_SYNC_MAX_PAGES", "25"))
+FAQ_SYNC_TIMEOUT_SECONDS: float = float(os.environ.get("FAQ_SYNC_TIMEOUT_SECONDS", "20"))
+FAQ_SYNC_ENABLED: bool = os.environ.get("FAQ_SYNC_ENABLED", "false").lower() == "true"
+FAQ_SYNC_INTERVAL_SECONDS: int = int(os.environ.get("FAQ_SYNC_INTERVAL_SECONDS", "21600"))
+FAQ_STALE_AFTER_SECONDS: int = int(os.environ.get("FAQ_STALE_AFTER_SECONDS", "43200"))
+FAQ_ALERT_FAILURE_THRESHOLD: int = int(os.environ.get("FAQ_ALERT_FAILURE_THRESHOLD", "3"))
+
+# Web search fallback config
+WEB_SEARCH_GLOBAL_ENABLED: bool = parse_bool(os.environ.get("WEB_SEARCH_GLOBAL_ENABLED"), True)
+WEB_SEARCH_PROVIDER: str = os.environ.get("WEB_SEARCH_PROVIDER", "searxng")
+WEB_SEARCH_URL: str = os.environ.get("WEB_SEARCH_URL", "http://searxng:8080")
+WEB_SEARCH_TIMEOUT_SECONDS: float = float(os.environ.get("WEB_SEARCH_TIMEOUT_SECONDS", "8"))
+WEB_SEARCH_MAX_RESULTS: int = int(os.environ.get("WEB_SEARCH_MAX_RESULTS", "5"))
+WEB_SEARCH_FALLBACK_ONLY: bool = parse_bool(os.environ.get("WEB_SEARCH_FALLBACK_ONLY"), True)
+WEB_SEARCH_FALLBACK_SCORE_THRESHOLD: float = float(
+    os.environ.get("WEB_SEARCH_FALLBACK_SCORE_THRESHOLD", os.environ.get("FAQ_FALLBACK_THRESHOLD", "0.5"))
+)
 
 # Set the Tiktoken cache directory
 os.environ["TIKTOKEN_CACHE_DIR"] = os.environ.get(

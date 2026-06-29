@@ -7,6 +7,19 @@ from criabot.database.bots.tables.bot_params import BotParametersModel
 from CriadexSDK.ragflow_schemas import TextNodeWithScore, TextNode, ChatMessage
 import httpx
 
+
+def make_text_node(text: str, score: float = 0.9, metadata: dict | None = None):
+    return TextNodeWithScore(
+        node=TextNode(
+            text=text,
+            metadata=metadata or {"group_name": "test-document-index"},
+            text_template="",
+            metadata_template="",
+            class_name="",
+        ),
+        score=score,
+    )
+
 @pytest.fixture
 def bot_mock():
     bot = AsyncMock()
@@ -111,6 +124,21 @@ async def test_send_no_context_with_llm_message(chat, bot_mock):
     assert "do not know" in history[0]["blocks"][0]["text"]
     assert history[1]["blocks"][0]["text"] == "hello"
 
+
+@pytest.mark.asyncio
+async def test_send_no_context_with_indexing_in_progress(chat, bot_mock):
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=None,
+        group_responses={},
+        indexing_in_progress=True,
+        indexing_groups=["test-document-index"],
+    )
+
+    reply = await chat.send(prompt="hello", metadata_filter=None, extra_bots=[])
+
+    assert reply.content.content == Chat.INDEXING_IN_PROGRESS_MESSAGE
+    bot_mock.criadex.agents.azure.chat.assert_not_called()
+
 @pytest.mark.asyncio
 async def test_send_with_criadex_error(chat):
     chat._retriever.retrieve.side_effect = httpx.HTTPStatusError("error", request=MagicMock(), response=MagicMock())
@@ -147,3 +175,113 @@ async def test_history_management(bot_mock, chat_model, bot_parameters):
         await chat.send(prompt=long_string, metadata_filter=None, extra_bots=[])
 
     assert len(chat.history()) <= 4
+
+
+@pytest.mark.asyncio
+async def test_send_single_question_does_not_force_summary(chat, bot_mock):
+    nodes = [
+        make_text_node("Employee Handbook version 5.4 was released on February 15, 2026."),
+        make_text_node("The Advanced Robotics Lab is located in the basement of Building 7, Room B12."),
+        make_text_node("The IT Department support motto is QuantumGuard2026."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
+    )
+
+    reply = await chat.send(
+        prompt="When was Employee Handbook version 5.4 released?",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert not reply.content.content.startswith("Summary:\n")
+    assert reply.content.content == "Employee Handbook version 5.4 was released on February 15, 2026."
+    bot_mock.criadex.agents.azure.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_simple_factoid_question_uses_direct_top_fact_reply(chat, bot_mock):
+    nodes = [
+        make_text_node("The IT Department support motto is QuantumGuard2026."),
+        make_text_node("Employee Handbook version 5.4 was released on February 15, 2026."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
+    )
+
+    reply = await chat.send(
+        prompt="What is the IT Department support motto?",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert reply.content.content == "The IT Department support motto is QuantumGuard2026."
+    bot_mock.criadex.agents.azure.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_explicit_summary_prompt_uses_summary_fast_path(chat, bot_mock):
+    nodes = [
+        make_text_node("The Advanced Robotics Lab is located in the basement of Building 7, Room B12."),
+        make_text_node("Employee Handbook version 5.4 was released on February 15, 2026."),
+        make_text_node("The IT Department support motto is QuantumGuard2026."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
+    )
+
+    reply = await chat.send(
+        prompt="Give me a summary including the IT Department support motto, the HR handbook release date, and the robotics lab location.",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert reply.content.content.startswith("Summary:\n")
+    bot_mock.criadex.agents.azure.chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_pointer_node_forces_llm_call(chat, bot_mock):
+    # If the retrieved node says "Please refer to Section 1.1", 
+    # we should NOT use a direct reply. Instead, we call the LLM
+    # so it can try to find the actual content or give a better answer.
+    nodes = [
+        make_text_node("Please refer to Section 1.1 of the syllabus for learning outcomes."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
+    )
+
+    await chat.send(
+        prompt="What are the learning outcomes?",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    # LLM should be called because direct reply is suppressed for pointers
+    bot_mock.criadex.agents.azure.chat.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_send_non_pointer_single_node_uses_direct_reply(chat, bot_mock):
+    nodes = [
+        make_text_node("The learning outcome is to master the art of Art."),
+    ]
+    chat._retriever.retrieve.return_value = ContextRetrieverResponse(
+        context=TextContext(text="context", nodes=nodes, related_prompts=[]),
+        group_responses={},
+    )
+
+    reply = await chat.send(
+        prompt="What is the learning outcome?",
+        metadata_filter=None,
+        extra_bots=[],
+    )
+
+    assert reply.content.content == "The learning outcome is to master the art of Art."
+    # LLM should NOT be called
+    bot_mock.criadex.agents.azure.chat.assert_not_called()
