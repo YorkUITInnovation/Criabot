@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, List
 
 from redis import asyncio as aioredis
-from CriadexSDK.ragflow_sdk import RAGFlowSDK
-from CriadexSDK.ragflow_schemas import AuthCreateConfig, GroupDeleteResponse
+from criabot.criadex_client import RAGFlowSDK
+from criabot.criadex_schemas import AuthCreateConfig, GroupDeleteResponse
 from aiomysql import Pool
 from redis.asyncio import ConnectionPool
 from sqlalchemy import URL, text
@@ -70,10 +70,16 @@ class Criabot:
         self._redis_credentials: RedisCredentials = redis_credentials
         self._criadex_credentials: CriadexCredentials = criadex_credentials
 
-        # Criadex SDK
+        # Criadex HTTP client — timeout reads CRIADEX_IO_TIMEOUT (was CRIADEX_SDK_IO_TIMEOUT)
+        _criadex_timeout = float(
+            os.environ.get("CRIADEX_IO_TIMEOUT")
+            or os.environ.get("CRIADEX_SDK_IO_TIMEOUT")
+            or "300"
+        )
         self._criadex: RAGFlowSDK = RAGFlowSDK(
             api_base=self._criadex_credentials.api_base,
-            error_stacktrace=criadex_stacktrace
+            error_stacktrace=criadex_stacktrace,
+            timeout=_criadex_timeout,
         )
         self._gradebook_analyzer: SyllabusAnalyzer = SyllabusAnalyzer(self._criadex)
 

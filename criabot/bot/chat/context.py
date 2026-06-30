@@ -7,8 +7,8 @@ import re
 import textwrap
 from typing import List, Optional, Dict, Awaitable, Union, Type, Callable
 
-from CriadexSDK.ragflow_sdk import RAGFlowSDK, CriadexNetworkError, CriadexAPIError
-from CriadexSDK.ragflow_schemas import TextNodeWithScore, Filter, GroupSearchResponse, CompletionUsage, Asset
+from criabot.criadex_client import RAGFlowSDK, CriadexNetworkError, CriadexAPIError
+from criabot.criadex_schemas import TextNodeWithScore, Filter, GroupSearchResponse, CompletionUsage, Asset
 from pydantic import BaseModel
 
 from criabot.bot.bot import Bot

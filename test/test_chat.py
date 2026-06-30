@@ -4,7 +4,7 @@ from criabot.bot.chat.chat import Chat
 from criabot.bot.chat.context import TextContext, QuestionContext, ContextRetrieverResponse
 from criabot.cache.objects.chats import ChatModel
 from criabot.database.bots.tables.bot_params import BotParametersModel
-from CriadexSDK.ragflow_schemas import TextNodeWithScore, TextNode, ChatMessage
+from criabot.criadex_schemas import TextNodeWithScore, TextNode, ChatMessage
 import httpx
 
 

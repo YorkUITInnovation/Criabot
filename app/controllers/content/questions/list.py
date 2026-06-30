@@ -1,4 +1,4 @@
-from CriadexSDK.ragflow_schemas import ContentListResponse
+from criabot.criadex_schemas import ContentListResponse
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request

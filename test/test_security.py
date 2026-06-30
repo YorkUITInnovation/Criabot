@@ -4,7 +4,7 @@ from app.core.security.handlers.master import GetApiKeyMaster
 from app.core.security.handlers.any import GetApiKeyAny
 from app.core.security.handlers.bots import GetApiKeyBots
 from app.core.security.get_api_key import BadAPIKeyException
-from CriadexSDK.ragflow_schemas import AuthCheckResponse, GroupAuthCheckResponse
+from criabot.criadex_schemas import AuthCheckResponse, GroupAuthCheckResponse
 
 @pytest.mark.asyncio
 async def test_get_api_key_master_success():

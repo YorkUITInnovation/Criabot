@@ -1,7 +1,7 @@
 from typing import Optional, Any, List
 
-from CriadexSDK.ragflow_sdk import CriadexNetworkError
-from CriadexSDK.ragflow_schemas import CompletionUsage
+from criabot.criadex_client import CriadexNetworkError
+from criabot.criadex_schemas import CompletionUsage
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request

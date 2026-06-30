@@ -2,8 +2,8 @@ import logging
 from abc import abstractmethod
 from typing import Optional
 
-from CriadexSDK.ragflow_sdk import RAGFlowSDK
-from CriadexSDK.ragflow_schemas import AuthCheckResponse, GroupAuthCheckResponse
+from criabot.criadex_client import RAGFlowSDK
+from criabot.criadex_schemas import AuthCheckResponse, GroupAuthCheckResponse
 from fastapi import Security, HTTPException
 from fastapi.security import APIKeyQuery, APIKeyHeader
 from starlette.requests import Request

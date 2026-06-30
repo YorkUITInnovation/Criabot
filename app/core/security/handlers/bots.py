@@ -1,7 +1,7 @@
 from json import JSONDecodeError
 from typing import Optional, Type, Awaitable
 
-from CriadexSDK.ragflow_schemas import AuthCheckResponse, GroupAuthCheckResponse
+from criabot.criadex_schemas import AuthCheckResponse, GroupAuthCheckResponse
 from starlette.requests import Request
 
 from app.controllers.schemas import APIResponse

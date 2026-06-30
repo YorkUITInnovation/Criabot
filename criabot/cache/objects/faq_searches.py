@@ -4,7 +4,7 @@ import os
 from typing import Any, Dict, Optional
 
 from redis import asyncio as aioredis
-from CriadexSDK.ragflow_schemas import GroupSearchResponse
+from criabot.criadex_schemas import GroupSearchResponse
 
 from criabot.cache.core import CacheObject
 from criabot.cache.helpers import normalize_cache_text, stable_hash

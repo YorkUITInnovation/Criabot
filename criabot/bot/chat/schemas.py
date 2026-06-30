@@ -2,7 +2,7 @@ import enum
 from abc import ABC
 from typing import List, Optional, Dict, Union, Literal
 
-from CriadexSDK.ragflow_schemas import (
+from criabot.criadex_schemas import (
     ChatMessage,
     RelatedPrompt,
     CompletionUsage,

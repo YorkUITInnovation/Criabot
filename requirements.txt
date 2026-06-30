@@ -2,13 +2,14 @@
 fastapi>=0.104.1
 uvicorn==0.24.0.post1
 python-multipart>=0.0.6
+httpx>=0.25.0
 python-dotenv==1.0.0
 cryptography==41.0.5
 pydantic==2.6.2
 pydantic-settings
 sqlalchemy==2.0.27
 typing-inspect
-tiktoken==0.5.1
+tiktoken>=0.7.0
 pypdf>=4.2.0
 slowapi==0.1.8
 redis>=4.0.0
@@ -23,5 +24,4 @@ pytest-asyncio
 pytest-cov
 pytest-dotenv
 
-# update after merge to master
-criadexsdk @ git+https://github.com/YorkUITInnovation/CriadexSDK@graphrag
+# criadexsdk removed — Criabot now owns its own client in criabot/criadex_client.py

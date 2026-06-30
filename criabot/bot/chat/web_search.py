@@ -7,7 +7,7 @@ from typing import List
 
 import httpx
 
-from CriadexSDK.ragflow_schemas import TextNodeWithScore
+from criabot.criadex_schemas import TextNodeWithScore
 
 
 logger = logging.getLogger(__name__)

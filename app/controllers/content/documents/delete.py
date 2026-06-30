@@ -7,7 +7,7 @@ from app.controllers.schemas import NOT_FOUND_CODE, \
 from app.core.route import CriaRoute
 
 from criabot.schemas import BotNotFoundError
-from CriadexSDK.ragflow_sdk import CriadexAPIError
+from criabot.criadex_client import CriadexAPIError
 
 view = APIRouter()
 

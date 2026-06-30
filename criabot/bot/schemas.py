@@ -1,4 +1,4 @@
-from CriadexSDK.ragflow_schemas import ContentUploadResponse
+from criabot.criadex_schemas import ContentUploadResponse
 from pydantic import BaseModel
 
 

@@ -9,7 +9,7 @@ from json import JSONDecodeError
 from typing import Optional, Type, List, TypeVar, Callable, Awaitable
 
 import httpx
-from CriadexSDK.ragflow_schemas import Filter
+from criabot.criadex_schemas import Filter
 from fastapi import Form
 from pydantic import BaseModel, Field, ConfigDict
 from starlette import status

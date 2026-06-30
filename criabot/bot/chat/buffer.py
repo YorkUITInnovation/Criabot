@@ -2,7 +2,7 @@ from pprint import pprint
 from typing import List, Optional, Type
 
 import tiktoken
-from CriadexSDK.ragflow_schemas import ChatMessage, TextBlock
+from criabot.criadex_schemas import ChatMessage, TextBlock
 
 
 def string_tokens(string: str, encoding_name: str = "cl100k_base") -> int:

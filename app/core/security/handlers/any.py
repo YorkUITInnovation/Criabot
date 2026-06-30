@@ -1,4 +1,4 @@
-from CriadexSDK.ragflow_schemas import AuthCheckResponse
+from criabot.criadex_schemas import AuthCheckResponse
 
 from app.controllers.schemas import APIResponse
 from app.core.security.get_api_key import GetApiKey, BadAPIKeyException

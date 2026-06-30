@@ -3,8 +3,8 @@ import traceback
 import re
 from typing import List, Optional, Dict, Tuple
 
-from CriadexSDK.ragflow_sdk import RAGFlowSDK
-from CriadexSDK.ragflow_schemas import ChatMessage, ChatResponse, CompletionUsage, Filter, TextNodeWithScore, GroupSearchResponse
+from criabot.criadex_client import RAGFlowSDK
+from criabot.criadex_schemas import ChatMessage, ChatResponse, CompletionUsage, Filter, TextNodeWithScore, GroupSearchResponse
 
 from criabot.bot.bot import Bot
 from criabot.bot.chat.buffer import ChatBuffer, History

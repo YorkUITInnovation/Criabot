@@ -2,7 +2,7 @@ import pytest
 import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from CriadexSDK.ragflow_schemas import GroupSearchResponse, TextNode, TextNodeWithScore
+from criabot.criadex_schemas import GroupSearchResponse, TextNode, TextNodeWithScore
 from criabot.bot.chat.chat import Chat
 from criabot.bot.chat.context import ContextRetriever, ContextRetrieverResponse, TextContext
 from criabot.cache.objects.chats import ChatModel

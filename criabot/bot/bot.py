@@ -6,8 +6,8 @@ import json
 import os
 from typing import Dict, Awaitable, Callable, Any
 
-from CriadexSDK.ragflow_sdk import RAGFlowSDK
-from CriadexSDK.ragflow_schemas import GroupSearchResponse
+from criabot.criadex_client import RAGFlowSDK
+from criabot.criadex_schemas import GroupSearchResponse
 
 from criabot.bot.schemas import GroupContentResponse
 from criabot.cache.api import BotCacheAPI

@@ -10,7 +10,7 @@ from criabot.cache.objects.gradebooks import Gradebooks, GradebookSessionModel
 from criabot.cache.objects.web_searches import WebSearches
 from criabot.cache.objects.reranks import Reranks
 from criabot.cache.objects.faq_searches import FaqSearches
-from CriadexSDK.ragflow_schemas import GroupSearchResponse, TextNodeWithScore, TextNode
+from criabot.criadex_schemas import GroupSearchResponse, TextNodeWithScore, TextNode
 
 
 class FakeRedis:

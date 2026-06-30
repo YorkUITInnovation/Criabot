@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from CriadexSDK.ragflow_schemas import GroupSearchResponse
+from criabot.criadex_schemas import GroupSearchResponse
 from criabot.bot.bot import Bot
 from criabot.bot.chat.context import ContextRetriever
 

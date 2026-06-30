@@ -60,15 +60,6 @@ services:
         - mysql
         - mailhog
         - redis
-    # Cria-Front CriaScraper
-    criascraper: # to-remove
-      image: amerkurev/scrapper:latest
-      restart: unless-stopped
-      ports:
-        - "127.0.0.1:3000:3000"
-      volumes:
-        - "./user_data:/home/user/user_data"
-        - "./user_scripts:/home/user/user_scripts"
     # Cria-Back SearXNG
     searxng:
       image: docker.io/searxng/searxng:2026.4.29-cba0cffa8
@@ -143,6 +134,10 @@ services:
         APP_INITIAL_MASTER_KEY: ${APP_INITIAL_MASTER_KEY}
         RAGFLOW_API_KEY: ${RAGFLOW_API_KEY}
         RAGFLOW_SECRET_KEY: ${RAGFLOW_SECRET_KEY}
+        REDIS_HOST: redis
+        REDIS_PORT: 6379
+        REDIS_PASSWORD: ${REDIS_PASSWORD}
+        REDIS_DB: 2
       volumes:
         - ./criadex_data/docker.env:/home/cria/.env
       networks:
@@ -154,6 +149,8 @@ services:
         elasticsearch:
           condition: service_healthy
         ragflow:
+          condition: service_healthy
+        redis:
           condition: service_healthy
       healthcheck:
         test: [ "CMD", "curl", "-f", "http://criadex:25574/health_check" ]
@@ -250,21 +247,6 @@ services:
         interval: 10s
         timeout: 10s
         retries: 60
-    # Cria-Back CriaParse
-    criaparse: # to-replace with rag parsing
-      image: uitadmin/criaparse:latest
-      ports:
-        - "127.0.0.1:25576:25576"
-      environment:
-        ENV_PATH: "./.env"
-      volumes:
-        - ./criaparse_data/docker.env:/home/cria/.env
-      networks:
-        - default
-        - cria_shared
-      depends_on:
-        criadex:
-          condition: service_healthy
     # Cria-Back Embed API
     criaembed-api:
       image: uitadmin/criaembed-api:latest

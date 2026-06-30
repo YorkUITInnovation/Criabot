@@ -1,6 +1,6 @@
 from typing import Optional
 
-from CriadexSDK.ragflow_schemas import AuthCreateResponse
+from criabot.criadex_schemas import AuthCreateResponse
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request

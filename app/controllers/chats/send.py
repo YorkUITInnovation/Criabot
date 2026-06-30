@@ -4,7 +4,7 @@ import json
 import time
 from datetime import datetime
 
-from CriadexSDK.ragflow_schemas import CompletionUsage
+from criabot.criadex_schemas import CompletionUsage
 from fastapi import APIRouter
 from fastapi_restful.cbv import cbv
 from starlette.requests import Request
@@ -228,7 +228,7 @@ class StreamChatRoute(CriaRoute):
                     raise retrieval_error
 
                 # Add user message to buffer
-                from CriadexSDK.ragflow_schemas import ChatMessage
+                from criabot.criadex_schemas import ChatMessage
                 chat._buffer.add_message(
                     message=ChatMessage(
                         role="user",

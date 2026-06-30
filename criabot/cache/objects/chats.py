@@ -3,7 +3,7 @@ import os
 from typing import List, Optional, Any
 
 from redis import asyncio as aioredis
-from CriadexSDK.ragflow_schemas import ChatMessage, TextBlock
+from criabot.criadex_schemas import ChatMessage, TextBlock
 from pydantic import BaseModel
 
 from criabot.bot.chat.buffer import ChatBuffer

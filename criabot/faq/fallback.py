@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from CriadexSDK.ragflow_schemas import GroupSearchResponse
+from criabot.criadex_schemas import GroupSearchResponse
 
 if TYPE_CHECKING:
     from criabot.cache.objects.faq_searches import FaqSearches

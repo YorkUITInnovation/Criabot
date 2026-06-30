@@ -3,7 +3,7 @@ import httpx
 from unittest.mock import AsyncMock, MagicMock, patch
 from criabot.bot.chat.context import ContextRetriever, TextContext, QuestionContext, ContextRetrieverResponse
 from criabot.bot.chat.web_search import WebSearchClient, infer_search_language
-from CriadexSDK.ragflow_schemas import TextNodeWithScore, TextNode, GroupSearchResponse, RerankAgentResponse, TransformAgentResponse, RelatedPrompt, ChatMessage
+from criabot.criadex_schemas import TextNodeWithScore, TextNode, GroupSearchResponse, RerankAgentResponse, TransformAgentResponse, RelatedPrompt, ChatMessage
 
 
 def make_group_search_payload(nodes=None, search_units=1, metadata=None, assets=None):
