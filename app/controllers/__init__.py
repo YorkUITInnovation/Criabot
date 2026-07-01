@@ -5,7 +5,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from starlette.responses import RedirectResponse, HTMLResponse, Response
 
 import app.core.config as config
-from app.controllers import manage, content, chats, faq, gradebook
+from app.controllers import manage, content, chats, faq, gradebook, models
 from app.core.objects import AppMode
 from app.core.security.handlers.master import GetApiKeyMaster
 from . import docs
@@ -24,6 +24,7 @@ router.include_router(docs.router)
 router.include_router(content.router)
 router.include_router(faq.router)
 router.include_router(gradebook.router)
+router.include_router(models.router)
 
 SWAGGER_ROUTE_DEPS: list = [Security(GetApiKeyMaster())] if config.APP_MODE == AppMode.PRODUCTION else []
 

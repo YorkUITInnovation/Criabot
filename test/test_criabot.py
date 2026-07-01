@@ -62,6 +62,78 @@ async def test_create_bot(criabot_instance):
 
 
 @pytest.mark.asyncio
+async def test_list_ragflow_models_syncs_then_lists_ragflow_provider_only(criabot_instance):
+    criabot_instance._criadex.models.sync_ragflow = AsyncMock(return_value={"stats": {"created": 1}})
+    criabot_instance._criadex.models.list = AsyncMock(return_value={
+        "models": [
+            {"id": 5, "provider_type": "ragflow", "config": {"api_model": "gpt-4o", "llm_factory": "Azure-OpenAI"}},
+        ]
+    })
+
+    models = await criabot_instance.list_ragflow_models()
+
+    assert models == [{"id": 5, "provider_type": "ragflow", "config": {"api_model": "gpt-4o", "llm_factory": "Azure-OpenAI"}}]
+    criabot_instance._criadex.models.sync_ragflow.assert_awaited_once()
+    criabot_instance._criadex.models.list.assert_awaited_once_with(provider_type="ragflow")
+
+
+@pytest.mark.asyncio
+async def test_list_ragflow_models_still_lists_when_sync_fails(criabot_instance):
+    criabot_instance._criadex.models.sync_ragflow = AsyncMock(side_effect=RuntimeError("tenant db unavailable"))
+    criabot_instance._criadex.models.list = AsyncMock(return_value={"models": []})
+
+    models = await criabot_instance.list_ragflow_models()
+
+    assert models == []
+
+
+@pytest.mark.asyncio
+async def test_list_ragflow_models_returns_only_models_configured_across_distinct_providers(criabot_instance):
+    """
+    Simulate a tenant with several different Ragflow provider factories configured
+    (not an exhaustive list of every factory Ragflow supports — a representative mix),
+    each with only a couple of models added on the Ragflow web UI, across different
+    model kinds (chat/rerank/embedding). Confirms Criabot hands local_cria exactly
+    the configured set — no more (no unconfigured providers/models leaking in) and
+    no less (no provider silently dropped).
+    """
+    configured_models = [
+        {"id": 10, "provider_type": "ragflow", "config": {
+            "api_model": "gpt-4o", "llm_factory": "Azure-OpenAI", "model_type": "chat", "status": "1",
+        }},
+        {"id": 11, "provider_type": "ragflow", "config": {
+            "api_model": "gpt-4o-mini", "llm_factory": "Azure-OpenAI", "model_type": "chat", "status": "1",
+        }},
+        {"id": 12, "provider_type": "ragflow", "config": {
+            "api_model": "llama-3.1-70b-instruct", "llm_factory": "OpenAI-API-Compatible", "model_type": "chat", "status": "1",
+        }},
+        {"id": 13, "provider_type": "ragflow", "config": {
+            "api_model": "rerank-english-v3.0", "llm_factory": "Cohere", "model_type": "rerank", "status": "1",
+        }},
+        {"id": 14, "provider_type": "ragflow", "config": {
+            "api_model": "bge-large-en-v1.5", "llm_factory": "VLLM", "model_type": "embedding", "status": "1",
+        }},
+    ]
+    criabot_instance._criadex.models.sync_ragflow = AsyncMock(return_value={"stats": {"created": 5}})
+    criabot_instance._criadex.models.list = AsyncMock(return_value={"models": configured_models})
+
+    models = await criabot_instance.list_ragflow_models()
+
+    # Exactly what was configured — every provider/model present, nothing extra synthesized.
+    assert models == configured_models
+    assert {m["config"]["llm_factory"] for m in models} == {"Azure-OpenAI", "OpenAI-API-Compatible", "Cohere", "VLLM"}
+    assert {m["config"]["api_model"] for m in models} == {
+        "gpt-4o", "gpt-4o-mini", "llama-3.1-70b-instruct", "rerank-english-v3.0", "bge-large-en-v1.5",
+    }
+    # Only a subset of models per provider were configured (e.g. Azure-OpenAI has 2, not every
+    # Azure deployment) — confirms we're not returning some unfiltered/default catalog.
+    azure_models = [m for m in models if m["config"]["llm_factory"] == "Azure-OpenAI"]
+    assert len(azure_models) == 2
+    criabot_instance._criadex.models.list.assert_awaited_once_with(provider_type="ragflow")
+    criabot_instance._criadex.models.list.assert_awaited_once_with(provider_type="ragflow")
+
+
+@pytest.mark.asyncio
 async def test_create_bot_only_sends_requires_documents_for_document_group(criabot_instance):
     criabot_instance._mysql_api.bots.exists = AsyncMock(return_value=False)
     criabot_instance._criadex.auth.create = AsyncMock(return_value={"api_key": "new_key"})

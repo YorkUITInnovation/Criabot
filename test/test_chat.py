@@ -104,6 +104,24 @@ async def test_send_no_context_with_llm_guess(chat, bot_mock, bot_parameters):
     assert history[1]["blocks"][0]["text"] == "hello"
 
 @pytest.mark.asyncio
+async def test_send_generates_related_prompts_with_chat_id(chat, bot_mock, bot_parameters):
+    bot_parameters.llm_generate_related_prompts = True
+    bot_mock.criadex.agents.azure.related_prompts = AsyncMock(return_value={
+        "agent_response": {
+            "related_prompts": [{"label": "Follow up?", "prompt": "Follow up?", "llm_generated": True}],
+            "usage": [],
+        }
+    })
+
+    reply = await chat.send(prompt="hello", metadata_filter=None, extra_bots=[])
+
+    bot_mock.criadex.agents.azure.related_prompts.assert_called_once()
+    call_kwargs = bot_mock.criadex.agents.azure.related_prompts.call_args.kwargs
+    assert call_kwargs["agent_config"]["chat_id"] == "test_chat"
+    assert reply.related_prompts[0].prompt == "Follow up?"
+
+
+@pytest.mark.asyncio
 async def test_send_no_context_with_saved_message(chat, bot_mock, bot_parameters):
     bot_parameters.no_context_message = "I don't know."
     chat._retriever.retrieve.return_value = ContextRetrieverResponse(context=None, group_responses={})

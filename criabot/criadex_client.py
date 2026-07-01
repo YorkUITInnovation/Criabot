@@ -217,6 +217,10 @@ class ModelsRouter:
         url = f"{self._api_base}/models/{provider_type}/list" if provider_type else f"{self._api_base}/models/list"
         return await _request_with_retry(self._httpx, "GET", url, max_retries=self._max_retries)
 
+    async def sync_ragflow(self):
+        url = f"{self._api_base}/models/ragflow/sync"
+        return await _request_with_retry(self._httpx, "POST", url, max_retries=self._max_retries)
+
     async def update(self, model_id, model_config, provider_type: str = "azure"):
         url = f"{self._api_base}/models/{provider_type}/{model_id}/update"
         dump = model_config.model_dump(mode="json") if hasattr(model_config, "model_dump") else dict(model_config)

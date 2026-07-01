@@ -17,6 +17,15 @@ def make_group_search_payload(nodes=None, search_units=1, metadata=None, assets=
     }
 
 
+def make_rerank_chat_response(text: str):
+    return {
+        "agent_response": {
+            "chat_response": {"message": {"blocks": [{"block_type": "text", "text": text}]}},
+            "usage": {},
+        }
+    }
+
+
 def make_group_search_side_effect(group_to_nodes):
     def _side_effect(*, group_name, search_config):
         return make_group_search_payload(nodes=group_to_nodes.get(group_name, []))
@@ -32,7 +41,7 @@ def expected_empty_search_calls(group_count: int) -> int:
 @pytest.fixture
 def criadex_api():
     mock = AsyncMock()
-    mock.agents.cohere.rerank = AsyncMock(return_value={"reranked_documents": [], "search_units": 1})
+    mock.agents.azure.chat = AsyncMock(return_value=make_rerank_chat_response(""))
     mock.agents.azure.transform = AsyncMock(return_value={"agent_response": TransformAgentResponse(new_prompt="hello", usage=[])})
     mock.content.search = AsyncMock()
     mock.content.list = AsyncMock(return_value={"files": []})
@@ -82,7 +91,7 @@ async def test_retrieve_no_nodes(retriever, bot_mock):
     assert isinstance(response, ContextRetrieverResponse)
     assert response.context is None
     assert len(response.nodes) == 0
-    retriever._criadex.agents.cohere.rerank.assert_not_called()
+    retriever._criadex.agents.azure.chat.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -247,18 +256,72 @@ async def test_question_index_uses_single_pass_by_default(retriever):
     assert len(question_calls) == 1
 
 @pytest.mark.asyncio
-async def test_hybrid_rerank(retriever, criadex_api):
+async def test_hybrid_rerank_skips_llm_call_with_single_node(retriever, criadex_api):
+    """A single candidate needs no reranking — avoid the extra LLM round trip."""
     nodes = [create_text_node("text 1")]
-    await retriever.hybrid_rerank(prompt="hello", nodes=nodes)
-    criadex_api.agents.cohere.rerank.assert_called_once_with(
-        model_id=retriever._rerank_model_id,
+    result = await retriever.hybrid_rerank(prompt="hello", nodes=nodes)
+    criadex_api.agents.azure.chat.assert_not_called()
+    assert result["ranked_nodes"] == nodes
+
+
+@pytest.mark.asyncio
+async def test_hybrid_rerank_uses_llm_to_rank_multiple_nodes(retriever, criadex_api):
+    nodes = [create_text_node("alpha"), create_text_node("beta")]
+    criadex_api.agents.azure.chat = AsyncMock(
+        return_value=make_rerank_chat_response("2: 0.9\n1: 0.6")
+    )
+    retriever._bot_params.min_n = 0.0
+
+    result = await retriever.hybrid_rerank(prompt="hello", nodes=nodes)
+
+    criadex_api.agents.azure.chat.assert_called_once_with(
+        model_id=retriever._llm_model_id,
         agent_config={
-            "prompt": "hello",
-            "nodes": [node.model_dump(mode='json') for node in nodes],
-            "top_n": retriever._bot_params.top_n,
-            "min_n": retriever._bot_params.min_n
+            "chat_id": retriever._chat_id,
+            "history": [{"role": "user", "content": retriever._build_rerank_prompt("hello", nodes)}],
         }
     )
+    ranked = result["ranked_nodes"]
+    assert [n.node.text for n in ranked] == ["beta", "alpha"]
+    assert ranked[0].score == 0.9
+    assert ranked[1].score == 0.6
+
+
+@pytest.mark.asyncio
+async def test_hybrid_rerank_falls_back_to_original_order_on_unparseable_response(retriever, criadex_api):
+    nodes = [create_text_node("alpha"), create_text_node("beta")]
+    criadex_api.agents.azure.chat = AsyncMock(
+        return_value=make_rerank_chat_response("I cannot rank these.")
+    )
+
+    result = await retriever.hybrid_rerank(prompt="hello", nodes=nodes)
+
+    assert result["ranked_nodes"] == nodes
+
+
+@pytest.mark.asyncio
+async def test_hybrid_rerank_falls_back_to_original_order_on_agent_error(retriever, criadex_api):
+    nodes = [create_text_node("alpha"), create_text_node("beta")]
+    criadex_api.agents.azure.chat = AsyncMock(side_effect=RuntimeError("ragflow down"))
+
+    result = await retriever.hybrid_rerank(prompt="hello", nodes=nodes)
+
+    assert result["ranked_nodes"] == nodes
+
+
+@pytest.mark.asyncio
+async def test_hybrid_rerank_filters_below_min_n_and_caps_top_n(retriever, criadex_api):
+    nodes = [create_text_node("alpha"), create_text_node("beta"), create_text_node("gamma")]
+    criadex_api.agents.azure.chat = AsyncMock(
+        return_value=make_rerank_chat_response("2: 0.9\n3: 0.5\n1: 0.1")
+    )
+    retriever._bot_params.min_n = 0.4
+    retriever._bot_params.top_n = 1
+
+    result = await retriever.hybrid_rerank(prompt="hello", nodes=nodes)
+
+    # "alpha" (0.1) is dropped by min_n=0.4; top_n=1 then caps to just "beta".
+    assert [n.node.text for n in result["ranked_nodes"]] == ["beta"]
 
 @pytest.mark.asyncio
 async def test_transform_prompt(retriever, criadex_api):
@@ -1060,11 +1123,11 @@ async def test_hybrid_rerank_cache_miss_populates_cache(retriever, bot_mock):
     rerank_cache.get = AsyncMock(return_value=None)
     rerank_cache.set = AsyncMock()
     bot_mock.cache_api.reranks = rerank_cache
+    retriever._bot_params.min_n = 0.0
 
     nodes = [create_text_node("alpha"), create_text_node("beta")]
-    ranked = [create_text_node("beta", score=0.95), create_text_node("alpha", score=0.5)]
-    retriever._criadex.agents.cohere.rerank = AsyncMock(
-        return_value={"reranked_documents": [n.model_dump(mode="json") for n in ranked]}
+    retriever._criadex.agents.azure.chat = AsyncMock(
+        return_value=make_rerank_chat_response("2: 0.95\n1: 0.5")
     )
 
     result = await retriever.hybrid_rerank(prompt="hello", nodes=nodes)
@@ -1072,11 +1135,11 @@ async def test_hybrid_rerank_cache_miss_populates_cache(retriever, bot_mock):
     assert len(result["ranked_nodes"]) == 2
     rerank_cache.get.assert_awaited_once()
     rerank_cache.set.assert_awaited_once()
-    retriever._criadex.agents.cohere.rerank.assert_awaited_once()
+    retriever._criadex.agents.azure.chat.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_hybrid_rerank_cache_hit_skips_cohere(retriever, bot_mock):
+async def test_hybrid_rerank_cache_hit_skips_llm_call(retriever, bot_mock):
     ranked = [create_text_node("beta", score=0.95)]
     payload = [n.model_dump(mode="json") for n in ranked]
 
@@ -1084,7 +1147,7 @@ async def test_hybrid_rerank_cache_hit_skips_cohere(retriever, bot_mock):
     rerank_cache.get = AsyncMock(return_value=payload)
     rerank_cache.set = AsyncMock()
     bot_mock.cache_api.reranks = rerank_cache
-    retriever._criadex.agents.cohere.rerank = AsyncMock()
+    retriever._criadex.agents.azure.chat = AsyncMock()
 
     result = await retriever.hybrid_rerank(
         prompt="hello",
@@ -1093,4 +1156,4 @@ async def test_hybrid_rerank_cache_hit_skips_cohere(retriever, bot_mock):
 
     assert len(result["ranked_nodes"]) == 1
     rerank_cache.set.assert_not_awaited()
-    retriever._criadex.agents.cohere.rerank.assert_not_awaited()
+    retriever._criadex.agents.azure.chat.assert_not_awaited()

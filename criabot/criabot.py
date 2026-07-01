@@ -522,6 +522,29 @@ class Criabot:
                 f"Failed to delete bot '{name}' cleanly; some resources may remain."
             ) from e
 
+    async def list_ragflow_models(self) -> list[dict]:
+        """
+        List models configured on Ragflow's web interface for the configured tenant.
+
+        Mirrors Criadex's GenericModels rows with provider_type='ragflow' — the only
+        models a bot creator should be offered, since anything else (Azure/Cohere rows,
+        manually-added generic providers) is not Ragflow-backed and gets silently
+        ignored by Ragflow chat/dataset sync.
+
+        Known gap: "Azure-OpenAI"/"OpenAI-API-Compatible" models have sometimes not shown
+        up here after a sync — see app/controllers/models/list.py for details.
+
+        :return: Raw model dicts (id, provider_type, config, created) from Criadex.
+        """
+        try:
+            await self._criadex.models.sync_ragflow()
+        except Exception:
+            # Listing should still work when the Ragflow tenant DB is temporarily unavailable.
+            pass
+
+        response = await self._criadex.models.list(provider_type="ragflow")
+        return response.get("models", [])
+
     async def about(self, name: str) -> AboutBot:
         """
         Retrieve the Bot's config

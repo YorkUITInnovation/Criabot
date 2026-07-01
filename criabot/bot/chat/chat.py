@@ -63,7 +63,8 @@ class Chat:
             rerank_model_id=self._rerank_model_id,
             llm_model_id=llm_model_id,
             bot=bot,
-            bot_params=bot_parameters
+            bot_params=bot_parameters,
+            chat_id=chat_id
         )
 
         # Now generate the chat buffer
@@ -161,6 +162,7 @@ class Chat:
                     agent_config={
                         "llm_prompt": prompt,
                         "llm_reply": response_message.blocks[0].text,
+                        "chat_id": self._chat_id,
                         "max_reply_tokens": 500,
                         "temperature": 0.1
                     }

@@ -98,11 +98,13 @@ class ContextRetriever:
             rerank_model_id,
             llm_model_id,
             bot,
-            bot_params
+            bot_params,
+            chat_id=None
     ):
         self._criadex = criadex
         self._rerank_model_id = rerank_model_id
         self._llm_model_id = llm_model_id
+        self._chat_id = chat_id
         self._bot = bot
         self._bot_params = bot_params
         self._graph_enabled = os.getenv("GRAPH_RAG_CHAT_ENABLED", "true").lower() == "true"
@@ -737,6 +739,44 @@ class ContextRetriever:
         cache_api = getattr(self._bot, "cache_api", None)
         return getattr(cache_api, "reranks", None) if cache_api is not None else None
 
+    _RERANK_LINE_RE = re.compile(r"^\s*\[?(\d+)\]?\s*[:.\-]?\s*([\d.]+)?\s*$")
+    _RERANK_PASSAGE_PREVIEW_CHARS = 400
+
+    @classmethod
+    def _build_rerank_prompt(cls, prompt: str, nodes: List[TextNodeWithScore]) -> str:
+        lines = [f"Query: {prompt}", "", "Passages:"]
+        for idx, node in enumerate(nodes, start=1):
+            text = (node.node.text or "").strip().replace("\n", " ")
+            if len(text) > cls._RERANK_PASSAGE_PREVIEW_CHARS:
+                text = text[:cls._RERANK_PASSAGE_PREVIEW_CHARS] + "..."
+            lines.append(f"[{idx}] {text}")
+        lines.append("")
+        lines.append(
+            "Rank the passages above by relevance to the query, most relevant first. "
+            "Reply with ONLY one line per relevant passage in the form `<number>: <score>`, "
+            "where score is your confidence (0.0 to 1.0) that the passage helps answer the "
+            "query. Omit passages that are not relevant at all. No other text. Example:\n"
+            "3: 0.92\n1: 0.65"
+        )
+        return "\n".join(lines)
+
+    @classmethod
+    def _parse_rerank_response(cls, text: str, num_nodes: int) -> List[tuple]:
+        """Parse '<index>: <score>' lines into 0-based (index, score) pairs, in ranked order."""
+        ranked: List[tuple] = []
+        seen = set()
+        for line in (text or "").splitlines():
+            match = cls._RERANK_LINE_RE.match(line.strip())
+            if not match:
+                continue
+            index = int(match.group(1)) - 1
+            if index < 0 or index >= num_nodes or index in seen:
+                continue
+            score = float(match.group(2)) if match.group(2) else 1.0
+            ranked.append((index, max(0.0, min(1.0, score))))
+            seen.add(index)
+        return ranked
+
     async def hybrid_rerank(
             self,
             prompt,
@@ -762,21 +802,45 @@ class ContextRetriever:
                 reranked_docs = [TextNodeWithScore(**doc) for doc in cached_payload]
                 return {"ranked_nodes": reranked_docs, "search_units": 0}
 
-        response = await self._criadex.agents.cohere.rerank(
-            model_id=self._rerank_model_id,
-            agent_config={
-                "prompt": prompt,
-                "nodes": [node.model_dump(mode='json') for node in nodes],
-                "top_n": self._bot_params.top_n,
-                "min_n": self._bot_params.min_n
-            }
-        )
+        # A single candidate needs no reranking, and if reranking fails or produces
+        # nothing parseable, fall back to the original (unranked, uncapped) order —
+        # same contract as before: only a genuine rerank result gets top_n-capped.
+        if len(nodes) <= 1:
+            return {"ranked_nodes": list(nodes), "search_units": 0}
 
-        reranked_docs = response.get("reranked_documents", [])
-        if reranked_docs and isinstance(reranked_docs[0], dict):
-            reranked_docs = [TextNodeWithScore(**doc) for doc in reranked_docs]
+        min_n = self._bot_params.min_n
+        reranked_docs: Optional[List[TextNodeWithScore]] = None
 
-        if cache is not None and cache_key is not None and reranked_docs:
+        try:
+            # Ragflow has no standalone rerank API — reuse the bot's own LLM (via the
+            # same chat completion path used for real replies) to rank passages.
+            response = await self._criadex.agents.azure.chat(
+                model_id=self._llm_model_id,
+                agent_config={
+                    "chat_id": self._chat_id,
+                    "history": [{"role": "user", "content": self._build_rerank_prompt(prompt, nodes)}],
+                }
+            )
+            agent_response = response.get("agent_response", response) if isinstance(response, dict) else response
+            text = agent_response["chat_response"]["message"]["blocks"][0]["text"]
+            ranked = self._parse_rerank_response(text, len(nodes))
+            if ranked:
+                reranked_docs = [
+                    TextNodeWithScore(node=nodes[index].node, score=score)
+                    for index, score in ranked
+                    if score >= min_n
+                ]
+        except Exception:
+            logging.getLogger(__name__).debug("LLM-based rerank failed; using original order", exc_info=True)
+
+        if reranked_docs is None:
+            return {"ranked_nodes": list(nodes), "search_units": 0}
+
+        top_n = self._bot_params.top_n
+        if top_n:
+            reranked_docs = reranked_docs[:top_n]
+
+        if cache is not None and cache_key is not None:
             try:
                 payload = [doc.model_dump(mode="json") for doc in reranked_docs]
                 await cache.set(cache_key, payload)
