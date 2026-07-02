@@ -2,6 +2,9 @@
 *_data/
 *data/
 
+# Local dev override of docker-compose.yml (machine-specific network/resource tuning)
+docker-compose.dev.yml
+
 # Keep SearXNG runtime config tracked in git.
 !searxng_data/
 !searxng_data/settings.yml

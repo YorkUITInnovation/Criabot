@@ -10,6 +10,12 @@ use_default_settings:
       - wikipedia
       - youtube
 
+# `keep_only` doesn't clear an engine's own `disabled` flag — Bing ships
+# disabled by default, so it never actually ran without this override.
+engines:
+  - name: bing
+    disabled: false
+
 server:
   port: 8080
   bind_address: "0.0.0.0"

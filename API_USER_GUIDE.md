@@ -26,6 +26,8 @@ X-API-Key: ${API_KEY}
 ### 1.1 Create a Bot
 POST /bots/{bot_name}/manage/create
 
+Only `llm_model_id`, `embedding_model_id`, and `rerank_model_id` are required — get valid IDs from `GET /models/list` (§7.1), which only lists models actually configured on Ragflow's web UI for your tenant. Every hyperparameter below is optional and falls back to the default shown if omitted (see the full list in `criabot/database/bots/tables/bot_params.py`), including the web-search and FAQ-fallback toggles.
+
 Request:
 ```bash
 curl -X POST "${HOST}:${PORT}/bots/my-new-bot/manage/create" \
@@ -35,7 +37,16 @@ curl -X POST "${HOST}:${PORT}/bots/my-new-bot/manage/create" \
     "llm_model_id": 1,
     "embedding_model_id": 2,
     "rerank_model_id": 3,
-    "parent_bot_names": ["optional-parent-name"]
+    "parent_bot_names": ["optional-parent-name"],
+
+    "temperature": 0.9,
+    "top_n": 3,
+    "min_n": 0.7,
+    "llm_generate_related_prompts": true,
+    "web_search_global_enabled": true,
+    "web_search_enabled": false,
+    "faq_fallback_enabled": true,
+    "faq_fallback_threshold": 0.5
 }'
 ```
 
@@ -53,16 +64,16 @@ Response (200 OK):
 ### 1.2 Configure Bot Hyperparameters
 PATCH /bots/{bot_name}/manage/update
 
+Same hyperparameters as create (all optional/partial) except the model IDs, `use_knowledge_graph`, and `requires_documents`, which are fixed at creation time.
+
 Request:
 ```bash
 curl -X PATCH "${HOST}:${PORT}/bots/my-new-bot/manage/update" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: ${API_KEY}" \
   -d '{
-    "llm_model_id": 4,
-    "embedding_model_id": 5,
-    "rerank_model_id": 6,
-    "parent_bot_names": ["optional-parent-name-1", "optional-parent-name-2"]
+    "parent_bot_names": ["optional-parent-name-1", "optional-parent-name-2"],
+    "web_search_enabled": true
 }'
 ```
 
@@ -205,6 +216,8 @@ Response (200 OK):
 ### 2.2 Query a bot
 POST /bots/chats/{chat_id}/query
 
+Same request/response shape as §2.3 Send, below. `extra_bots` is merged automatically with the bot's inherited parent bots, so you only need to list *additional* bots here.
+
 Request:
 ```bash
 curl -X POST "${HOST}:${PORT}/bots/chats/your-chat-id/query" \
@@ -215,25 +228,6 @@ curl -X POST "${HOST}:${PORT}/bots/chats/your-chat-id/query" \
     "bot_name": "my-new-bot-name",
     "extra_bots": ["another-bot-name"]
 }'
-```
-
-Response (200 OK):
-```json
-{
-  "status": 200,
-  "message": "Successfully sent the query",
-  "timestamp": "<timestamp>",
-  "code": "SUCCESS",
-  "reply": {
-    "message": "Paris",
-    "completion_usage": {
-      "prompt_tokens": 7,
-      "completion_tokens": 2,
-      "total_tokens": 9
-    },
-    "related_prompts": []
-  }
-}
 ```
 
 ### 2.3 Send a chat to a bot
@@ -259,16 +253,46 @@ Response (200 OK):
   "timestamp": "<timestamp>",
   "code": "SUCCESS",
   "reply": {
-    "message": "Hello! How can I help you today?",
-    "completion_usage": {
-      "prompt_tokens": 5,
-      "completion_tokens": 10,
-      "total_tokens": 15
+    "prompt": "Hello, bot!",
+    "content": {
+      "role": "assistant",
+      "content": "Hello! How can I help you today?",
+      "assets": [],
+      "additional_kwargs": {},
+      "metadata": {}
     },
-    "related_prompts": []
+    "token_usage": [{"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}],
+    "total_usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15},
+    "search_units": 1,
+    "history": ["... ChatMessage entries ..."],
+    "related_prompts": [
+      {"label": "Follow-up", "prompt": "What else can you tell me?", "llm_generated": true}
+    ],
+    "context": null,
+    "group_responses": {},
+    "verified_response": true,
+    "faq_fallback_used": false,
+    "faq_sources": []
   }
 }
 ```
+
+> **Note if you integrated against an older version of this guide:** the reply text moved from a top-level `message` field to `reply.content.content`, and token usage moved from `reply.completion_usage` to `reply.total_usage`. `related_prompts` are now genuinely LLM-generated (not a static/empty stub). When web search fires (see below), `reply.group_responses.WEB_SEARCH.nodes` carries the retrieved snippets with `source_url` metadata. `faq_fallback_used`/`faq_sources` are set when the reply came from the FAQ crawl index instead of RAG (§5).
+
+### 2.3.1 Stream a chat with live reasoning + citations
+POST /bots/chats/{chat_id}/stream
+
+Same request body as §2.3, but the response is a Server-Sent Events stream — useful for showing retrieval progress and citations live instead of waiting for one JSON payload.
+
+Request:
+```bash
+curl -N -X POST "${HOST}:${PORT}/bots/chats/your-chat-id/stream" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${API_KEY}" \
+  -d '{"prompt": "Hello, bot!", "bot_name": "my-new-bot-name"}'
+```
+
+Each line is `data: {...}` with a `type` of `status` (retrieval/synthesis progress), `chunk` (partial response text), `citations` (source list), or `done` (elapsed time). On error you get a plain JSON error body instead of a stream.
 
 ### 2.4 End a chat with a bot
 DELETE /bots/chats/{chat_id}/end
@@ -394,6 +418,31 @@ Response (200 OK):
   "token_usage": 1
 }
 ```
+
+### 3.1.1 Upload a raw file for native Ragflow parsing
+POST /bots/{bot_name}/documents/upload/file
+
+Preferred over §3.1 for real documents — upload the raw file and let Ragflow parse it natively (PDF, DOCX, HTML, etc.), instead of pre-constructing node/text JSON yourself.
+
+Request:
+```bash
+curl -X POST "${HOST}:${PORT}/bots/my-new-bot/documents/upload/file" \
+  -H "X-API-Key: ${API_KEY}" \
+  -F "file=@./syllabus.pdf" \
+  -F "strategy=GENERIC"
+```
+
+Response (200 OK):
+```json
+{
+  "status": 200,
+  "message": "File queued for native Ragflow parsing.",
+  "code": "SUCCESS",
+  "document_name": "syllabus.pdf"
+}
+```
+
+`strategy` is optional (`GENERIC`, `ALSYLLABUS`, `ALSYLLABUSFR`, `PARAGRAPH`); HTML files are always routed through `PARAGRAPH` regardless of what you pass, since Ragflow has no native HTML parser.
 
 ### 3.2 Update a document on the bot
 PATCH /bots/{bot_name}/documents/update
@@ -577,7 +626,137 @@ Response (200 OK):
 
 ---
 
-## 5. API Documentation & Health
+## 5. FAQ Management
+
+Crawls a configured website into a bot's knowledge base, and also serves as a fallback answer source when RAG retrieval confidence is low (below the bot's `faq_fallback_threshold`).
+
+### 5.1 Update FAQ sync config
+PATCH /faq/config
+
+```bash
+curl -X PATCH "${HOST}:${PORT}/faq/config" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${API_KEY}" \
+  -d '{"source_url": "https://example.edu/faq", "group_name": "my-bot-faq", "max_pages": 50, "enabled": true}'
+```
+
+### 5.2 Trigger an FAQ sync
+POST /faq/sync
+
+```bash
+curl -X POST "${HOST}:${PORT}/faq/sync" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${API_KEY}" \
+  -d '{"trigger_graph_build": true}'
+```
+
+Response (200 OK):
+```json
+{
+  "status": 200,
+  "code": "SUCCESS",
+  "state": "READY",
+  "source_url": "https://example.edu/faq",
+  "group_name": "my-bot-faq",
+  "pages_crawled": 12,
+  "indexed_files": 12,
+  "duplicate_files": 0,
+  "graph_build_job": null
+}
+```
+
+### 5.3 Get FAQ sync status
+GET /faq/status
+
+```bash
+curl "${HOST}:${PORT}/faq/status" -H "X-API-Key: ${API_KEY}"
+```
+
+Returns the current lifecycle `state` (`NOT_RUN`/`READY`/etc.), last run/success timestamps, whether the index is `stale`, and recent run history.
+
+---
+
+## 6. Gradebook
+
+A multi-turn, state-machine-driven session that turns Moodle course activities into a proposed gradebook category structure. Every step after "start" is keyed by the `session_id` it returns.
+
+**What you get back:** most responses below carry a `proposal` and/or `content_mapping` field. These aren't opaque — `proposal` is always a `{categories: [...], not_graded_items: [...], notes: [...], aggregation_method: 13}` object (each category has `name`, `weight`, `items`, `subcategories`, plus drop-lowest/hidden/locked/formula settings), and `content_mapping` is always `{graded_activities: [...], unmatched_activities: [...], uncategorized_activities: [...], validation_errors: [...], llm_mapper_chat_id, validation: {errors, warnings, can_proceed}}` where each activity row has `activity_name`, `suggested_category`/`confirmed_category`, `confidence`, `mapping_method` (`deterministic`/`llm`/`manual`), etc. `§6.8`'s `session` field is the full session record (course/professor/bot IDs, phase, resources, activities, plus `proposal`/`content_mapping`/`chat_history`). See API_SPECIFICATION.md §6.0 for the exact field-by-field shape.
+
+### 6.1 Start a session
+POST /gradebook/sessions/start
+```bash
+curl -X POST "${HOST}:${PORT}/gradebook/sessions/start" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${API_KEY}" \
+  -d '{"course_id": "101", "professor_id": "42", "bot_name": "my-new-bot", "moodle_resources": [], "course_activities": []}'
+```
+
+### 6.2 Chat to refine the proposal
+POST /gradebook/sessions/{session_id}/chat
+```bash
+curl -X POST "${HOST}:${PORT}/gradebook/sessions/${SESSION_ID}/chat" \
+  -H "Content-Type: application/json" -H "X-API-Key: ${API_KEY}" \
+  -d '{"prompt": "Weight assignments at 40% and exams at 60%"}'
+```
+
+### 6.3 Get the current proposal
+GET /gradebook/sessions/{session_id}/proposal
+
+### 6.4 Accept the proposal
+POST /gradebook/sessions/{session_id}/accept — generates the activity-to-category content mapping.
+
+### 6.5 Finalize
+POST /gradebook/sessions/{session_id}/finalize
+```bash
+curl -X POST "${HOST}:${PORT}/gradebook/sessions/${SESSION_ID}/finalize" \
+  -H "Content-Type: application/json" -H "X-API-Key: ${API_KEY}" \
+  -d '{"confirmed_mapping": [{"grade_item_id": 1, "category": "Assignments"}], "create_categories": true}'
+```
+`phase` reaches `COMPLETED` on success; otherwise `message` explains the first validation error.
+
+### 6.6 Upload a syllabus document
+POST /gradebook/sessions/{session_id}/upload — body is `{"filename": "...", "filetype": "pdf", "base64": "..."}`.
+
+### 6.7 Reset
+POST /gradebook/sessions/{session_id}/reset — body `{"keep_extraction": true}`.
+
+### 6.8 Get status
+GET /gradebook/sessions/{session_id}/status
+
+### 6.9 Sync Moodle context
+POST /gradebook/sessions/{session_id}/sync — body `{"course_activities": [...], "confirmed_mapping": null}`.
+
+### 6.10 Delete a session
+DELETE /gradebook/sessions/{session_id}
+
+All of the above return 404 (`NOT_FOUND`) if the session doesn't exist.
+
+---
+
+## 7. Model Discovery
+
+### 7.1 List available models
+GET /models/list
+
+```bash
+curl "${HOST}:${PORT}/models/list" -H "X-API-Key: ${API_KEY}"
+```
+
+Master-key gated. Lists only models/providers actually configured on Ragflow's web UI for your tenant — use the returned `id`s for `llm_model_id`/`embedding_model_id`/`rerank_model_id` when creating a bot (§1.1). Models added directly in Criadex (Azure/Cohere/manual generic rows) are intentionally excluded.
+
+```json
+{
+  "status": 200,
+  "code": "SUCCESS",
+  "models": [
+    {"id": 12, "provider_type": "ragflow", "config": {"api_model": "gpt-4o", "llm_type": "chat"}}
+  ]
+}
+```
+
+---
+
+## 8. API Documentation & Health
 
 ### Swagger UI
 Visit:

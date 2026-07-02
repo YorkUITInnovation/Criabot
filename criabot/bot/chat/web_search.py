@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import time
 from typing import List
 
 import httpx
@@ -11,6 +13,22 @@ from criabot.criadex_schemas import TextNodeWithScore
 
 
 logger = logging.getLogger(__name__)
+
+# Process-wide min spacing between outbound SearXNG calls, so bursty/concurrent
+# chats can't trip upstream engine rate limits (SearXNG itself has none).
+_MIN_REQUEST_INTERVAL_SECONDS = float(os.environ.get("WEB_SEARCH_MIN_INTERVAL_SECONDS", "0.3"))
+_rate_limit_lock = asyncio.Lock()
+_last_request_monotonic = 0.0
+
+
+async def _throttle_outbound_request() -> None:
+    global _last_request_monotonic
+    async with _rate_limit_lock:
+        now = time.monotonic()
+        wait_for = _MIN_REQUEST_INTERVAL_SECONDS - (now - _last_request_monotonic)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        _last_request_monotonic = time.monotonic()
 
 
 _FRENCH_MARKER_RE = re.compile(
@@ -111,15 +129,17 @@ class WebSearchClient:
         async with httpx.AsyncClient(timeout=self._timeout_seconds, follow_redirects=True) as client:
             for attempt in range(max_attempts):
                 try:
+                    await _throttle_outbound_request()
                     response = await client.get(f"{self._base_url}/search", params=params, headers=headers)
 
-                    if response.status_code == 429 or response.status_code >= 500:
+                    if response.status_code >= 500:
                         if attempt < max_attempts - 1:
                             await asyncio.sleep(self._retry_backoff_seconds * (2 ** attempt))
                             continue
                         response.raise_for_status()
 
-                    # Non-retriable client errors should not fail chat fallback flow.
+                    # 429 = an engine got suspended (multi-minute cooldown) — a
+                    # sub-second retry won't help, so fail fast to the next candidate.
                     if response.status_code >= 400:
                         return []
 
@@ -159,6 +179,10 @@ class WebSearchClient:
         for fallback_language in self._candidate_languages(effective_language)[1:]:
             for candidate_query in self._candidate_queries(query):
                 attempts.append((candidate_query, fallback_language))
+
+        # Cap fan-out: each attempt already hits every configured engine, so
+        # trying every query/language permutation would multiply upstream load.
+        attempts = attempts[:2]
 
         last_error: httpx.HTTPError | None = None
         for candidate_query, candidate_language in attempts:

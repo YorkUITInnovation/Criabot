@@ -6,6 +6,13 @@ from criabot.bot.chat.web_search import WebSearchClient, infer_search_language
 from criabot.criadex_schemas import TextNodeWithScore, TextNode, GroupSearchResponse, RerankAgentResponse, TransformAgentResponse, RelatedPrompt, ChatMessage
 
 
+@pytest.fixture(autouse=True)
+def _disable_web_search_throttle(monkeypatch):
+    # Production-only pacing gate between outbound SearXNG requests; real sleeps
+    # here would just slow down these mocked-network unit tests for no benefit.
+    monkeypatch.setattr("criabot.bot.chat.web_search._MIN_REQUEST_INTERVAL_SECONDS", 0.0)
+
+
 def make_group_search_payload(nodes=None, search_units=1, metadata=None, assets=None):
     return {
         "response": GroupSearchResponse(
