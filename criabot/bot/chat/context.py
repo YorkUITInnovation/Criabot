@@ -814,8 +814,10 @@ class ContextRetriever:
         try:
             # Ragflow has no standalone rerank API — reuse the bot's own LLM (via the
             # same chat completion path used for real replies) to rank passages.
+            # Prefer the bot's configured rerank model; fall back to the chat model.
+            rerank_model_id = self._rerank_model_id if self._rerank_model_id else self._llm_model_id
             response = await self._criadex.agents.azure.chat(
-                model_id=self._llm_model_id,
+                model_id=rerank_model_id,
                 agent_config={
                     "chat_id": self._chat_id,
                     "history": [{"role": "user", "content": self._build_rerank_prompt(prompt, nodes)}],

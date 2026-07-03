@@ -70,10 +70,9 @@ class Criabot:
         self._redis_credentials: RedisCredentials = redis_credentials
         self._criadex_credentials: CriadexCredentials = criadex_credentials
 
-        # Criadex HTTP client — timeout reads CRIADEX_IO_TIMEOUT (was CRIADEX_SDK_IO_TIMEOUT)
+        # Criadex HTTP client — timeout reads CRIADEX_IO_TIMEOUT
         _criadex_timeout = float(
             os.environ.get("CRIADEX_IO_TIMEOUT")
-            or os.environ.get("CRIADEX_SDK_IO_TIMEOUT")
             or "300"
         )
         self._criadex: RAGFlowSDK = RAGFlowSDK(
@@ -149,7 +148,6 @@ class Criabot:
 
         # SQL DB Startup
         self._mysql_engine: AsyncEngine = await self._create_mysql_engine()
-        await MigrationRunner(self._mysql_engine).run_pending()
 
         # Redis DB Startup
         # Bound the pool and add socket/health timeouts so a slow or dropped
@@ -178,6 +176,11 @@ class Criabot:
         self._faq_api: FAQDatabaseAPI = FAQDatabaseAPI(engine=self._mysql_engine)
         await self._faq_api.initialize()
         await self._refresh_faq_sync_status_from_db()
+
+        # Versioned migrations run last: some (e.g. BotParents) add tables with
+        # FKs to the base tables above, so they'd fail on a genuinely fresh
+        # database if applied before those tables exist.
+        await MigrationRunner(self._mysql_engine).run_pending()
 
         # Redis API Startup
         from .cache.api import BotCacheAPI

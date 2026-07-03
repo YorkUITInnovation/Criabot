@@ -8,6 +8,7 @@ SDK; Ragflow calls are made by Criadex internally using ragflow-sdk.
 
 from typing import Any, Optional
 import asyncio
+import json
 import logging
 
 from httpx import AsyncClient, Timeout, HTTPStatusError, RequestError
@@ -179,9 +180,8 @@ class GroupAuthRouter:
         except CriadexAPIError as exc:
             # Criadex returns authorized/master in the body even on 404 (GROUP_NOT_FOUND).
             # Parse the body so callers read authorized=null (falsy) instead of getting a crash.
-            import json as _json
             try:
-                return _json.loads(exc.message)
+                return json.loads(exc.message)
             except Exception:
                 return {"authorized": False, "master": False}
 

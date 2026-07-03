@@ -19,7 +19,6 @@ services:
         interval: 5s
         timeout: 5s
         retries: 5
-    # Cria-Front MySQL
     mysql:
       image: 'docker.io/mysql:8.4'
       command: [ 'mysqld','--mysql-native-password=ON' ]
@@ -37,21 +36,6 @@ services:
         - '127.0.0.1:3306:3306'
       volumes:
         - './mysql_data:/var/lib/mysql:cached'
-    # Cria-Front Moodle
-    cria:
-      platform: linux/amd64
-      image: 'uitadmin/cria:v1.1.0'
-      ports:
-        - '127.0.0.1:80:80'
-      volumes:
-        - './html/config.php:/var/www/html/config.php:cached'
-        - './moodledata:/var/www/moodledata:cached'
-        - './log:/var/log/apache2:cached'
-        - '../Cria:/var/www/html/local/cria:cached'
-      depends_on:
-        - mysql
-        - mailhog
-        - redis
     # Cria-Back SearXNG
     searxng:
       image: docker.io/searxng/searxng:2026.4.29-cba0cffa8
